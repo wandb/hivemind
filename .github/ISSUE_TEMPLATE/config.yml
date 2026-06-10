@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://hivemind.wandb.tools/docs
+    about: Install guides, configuration, and MDM deployment docs.
+  - name: Dashboard
+    url: https://hivemind.wandb.tools
+    about: Sign in and see your team's coding sessions.

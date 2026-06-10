@@ -1,0 +1,49 @@
+name: Bug report
+description: Something isn't working with the HiveMind daemon
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Before filing, try `hivemind doctor` — it can diagnose and fix the most common problems.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect to happen, and what happened instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install method
+      options:
+        - Homebrew
+        - uv
+        - Standalone installer
+        - MDM / fleet deployment
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `hivemind version` and `hivemind doctor`
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: If applicable, paste output from `hivemind logs` around the time of the problem.
+      render: shell

@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest an improvement to HiveMind
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the workflow or situation where HiveMind falls short today.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like to see?
+      description: If you have a specific solution in mind, describe it. If not, that's fine too.
+  - type: input
+    id: agent
+    attributes:
+      label: Which coding agent(s) does this involve?
+      description: e.g. Claude Code, Codex, Cursor, Gemini CLI — or "all" / "n/a"

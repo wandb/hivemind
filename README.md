@@ -42,6 +42,7 @@ If you'd rather not depend on Homebrew, Python, or `uv`, the standalone installe
 
 ```bash
 curl -fsSL https://hivemind.wandb.tools/install | sh
+hivemind login
 ```
 
 The standalone binary detects and applies upgrades automatically.

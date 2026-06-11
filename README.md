@@ -8,13 +8,12 @@ This repository hosts release binaries for the HiveMind daemon and is the public
 
 ## Getting started
 
-Install the client, authenticate, and start the daemon. `hivemind login` authenticates you through GitHub or your organization's SSO, and `hivemind start` registers a background service (launchd on macOS, systemd on Linux) so the daemon keeps running and starts on login. Choose the method that fits your platform.
+Install the client and start the daemon. `hivemind start` registers a background service (launchd on macOS, systemd on Linux) so the daemon keeps running and starts on login, prompting you to authenticate through GitHub or your organization's SSO if you haven't already. Choose the method that fits your platform.
 
 ### macOS (Homebrew)
 
 ```bash
 brew install wandb/taps/hivemind
-hivemind login
 hivemind start
 ```
 
@@ -28,7 +27,6 @@ brew upgrade hivemind
 
 ```bash
 uv tool install wandb-hivemind
-hivemind login
 hivemind start
 ```
 

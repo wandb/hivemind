@@ -49,6 +49,20 @@ The standalone binary detects and applies upgrades automatically.
 
 On macOS, the standalone binary requires Apple Silicon; on an Intel Mac, use Homebrew instead. For fleet rollouts through an MDM, see [Deploying with MDM](https://hivemind.wandb.tools/docs/mdm).
 
+### Docker (sidecar)
+
+For containerized agents, run the daemon as a sidecar that watches the agent's transcript directory. Images are published for `linux/amd64` and `linux/arm64`:
+
+```bash
+docker run -d \
+  -v claude-sessions:/watch/.claude:ro \
+  -e HIVEMIND_TOKEN=<your-token> \
+  -e HIVEMIND_WATCH_PATHS=/watch/.claude \
+  ghcr.io/wandb/hivemind:latest
+```
+
+Mount the directory your agent writes transcripts to (read-only is fine) and point `HIVEMIND_WATCH_PATHS` at it. The HiveMind server image is also available as [`ghcr.io/wandb/hivemind-server`](https://github.com/wandb/hivemind/pkgs/container/hivemind-server).
+
 ## How it works
 
 Once the daemon is running, open any supported coding agent and start working. Within 30 seconds your session appears on the [dashboard](https://hivemind.wandb.tools). You can watch sessions in real-time, review past conversations, and dig into individual tool calls.

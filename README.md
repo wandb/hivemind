@@ -13,15 +13,13 @@ Install the client and start the daemon. `hivemind start` registers a background
 ### macOS (Homebrew)
 
 ```bash
-brew install --cask wandb/taps/wandb-hivemind
+brew install wandb/taps/wandb-hivemind
 hivemind start
 ```
 
 Homebrew 6 requires third-party taps to be trusted before their code runs. Installing by fully-qualified name records that trust automatically (you'll see `Trusted cask wandb/taps/wandb-hivemind` on first install); review or revoke it later with `brew trust` / `brew untrust`.
 
-Always use the fully-qualified `wandb/taps/...` names — homebrew-core has an unrelated package also named `hivemind`.
-
-The cask installs a self-updating binary, so there's nothing to upgrade by hand — `brew upgrade` is a no-op for it unless you pass `--greedy`. On an Intel Mac, install the Python formula instead: `brew install wandb/taps/hivemind`.
+The cask installs a self-updating binary, so there's nothing to upgrade by hand — `brew upgrade` is a no-op for it unless you pass `--greedy`. On an Intel Mac, install the Python formula instead: `brew install wandb/taps/hivemind` (always fully-qualified — homebrew-core has an unrelated package also named `hivemind`).
 
 ### macOS or Linux (uv)
 

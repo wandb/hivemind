@@ -1,11 +1,17 @@
 #!/usr/bin/env sh
-# Hivemind binary installer.
+# Hivemind installer.
 #
 #   curl -fsSL https://hivemind.wandb.tools/install | sh
 #
-# Resolves a release manifest, verifies the binary's sha256 (and
+# On Apple Silicon Macs with Homebrew it prefers the wandb-hivemind
+# cask (clean uninstall via brew). Everywhere else — and with --binary —
+# it resolves a release manifest, verifies the binary's sha256 (and
 # codesign Team ID on macOS), and installs to ~/.local/bin/hivemind.
+# A managed .pkg install (MDM) makes this script a no-op unless --force.
 # See docs/BREW_AUTO_UPGRADE_DESIGN.md for the cross-channel design.
+#
+# Tests: scripts/tests/install_sh/run.sh (plain-sh isolated harness; CI
+# runs it under dash, bash, and macOS sh — see install-script.yml).
 #
 # This file is the source of truth. release.yml syncs it to the top
 # level of the public wandb/hivemind repo on every stable release:
@@ -26,6 +32,17 @@ CHANNEL="${HIVEMIND_CHANNEL:-stable}"
 DRY_RUN=0
 NO_SERVICE=0
 ALLOW_ROOT=0
+BINARY_ONLY=0
+FORCE=0
+PREFIX_CUSTOMIZED=0
+[ -n "${HIVEMIND_INSTALL_PREFIX:-}" ] && PREFIX_CUSTOMIZED=1
+
+# Test seams — unset in real installs. SYSROOT prefixes the absolute
+# system paths probed below (pkg payload, Caskroom, Cellar) so the test
+# harness (scripts/tests/install_sh/) can fake installed-state in a
+# tmpdir; TTY_DEV redirects the interactive prompt the same way.
+SYSROOT="${HIVEMIND_INSTALL_SYSROOT:-}"
+TTY_DEV="${HIVEMIND_INSTALL_TTY:-/dev/tty}"
 
 # Colorize diagnostics when stderr is a terminal and NO_COLOR is unset.
 # `curl … | sh` only pipes stdin, so stderr is still the user's terminal
@@ -46,7 +63,13 @@ die() { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 usage() {
   cat <<EOF
 Usage: install.sh [--version X.Y.Z] [--channel stable|prerelease] [--prefix DIR]
-                  [--dry-run] [--allow-root]
+                  [--binary] [--force] [--dry-run] [--allow-root]
+
+Options:
+  --binary    Skip the Homebrew cask preference and install the raw
+              signed binary to PREFIX/bin/hivemind.
+  --force     Like --binary, but also proceeds when a managed .pkg
+              install is present (normally a no-op).
 
 Environment:
   HIVEMIND_VERSION              Pin a specific version (same as --version)
@@ -54,7 +77,10 @@ Environment:
   HIVEMIND_INSTALL_PREFIX       Alt install prefix (default: \$HOME/.local)
   HIVEMIND_UPGRADE_MANIFEST_URL Override manifest URL (overrides --channel)
 
-Without flags, installs the latest stable signed release of hivemind to
+On Apple Silicon Macs with Homebrew, the installer prefers
+\`brew install --cask wandb/taps/wandb-hivemind\` (clean uninstall via
+brew; the daemon still keeps itself updated). Everywhere else — and
+with --binary — it installs the latest signed release to
 ~/.local/bin/hivemind. Run \`hivemind start\` afterwards to accept the
 terms, sign in, and register the background service. Use
 --channel prerelease to opt into the unstable channel.
@@ -73,8 +99,10 @@ while [ $# -gt 0 ]; do
     --version=*) PIN_VERSION="${1#--version=}"; shift ;;
     --channel) require_value "$1" "${2:-}"; CHANNEL="$2"; shift 2 ;;
     --channel=*) CHANNEL="${1#--channel=}"; shift ;;
-    --prefix) require_value "$1" "${2:-}"; INSTALL_PREFIX="$2"; shift 2 ;;
-    --prefix=*) INSTALL_PREFIX="${1#--prefix=}"; shift ;;
+    --prefix) require_value "$1" "${2:-}"; INSTALL_PREFIX="$2"; PREFIX_CUSTOMIZED=1; shift 2 ;;
+    --prefix=*) INSTALL_PREFIX="${1#--prefix=}"; PREFIX_CUSTOMIZED=1; shift ;;
+    --binary) BINARY_ONLY=1; shift ;;
+    --force) FORCE=1; BINARY_ONLY=1; shift ;;
     # Deprecated: the installer no longer registers the service at all;
     # `hivemind start` owns that. Accepted so existing automation keeps
     # working.
@@ -131,6 +159,164 @@ elif have shasum; then
   SHA256SUM="shasum -a 256"
 else
   die "neither sha256sum nor shasum found on PATH"
+fi
+
+# ─── Install-path decision (macOS) ────────────────────────────────────
+# Probes mirror install_channels.py: pkg = payload binary AND system
+# plist (a stale pkgutil receipt alone must not block); cask/formula =
+# their Caskroom/Cellar directories.
+
+cask_dir_exists() {
+  [ -d "$SYSROOT/opt/homebrew/Caskroom/$1" ] || [ -d "$SYSROOT/usr/local/Caskroom/$1" ]
+}
+
+# `curl … | sh` pipes stdin, so prompts must go through the controlling
+# terminal instead. No usable TTY → never prompt (fall back to the
+# non-interactive behavior of whichever path we're on).
+TTY_OK=0
+if [ -r "$TTY_DEV" ] && [ -w "$TTY_DEV" ]; then TTY_OK=1; fi
+
+confirm_tty() {  # confirm_tty "question" — returns 0 only on an explicit yes
+  # Every confirm gates something destructive or surprising (uninstall,
+  # downgrade, cask switch), so a bare Enter or Ctrl-D means NO — a user
+  # bailing out must never fall through to the destructive branch.
+  # Append, don't truncate: identical on a real /dev/tty, but it keeps
+  # the harness's seeded answer file intact when TTY_DEV is overridden.
+  printf '%s [y/N] ' "$1" >> "$TTY_DEV"
+  REPLY=""
+  read -r REPLY < "$TTY_DEV" || true
+  case "$REPLY" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ "$OS" = "Darwin" ] \
+   && [ -e "$SYSROOT/usr/local/hivemind/bin/hivemind" ] \
+   && [ -e "$SYSROOT/Library/LaunchAgents/com.wandb.hivemind.plist" ]; then
+  if [ "$FORCE" -ne 1 ]; then
+    log "hivemind is already installed and managed by your organization's .pkg installer"
+    log "($SYSROOT/usr/local/hivemind/bin/hivemind). It keeps itself up to date — nothing to do."
+    log ""
+    log "To replace it with a self-managed install, first remove it:"
+    log "    sudo /usr/local/hivemind/uninstall.sh"
+    log "then re-run this installer. (--force installs alongside it; not recommended —"
+    log "the two fight over PATH and the com.wandb.hivemind LaunchAgent.)"
+    exit 0
+  fi
+  warn "--force: installing the script binary alongside the managed .pkg install. They will conflict over PATH and the com.wandb.hivemind LaunchAgent; remove one of them with its uninstaller."
+fi
+
+# On Apple Silicon with Homebrew, prefer the cask: brew gives a clean
+# uninstall path (`brew uninstall --cask wandb/taps/wandb-hivemind`),
+# which the raw-binary install lacks, and the daemon self-updates either
+# way. Skipped for --binary/--force, --version pins (the cask always
+# installs the latest), and custom --prefix (explicitly a binary ask).
+if [ "$OS" = "Darwin" ] && [ "$ARCH" = "arm64" ] && [ "$BINARY_ONLY" -ne 1 ] \
+   && [ -z "$PIN_VERSION" ] && [ "$PREFIX_CUSTOMIZED" -ne 1 ]; then
+
+  case "$CHANNEL" in
+    stable) CASK_NAME="wandb-hivemind" ;;
+    prerelease) CASK_NAME="wandb-hivemind-prerelease" ;;
+    *) die "unknown --channel '$CHANNEL' (expected: stable, prerelease)" ;;
+  esac
+
+  INSTALLED_CASK=""
+  for cask in wandb-hivemind wandb-hivemind-prerelease hivemind-app hivemind-app-prerelease; do
+    if cask_dir_exists "$cask"; then
+      INSTALLED_CASK="$cask"
+      break
+    fi
+  done
+
+  if [ "$INSTALLED_CASK" = "$CASK_NAME" ]; then
+    log "hivemind is already installed via the Homebrew cask ($CASK_NAME) — nothing to do."
+    log "The daemon keeps itself up to date. To force a reinstall through brew:"
+    log "    brew upgrade --greedy wandb/taps/$CASK_NAME"
+    log "(or pass --binary to switch to a script-managed binary install)"
+    exit 0
+  fi
+
+  if [ -n "$INSTALLED_CASK" ]; then
+    # A different cask from the family is installed: a channel switch
+    # (stable ↔ prerelease) or a legacy hivemind-app migration. The
+    # casks conflict over the binary link, so the old one must go first.
+    warn "hivemind is installed via the $INSTALLED_CASK cask, but this install targets $CASK_NAME."
+    SWITCH_CMD="brew uninstall --cask wandb/taps/$INSTALLED_CASK && brew install --cask wandb/taps/$CASK_NAME"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      log "(dry-run) would prompt to switch casks: $SWITCH_CMD"
+      exit 0
+    fi
+    if have brew && [ "$TTY_OK" -eq 1 ]; then
+      confirm_tty "Replace $INSTALLED_CASK with $CASK_NAME?" \
+        || die "keeping $INSTALLED_CASK. To switch manually: $SWITCH_CMD"
+      log "Running: brew uninstall --cask wandb/taps/$INSTALLED_CASK"
+      brew uninstall --cask "wandb/taps/$INSTALLED_CASK" >&2 \
+        || brew uninstall --cask "$INSTALLED_CASK" >&2 \
+        || die "brew uninstall failed — switch manually: $SWITCH_CMD"
+      # fall through to the cask install below
+    else
+      die "can't confirm the cask switch non-interactively. Run: $SWITCH_CMD"
+    fi
+  fi
+
+  if have brew && [ "$TTY_OK" -eq 1 ]; then
+    CASK_OK=1
+
+    if [ -d "$SYSROOT/opt/homebrew/Cellar/hivemind" ] || [ -d "$SYSROOT/usr/local/Cellar/hivemind" ]; then
+      # Distinguish our formula (a python virtualenv keg with
+      # libexec/bin/hivemind) from homebrew-core's unrelated `hivemind`
+      # process manager (a bare Go binary) before uninstalling anything.
+      BREW_PREFIX=$(brew --prefix 2>/dev/null || echo "$SYSROOT/opt/homebrew")
+      if [ -e "$BREW_PREFIX/opt/hivemind/libexec/bin/hivemind" ]; then
+        warn "the legacy Homebrew formula (wandb/taps/hivemind) is installed. The wandb-hivemind cask can't install alongside it — both link \$(brew --prefix)/bin/hivemind."
+        if [ "$DRY_RUN" -eq 1 ]; then
+          log "(dry-run) would prompt to remove it: brew uninstall wandb/taps/hivemind"
+        elif confirm_tty "Remove the legacy formula now (brew uninstall wandb/taps/hivemind)?"; then
+          log "Running: brew uninstall wandb/taps/hivemind"
+          brew uninstall wandb/taps/hivemind >&2 \
+            || brew uninstall hivemind >&2 \
+            || die "brew uninstall failed — remove the formula manually, then re-run this installer"
+        else
+          die "keeping the legacy formula. Re-run after \`brew uninstall wandb/taps/hivemind\`, or pass --binary for a script-managed binary install."
+        fi
+      else
+        warn "an unrelated 'hivemind' Homebrew formula is installed; its binary link would conflict with the wandb-hivemind cask. Falling back to the script binary install."
+        CASK_OK=0
+      fi
+    fi
+
+    if [ "$CASK_OK" -eq 1 ]; then
+      log "Homebrew detected — installing via the cask (preferred on Apple Silicon:"
+      log "clean uninstall through brew; the daemon still keeps itself updated)."
+      if [ "$DRY_RUN" -eq 1 ]; then
+        log "(dry-run) would run: brew install --cask wandb/taps/$CASK_NAME"
+        exit 0
+      fi
+      log "Running: brew install --cask wandb/taps/$CASK_NAME"
+      brew install --cask "wandb/taps/$CASK_NAME" >&2 \
+        || die "brew install failed — fix the brew error above and re-run, or pass --binary for a script-managed binary install"
+      cat <<EOS >&2
+
+${C_GREEN}✓${C_RESET} ${C_BOLD}hivemind installed via Homebrew cask (wandb/taps/$CASK_NAME)${C_RESET}
+
+Next steps:
+  1. hivemind start          # accept the terms, sign in, and start the daemon
+  2. hivemind doctor         # verify health
+
+The daemon keeps itself up to date automatically. Manage the install
+with brew:
+    brew upgrade --greedy wandb/taps/$CASK_NAME    # force-reinstall latest
+    brew uninstall --cask wandb/taps/$CASK_NAME    # clean uninstall
+EOS
+      exit 0
+    fi
+  elif have brew; then
+    log "Tip: on Apple Silicon with Homebrew, the preferred install is:"
+    log "    brew install wandb/taps/wandb-hivemind"
+    log "(clean uninstall through brew). No terminal available to confirm, so"
+    log "continuing with the script binary install."
+  fi
 fi
 
 # Manifest URL resolution order: env override > --version pin > --channel.
@@ -248,10 +434,28 @@ MANIFEST_TEAM_ID=$(printf '%s' "$PLATFORM_INFO" | sed -n '4p')
 log "Resolved version: $VERSION"
 log "Binary URL:       $BINARY_URL"
 
+# ─── Upgrade vs first-install detection ───────────────────────────────
+# Captured BEFORE the new binary lands. "Upgrade" means a binary was
+# already at the install path AND the service has been registered
+# (mirrors _is_service_installed() in cli.py) — i.e. the user has been
+# through `hivemind start` at least once, so a post-install
+# `hivemind restart` is what applies the new build. A binary with no
+# registered service is still a first install (start owns ToS + login).
+INSTALL_PATH_PREVIEW="$INSTALL_PREFIX/bin/hivemind"
+SERVICE_REGISTERED=0
+if [ "$OS" = "Darwin" ]; then
+  [ -e "$HOME/Library/LaunchAgents/com.wandb.hivemind.plist" ] && SERVICE_REGISTERED=1
+else
+  [ -e "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/hivemind.service" ] && SERVICE_REGISTERED=1
+fi
+IS_UPGRADE=0
+if [ -x "$INSTALL_PATH_PREVIEW" ] && [ "$SERVICE_REGISTERED" -eq 1 ]; then
+  IS_UPGRADE=1
+fi
+
 # ─── Downgrade detection ──────────────────────────────────────────────
 # `--version 0.5.0` over a working 0.6.x install is almost always a
 # typo. Prompt to confirm interactively; refuse with no TTY.
-INSTALL_PATH_PREVIEW="$INSTALL_PREFIX/bin/hivemind"
 if [ -x "$INSTALL_PATH_PREVIEW" ] && [ -n "$PIN_VERSION" ]; then
   CURRENT_VERSION=$("$INSTALL_PATH_PREVIEW" --version 2>/dev/null \
     | awk '{for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+\./) {print $i; exit}}' \
@@ -280,13 +484,11 @@ except Exception:
     fi
     if [ "$IS_DOWNGRADE" = "1" ]; then
       warn "Installing $VERSION over a newer install ($CURRENT_VERSION) — this is a downgrade."
-      if [ -t 0 ]; then
-        printf 'Continue? [y/N] ' >&2
-        read -r REPLY
-        case "$REPLY" in
-          y|Y|yes|YES) ;;
-          *) die "aborted by user" ;;
-        esac
+      # Prompt via the controlling terminal, not stdin: under the
+      # documented `curl … | sh` usage stdin is the pipe, so a `-t 0`
+      # check would refuse even when the user is sitting at a terminal.
+      if [ "$TTY_OK" -eq 1 ]; then
+        confirm_tty "Continue?" || die "aborted by user"
       else
         die "downgrade refused in non-interactive mode (re-run with a TTY, or remove $INSTALL_PATH_PREVIEW first)"
       fi
@@ -301,38 +503,19 @@ if [ "$OS" = "Darwin" ] && [ -n "$MANIFEST_TEAM_ID" ] && [ "$MANIFEST_TEAM_ID" !
 fi
 
 # ─── Coexistence detection (informational) ────────────────────────────
+# The managed-pkg case was handled up front (no-op unless --force); the
+# rest is informational — a binary install proceeds, and `hivemind
+# start` takes over the shared service label.
 EXISTING_INSTALLS=""
 note_existing() { EXISTING_INSTALLS="$EXISTING_INSTALLS\n  - $1"; }
 
 if [ "$OS" = "Darwin" ]; then
-  # A managed .pkg install owns a symlink high on PATH
-  # (/usr/local/hivemind/bin/hivemind) plus a root-owned system
-  # LaunchAgent. A script binary in ~/.local/bin would shadow neither
-  # reliably and install-service can't claim the label anyway, so refuse
-  # rather than leave two installs fighting over PATH and launchd.
-  # Detect the actual conflicting artifacts, not the pkgutil receipt: a
-  # stale receipt can outlive a partial uninstall and wrongly block us.
-  # Mirrors _pkg_managed_installed() in install_channels.py (binary AND
-  # system plist must both be present).
-  if [ -e /usr/local/hivemind/bin/hivemind ] && [ -e /Library/LaunchAgents/com.wandb.hivemind.plist ]; then
-    PKG_CONFLICT_MSG="a managed .pkg install of hivemind is already present (/usr/local/hivemind/bin/hivemind).
-  The script installer won't overwrite it — they would conflict over PATH and the
-  com.wandb.hivemind LaunchAgent. To switch to a script-managed install, first remove
-  the .pkg install:
-      sudo /usr/local/hivemind/uninstall.sh
-  then re-run this installer."
-    if [ "$DRY_RUN" -eq 1 ]; then
-      warn "(dry-run) the real install would refuse: $PKG_CONFLICT_MSG"
-    else
-      die "$PKG_CONFLICT_MSG"
-    fi
-  fi
   for cask in wandb-hivemind wandb-hivemind-prerelease hivemind-app hivemind-app-prerelease; do
-    if [ -d "/opt/homebrew/Caskroom/$cask" ] || [ -d "/usr/local/Caskroom/$cask" ]; then
+    if cask_dir_exists "$cask"; then
       note_existing "Homebrew cask $cask"
     fi
   done
-  if [ -d /opt/homebrew/Cellar/hivemind ] || [ -d /usr/local/Cellar/hivemind ]; then
+  if [ -d "$SYSROOT/opt/homebrew/Cellar/hivemind" ] || [ -d "$SYSROOT/usr/local/Cellar/hivemind" ]; then
     note_existing "Homebrew formula hivemind"
   fi
 fi
@@ -403,6 +586,14 @@ else
   mv "$FINAL_STAGE" "$INSTALL_PATH"
   log "Installed: $INSTALL_PATH"
 
+  # Pre-warm: the Nuitka onefile binary extracts ~180 MB to
+  # ~/.cache/hivemind-<version>/ on its first execution — several
+  # seconds of I/O better paid here than on the user's first command.
+  # Best-effort (the binary is already sha256- and codesign-verified).
+  if ! "$INSTALL_PATH" --version >/dev/null 2>&1; then
+    warn "$INSTALL_PATH --version failed; run \`hivemind doctor\` to investigate"
+  fi
+
   # Marker so the daemon's upgrade-watcher and service-manager find
   # non-default --prefix installs. Only record `channel` when it
   # actually selected the manifest URL — otherwise the watcher would
@@ -446,15 +637,55 @@ Then open a new terminal (or run \`source ~/.zshrc\`) and run
 EOS
 fi
 
-# The installer intentionally does not register or start the service:
-# `hivemind start` walks the user through the terms of service and the
-# login flow before registering the LaunchAgent / systemd unit.
+# The installer intentionally does not register or start the service on
+# first install: `hivemind start` walks the user through the terms of
+# service and the login flow before registering the LaunchAgent /
+# systemd unit.
 if [ "$NO_SERVICE" -eq 1 ]; then
   warn "--no-service is deprecated and now a no-op: the installer never registers the service. Run \`hivemind start\` when you want the daemon running."
 fi
 
+# ─── Restart on upgrade ───────────────────────────────────────────────
+# An upgrade of a registered service can be applied right here instead
+# of telling the user to run `hivemind restart` themselves. TTY only:
+# restart can prompt (keychain, re-login), and a prompt with no terminal
+# would hang automation — non-interactive runs get the hint instead.
+# Skipped under --force, where a managed .pkg may own the service label.
+RESTARTED=0
+if [ "$IS_UPGRADE" -eq 1 ] && [ "$FORCE" -ne 1 ]; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "(dry-run) would restart the daemon (existing service detected)"
+  elif [ "$TTY_OK" -eq 1 ]; then
+    log "Existing service detected — restarting the daemon onto v$VERSION..."
+    if "$INSTALL_PATH" restart >&2 < "$TTY_DEV"; then
+      RESTARTED=1
+    else
+      warn "hivemind restart failed — run it manually to finish the upgrade"
+    fi
+  fi
+fi
+
 # ─── Done ─────────────────────────────────────────────────────────────
-cat <<EOS >&2
+if [ "$RESTARTED" -eq 1 ]; then
+  cat <<EOS >&2
+
+${C_GREEN}✓${C_RESET} ${C_BOLD}hivemind upgraded to v$VERSION and the daemon restarted${C_RESET}
+
+Run \`hivemind status\` to confirm, or \`hivemind doctor\` if anything
+looks off. The daemon keeps itself up to date automatically from here.
+EOS
+elif [ "$IS_UPGRADE" -eq 1 ]; then
+  cat <<EOS >&2
+
+${C_GREEN}✓${C_RESET} ${C_BOLD}hivemind v$VERSION installed at $INSTALL_PATH${C_RESET}
+
+The daemon is still running the previous build. Apply the upgrade with:
+
+    hivemind restart
+
+EOS
+else
+  cat <<EOS >&2
 
 ${C_GREEN}✓${C_RESET} ${C_BOLD}hivemind v$VERSION installed at $INSTALL_PATH${C_RESET}
 
@@ -466,3 +697,4 @@ Once started, the daemon keeps itself up to date automatically
 (auto-apply is the default for script installs). To disable polling,
 set HIVEMIND_UPGRADE_WATCHER_DISABLED=1 in the daemon environment.
 EOS
+fi

@@ -13,15 +13,13 @@ Install the client and start the daemon. `hivemind start` registers a background
 ### macOS (Homebrew)
 
 ```bash
-brew install wandb/taps/hivemind
+brew install wandb/taps/wandb-hivemind
 hivemind start
 ```
 
-Upgrade with:
+Homebrew 6 requires third-party taps to be trusted before their code runs. Installing by fully-qualified name records that trust automatically (you'll see `Trusted cask wandb/taps/wandb-hivemind` on first install); review or revoke it later with `brew trust` / `brew untrust`.
 
-```bash
-brew upgrade hivemind
-```
+The cask installs a self-updating binary, so there's nothing to upgrade by hand — `brew upgrade` is a no-op for it unless you pass `--greedy`. On an Intel Mac, install the Python formula instead: `brew install wandb/taps/hivemind` (always fully-qualified — homebrew-core has an unrelated package also named `hivemind`).
 
 ### macOS or Linux (uv)
 
@@ -38,14 +36,14 @@ uv tool upgrade wandb-hivemind
 
 ### Standalone installer (macOS or Linux)
 
-If you'd rather not depend on Homebrew, Python, or `uv`, the standalone installer downloads a signed binary to `~/.local/bin`, registers the background service, and keeps itself up to date. It doesn't require `sudo`:
+If you'd rather not depend on Homebrew, Python, or `uv`, the standalone installer downloads a signed binary to `~/.local/bin`. It doesn't require `sudo`:
 
 ```bash
 curl -fsSL https://hivemind.wandb.tools/install | sh
-hivemind login
+hivemind start
 ```
 
-The standalone binary detects and applies upgrades automatically.
+Once started, the standalone binary detects and applies upgrades automatically.
 
 On macOS, the standalone binary requires Apple Silicon; on an Intel Mac, use Homebrew instead. For fleet rollouts through an MDM, see [Deploying with MDM](https://hivemind.wandb.tools/docs/mdm).
 

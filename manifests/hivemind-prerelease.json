@@ -1,0 +1,21 @@
+{
+  "version": "0.0.1-test1",
+  "minimum_supported": "0.0.1-test1",
+  "released_at": "2026-04-28T19:33:52Z",
+  "rollout_percentage": 100,
+  "platforms": {
+    "darwin-arm64": {
+      "binary_url": "https://github.com/wandb/homebrew-taps/releases/download/hivemind-v0.0.1-test1/hivemind-darwin-arm64",
+      "binary_sha256": "ca043f5468651628ea000b13bd163816d480dcfda448147c19121267694774bc",
+      "team_id": "58UA579432"
+    },
+    "linux-x86_64": {
+      "binary_url": "https://github.com/wandb/homebrew-taps/releases/download/hivemind-v0.0.1-test1/hivemind-linux-x86_64",
+      "binary_sha256": "c84fcb32affa6685804560ebfabfaea275c4b4aa92d799c8ef3f140d3a802dc0"
+    },
+    "linux-arm64": {
+      "binary_url": "https://github.com/wandb/homebrew-taps/releases/download/hivemind-v0.0.1-test1/hivemind-linux-arm64",
+      "binary_sha256": "00bdbe41d215c51d936a46910278bec5689d29c831845f5e1084b952be974911"
+    }
+  }
+}

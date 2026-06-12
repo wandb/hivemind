@@ -1,0 +1,21 @@
+{
+  "version": "0.7.0",
+  "minimum_supported": "0.7.0",
+  "released_at": "2026-05-26T20:23:54Z",
+  "rollout_percentage": 100,
+  "platforms": {
+    "darwin-arm64": {
+      "binary_url": "https://github.com/wandb/hivemind/releases/download/v0.7.0/hivemind-darwin-arm64",
+      "binary_sha256": "1e345a3bc0b056279687a272d29711d0cfa703464755482f53cb7a64d50ebbc0",
+      "team_id": "5DTHBP38WM"
+    },
+    "linux-x86_64": {
+      "binary_url": "https://github.com/wandb/hivemind/releases/download/v0.7.0/hivemind-linux-x86_64",
+      "binary_sha256": "86fc8096c48ef362e99207a6d80c7ff97190bbd154290bba4d55a1fcf50f45d3"
+    },
+    "linux-arm64": {
+      "binary_url": "https://github.com/wandb/hivemind/releases/download/v0.7.0/hivemind-linux-arm64",
+      "binary_sha256": "05774f278acf7049476c07fddce3d16d2d83dfa7ff8f4bae7d7ff6429c4d0913"
+    }
+  }
+}

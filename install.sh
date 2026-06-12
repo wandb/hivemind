@@ -14,8 +14,10 @@
 set -eu
 
 # Match upgrade_watcher.py:DEFAULT_MANIFEST_URL and EXPECTED_TEAM_ID.
-STABLE_MANIFEST_URL="https://raw.githubusercontent.com/wandb/homebrew-taps/main/manifests/hivemind-latest.json"
-PRERELEASE_MANIFEST_URL="https://raw.githubusercontent.com/wandb/homebrew-taps/main/manifests/hivemind-prerelease.json"
+# wandb/hivemind is the canonical release repo; wandb/homebrew-taps
+# carries a mirror for pre-0.7.5 daemons.
+STABLE_MANIFEST_URL="https://raw.githubusercontent.com/wandb/hivemind/main/manifests/hivemind-latest.json"
+PRERELEASE_MANIFEST_URL="https://raw.githubusercontent.com/wandb/hivemind/main/manifests/hivemind-prerelease.json"
 EXPECTED_TEAM_ID="5DTHBP38WM"
 
 INSTALL_PREFIX="${HIVEMIND_INSTALL_PREFIX:-$HOME/.local}"
@@ -44,7 +46,7 @@ die() { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 usage() {
   cat <<EOF
 Usage: install.sh [--version X.Y.Z] [--channel stable|prerelease] [--prefix DIR]
-                  [--no-service] [--dry-run] [--allow-root]
+                  [--dry-run] [--allow-root]
 
 Environment:
   HIVEMIND_VERSION              Pin a specific version (same as --version)
@@ -53,9 +55,9 @@ Environment:
   HIVEMIND_UPGRADE_MANIFEST_URL Override manifest URL (overrides --channel)
 
 Without flags, installs the latest stable signed release of hivemind to
-~/.local/bin/hivemind and registers a per-user LaunchAgent (macOS) or
-systemd user unit (Linux). Use --channel prerelease to opt into the
-unstable channel.
+~/.local/bin/hivemind. Run \`hivemind start\` afterwards to accept the
+terms, sign in, and register the background service. Use
+--channel prerelease to opt into the unstable channel.
 EOF
 }
 
@@ -73,6 +75,9 @@ while [ $# -gt 0 ]; do
     --channel=*) CHANNEL="${1#--channel=}"; shift ;;
     --prefix) require_value "$1" "${2:-}"; INSTALL_PREFIX="$2"; shift 2 ;;
     --prefix=*) INSTALL_PREFIX="${1#--prefix=}"; shift ;;
+    # Deprecated: the installer no longer registers the service at all;
+    # `hivemind start` owns that. Accepted so existing automation keeps
+    # working.
     --no-service) NO_SERVICE=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --allow-root) ALLOW_ROOT=1; shift ;;
@@ -95,7 +100,7 @@ case "$OS-$ARCH" in
     PLATFORM=darwin-arm64
     ;;
   Darwin-x86_64)
-    die "Intel Macs are not currently supported. The hivemind binary is built for Apple Silicon only. Please install via Homebrew formula instead: brew install wandb/taps/hivemind"
+    die "Intel Macs are not currently supported. The hivemind binary is built for Apple Silicon only. Please install via the Homebrew formula instead: brew install wandb/taps/hivemind"
     ;;
   Linux-x86_64)
     PLATFORM=linux-x86_64
@@ -134,7 +139,7 @@ CHANNEL_USED=0
 if [ -n "${HIVEMIND_UPGRADE_MANIFEST_URL:-}" ]; then
   MANIFEST_URL="$HIVEMIND_UPGRADE_MANIFEST_URL"
 elif [ -n "$PIN_VERSION" ]; then
-  MANIFEST_URL="https://raw.githubusercontent.com/wandb/homebrew-taps/main/manifests/hivemind-${PIN_VERSION}.json"
+  MANIFEST_URL="https://raw.githubusercontent.com/wandb/hivemind/main/manifests/hivemind-${PIN_VERSION}.json"
 else
   case "$CHANNEL" in
     stable) MANIFEST_URL="$STABLE_MANIFEST_URL"; CHANNEL_USED=1 ;;
@@ -322,9 +327,11 @@ if [ "$OS" = "Darwin" ]; then
       die "$PKG_CONFLICT_MSG"
     fi
   fi
-  if [ -d /opt/homebrew/Caskroom/hivemind-app ] || [ -d /usr/local/Caskroom/hivemind-app ]; then
-    note_existing "Homebrew cask hivemind-app"
-  fi
+  for cask in wandb-hivemind wandb-hivemind-prerelease hivemind-app hivemind-app-prerelease; do
+    if [ -d "/opt/homebrew/Caskroom/$cask" ] || [ -d "/usr/local/Caskroom/$cask" ]; then
+      note_existing "Homebrew cask $cask"
+    fi
+  done
   if [ -d /opt/homebrew/Cellar/hivemind ] || [ -d /usr/local/Cellar/hivemind ]; then
     note_existing "Homebrew formula hivemind"
   fi
@@ -337,7 +344,7 @@ if [ -n "$EXISTING_INSTALLS" ]; then
   printf 'Detected existing hivemind install(s):' >&2
   # %b interprets the accumulated \n without treating data as a format string.
   printf '%b\n' "$EXISTING_INSTALLS" >&2
-  log "The script-installed binary will take over the LaunchAgent label (com.wandb.hivemind) on first run; old installs remain on disk and can be removed with their respective uninstallers."
+  log "Running \`hivemind start\` from the script-installed binary will take over the service registration (com.wandb.hivemind); old installs remain on disk and can be removed with their respective uninstallers."
 fi
 
 # ─── Download + verify ────────────────────────────────────────────────
@@ -433,22 +440,17 @@ $INSTALL_DIR is not on your PATH. Add it by running:
     # or
     echo 'export PATH="$INSTALL_DIR:\$PATH"' >> ~/.bashrc  # bash
 
-Then open a new terminal (or run \`source ~/.zshrc\`) and re-run
-\`hivemind install-service\` if you want the daemon to start on login.
+Then open a new terminal (or run \`source ~/.zshrc\`) and run
+\`hivemind start\` to get the daemon running and starting on login.
 
 EOS
 fi
 
-# ─── Service registration ─────────────────────────────────────────────
+# The installer intentionally does not register or start the service:
+# `hivemind start` walks the user through the terms of service and the
+# login flow before registering the LaunchAgent / systemd unit.
 if [ "$NO_SERVICE" -eq 1 ]; then
-  log "Skipping service registration (--no-service)."
-elif [ "$DRY_RUN" -eq 1 ]; then
-  log "(dry-run) would run: $INSTALL_PATH install-service"
-else
-  log "Registering background service..."
-  if ! "$INSTALL_PATH" install-service; then
-    warn "install-service failed; the binary is installed but won't start on login. Run \`$INSTALL_PATH install-service\` manually after fixing the issue."
-  fi
+  warn "--no-service is deprecated and now a no-op: the installer never registers the service. Run \`hivemind start\` when you want the daemon running."
 fi
 
 # ─── Done ─────────────────────────────────────────────────────────────
@@ -457,10 +459,10 @@ cat <<EOS >&2
 ${C_GREEN}✓${C_RESET} ${C_BOLD}hivemind v$VERSION installed at $INSTALL_PATH${C_RESET}
 
 Next steps:
-  1. hivemind login          # authenticate
+  1. hivemind start          # accept the terms, sign in, and start the daemon
   2. hivemind doctor         # verify health
 
-The daemon keeps itself up to date automatically (auto-apply is the
-default for script installs). To disable polling, set
-HIVEMIND_UPGRADE_WATCHER_DISABLED=1 in the daemon environment.
+Once started, the daemon keeps itself up to date automatically
+(auto-apply is the default for script installs). To disable polling,
+set HIVEMIND_UPGRADE_WATCHER_DISABLED=1 in the daemon environment.
 EOS

@@ -17,12 +17,13 @@ brew install --cask wandb/taps/wandb-hivemind
 hivemind start
 ```
 
-Homebrew 6 requires third-party taps to be trusted before their code runs; installing the fully-qualified cask above will prompt you to trust it. To trust it ahead of time instead:
+Homebrew 6 requires third-party taps to be trusted before their code runs; installing the fully-qualified cask above will prompt you to trust it. To trust it ahead of time instead (e.g. for non-interactive installs):
 
 ```bash
-brew tap wandb/taps
 brew trust --cask wandb/taps/wandb-hivemind
 ```
+
+Always use the fully-qualified `wandb/taps/...` names — homebrew-core has an unrelated package also named `hivemind`.
 
 The cask installs a self-updating binary, so there's nothing to upgrade by hand — `brew upgrade` is a no-op for it unless you pass `--greedy`. On an Intel Mac, install the Python formula instead: `brew install wandb/taps/hivemind`.
 

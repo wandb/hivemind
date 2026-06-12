@@ -327,12 +327,11 @@ if [ "$OS" = "Darwin" ]; then
       die "$PKG_CONFLICT_MSG"
     fi
   fi
-  if [ -d /opt/homebrew/Caskroom/wandb-hivemind ] || [ -d /usr/local/Caskroom/wandb-hivemind ]; then
-    note_existing "Homebrew cask wandb-hivemind"
-  fi
-  if [ -d /opt/homebrew/Caskroom/hivemind-app ] || [ -d /usr/local/Caskroom/hivemind-app ]; then
-    note_existing "Homebrew cask hivemind-app"
-  fi
+  for cask in wandb-hivemind wandb-hivemind-prerelease hivemind-app hivemind-app-prerelease; do
+    if [ -d "/opt/homebrew/Caskroom/$cask" ] || [ -d "/usr/local/Caskroom/$cask" ]; then
+      note_existing "Homebrew cask $cask"
+    fi
+  done
   if [ -d /opt/homebrew/Cellar/hivemind ] || [ -d /usr/local/Cellar/hivemind ]; then
     note_existing "Homebrew formula hivemind"
   fi

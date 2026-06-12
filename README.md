@@ -17,11 +17,7 @@ brew install --cask wandb/taps/wandb-hivemind
 hivemind start
 ```
 
-Homebrew 6 requires third-party taps to be trusted before their code runs; installing the fully-qualified cask above will prompt you to trust it. To trust it ahead of time instead (e.g. for non-interactive installs):
-
-```bash
-brew trust --cask wandb/taps/wandb-hivemind
-```
+Homebrew 6 requires third-party taps to be trusted before their code runs. Installing by fully-qualified name records that trust automatically (you'll see `Trusted cask wandb/taps/wandb-hivemind` on first install); review or revoke it later with `brew trust` / `brew untrust`.
 
 Always use the fully-qualified `wandb/taps/...` names — homebrew-core has an unrelated package also named `hivemind`.
 

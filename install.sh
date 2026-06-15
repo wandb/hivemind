@@ -128,7 +128,7 @@ case "$OS-$ARCH" in
     PLATFORM=darwin-arm64
     ;;
   Darwin-x86_64)
-    die "Intel Macs are not currently supported. The hivemind binary is built for Apple Silicon only. Please install via the Homebrew formula instead: brew install wandb/taps/hivemind"
+    die "Intel Macs are not currently supported. The hivemind binary is built for Apple Silicon only. Install the cross-platform package with uv instead: uv tool install wandb-hivemind"
     ;;
   Linux-x86_64)
     PLATFORM=linux-x86_64

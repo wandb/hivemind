@@ -53,6 +53,34 @@ hivemind start
 uv tool upgrade wandb-hivemind
 ```
 
+### Uninstalling
+
+How you remove HiveMind depends on how it was installed. Since the one-line installer uses the cask on an Apple Silicon Mac with Homebrew, check whether brew owns it:
+
+```bash
+brew list wandb/taps/wandb-hivemind
+```
+
+If that succeeds, uninstall through brew — this also stops and unregisters the launchd service:
+
+```bash
+brew uninstall wandb/taps/wandb-hivemind
+# add --zap to also remove the leftover LaunchAgent plist and logs
+```
+
+Installed with `uv`? Use `uv tool uninstall wandb-hivemind`. Otherwise it's a binary install — stop and unregister the daemon, then remove the binary:
+
+```bash
+hivemind stop --disable
+rm ~/.local/bin/hivemind
+```
+
+Either way, your data in `~/.hivemind/` is left in place. It holds the daemon's sync state — which sessions have already been uploaded — so removing it and reinstalling later triggers a re-sync. Delete it only if you don't intend to use HiveMind again:
+
+```bash
+rm -rf ~/.hivemind
+```
+
 ### Docker (sidecar)
 
 For containerized agents, run the daemon as a sidecar that watches the agent's transcript directory. Images are published for `linux/amd64` and `linux/arm64`:

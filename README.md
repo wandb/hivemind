@@ -61,11 +61,10 @@ How you remove HiveMind depends on how it was installed. Since the one-line inst
 brew list wandb/taps/wandb-hivemind
 ```
 
-If that succeeds, uninstall through brew — this also stops and unregisters the launchd service:
+If that succeeds, uninstall through brew with `--zap` — this stops and unregisters the launchd service, removes the binary, and clears the leftover LaunchAgent plist and logs (it deliberately leaves `~/.hivemind` alone — see below):
 
 ```bash
-brew uninstall wandb/taps/wandb-hivemind
-# add --zap to also remove the leftover LaunchAgent plist and logs
+brew uninstall --zap wandb/taps/wandb-hivemind
 ```
 
 Installed with `uv`? Use `uv tool uninstall wandb-hivemind`. Otherwise it's a binary install — stop and unregister the daemon, then remove the binary:

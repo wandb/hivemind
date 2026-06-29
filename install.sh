@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Hivemind installer.
+# HiveMind installer.
 #
 #   curl -fsSL https://hivemind.wandb.tools/install | sh
 #
@@ -29,6 +29,14 @@ EXPECTED_TEAM_ID="5DTHBP38WM"
 INSTALL_PREFIX="${HIVEMIND_INSTALL_PREFIX:-$HOME/.local}"
 PIN_VERSION="${HIVEMIND_VERSION:-}"
 CHANNEL="${HIVEMIND_CHANNEL:-stable}"
+
+# Self-hosted server endpoint. The /install endpoint
+# (backend/api/.../handlers/install.py) rewrites the default below to the host
+# it was served from, so `curl https://my.hivemind.example/install | sh` points
+# the daemon at that host. Served from the public SaaS host — or fetched
+# straight from GitHub — it stays empty and the daemon keeps its built-in
+# default endpoint. Override for manual installs with HIVEMIND_SERVER_ENDPOINT.
+SERVER_ENDPOINT="${HIVEMIND_SERVER_ENDPOINT:-}"
 DRY_RUN=0
 NO_SERVICE=0
 ALLOW_ROOT=0
@@ -79,8 +87,8 @@ Environment:
 
 On Apple Silicon Macs with Homebrew, the installer prefers
 \`brew install --cask wandb/taps/wandb-hivemind\` (clean uninstall via
-brew; the daemon still keeps itself updated). Everywhere else — and
-with --binary — it installs the latest signed release to
+brew; the daemon still keeps itself updated). Everywhere else, and
+with --binary, it installs the latest signed release to
 ~/.local/bin/hivemind. Run \`hivemind start\` afterwards to accept the
 terms, sign in, and register the background service. Use
 --channel prerelease to opt into the unstable channel.
@@ -161,6 +169,32 @@ else
   die "neither sha256sum nor shasum found on PATH"
 fi
 
+# Point the daemon at a self-hosted server, when this script was served from a
+# custom /install host (see SERVER_ENDPOINT above). Runs on fresh installs and
+# re-runs over existing ones — re-curling a custom /install is how a user
+# repoints an already-installed daemon, so this is called on the "nothing to
+# do" exits too. Best-effort: a failure here never fails the install.
+# $1 (optional) is the best-known path to the hivemind binary; falls back to
+# whatever is on PATH (brew/pkg installs put hivemind there).
+configure_server_endpoint() {
+  [ -n "$SERVER_ENDPOINT" ] || return 0
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "(dry-run) would run: hivemind config set server.endpoint \"$SERVER_ENDPOINT\""
+    return 0
+  fi
+  hm_bin="${1:-}"
+  [ -x "$hm_bin" ] || hm_bin=$(command -v hivemind 2>/dev/null || true)
+  if [ -z "$hm_bin" ] || [ ! -x "$hm_bin" ]; then
+    warn "couldn't find hivemind to point at $SERVER_ENDPOINT — run: hivemind config set server.endpoint \"$SERVER_ENDPOINT\""
+    return 0
+  fi
+  if "$hm_bin" config set server.endpoint "$SERVER_ENDPOINT" >&2; then
+    log "${C_GREEN}✓${C_RESET} Updated hivemind to log to $SERVER_ENDPOINT"
+  else
+    warn "couldn't set server.endpoint=$SERVER_ENDPOINT — run: hivemind config set server.endpoint \"$SERVER_ENDPOINT\""
+  fi
+}
+
 # ─── Install-path decision (macOS) ────────────────────────────────────
 # Probes mirror install_channels.py: pkg = payload binary AND system
 # plist (a stale pkgutil receipt alone must not block); cask/formula =
@@ -202,6 +236,7 @@ if [ "$OS" = "Darwin" ] \
     log "    sudo /usr/local/hivemind/uninstall.sh"
     log "then re-run this installer. (--force installs alongside it; not recommended —"
     log "the two fight over PATH and the com.wandb.hivemind LaunchAgent.)"
+    configure_server_endpoint "$SYSROOT/usr/local/hivemind/bin/hivemind"
     exit 0
   fi
   warn "--force: installing the script binary alongside the managed .pkg install. They will conflict over PATH and the com.wandb.hivemind LaunchAgent; remove one of them with its uninstaller."
@@ -234,6 +269,7 @@ if [ "$OS" = "Darwin" ] && [ "$ARCH" = "arm64" ] && [ "$BINARY_ONLY" -ne 1 ] \
     log "The daemon keeps itself up to date. To force a reinstall through brew:"
     log "    brew upgrade --greedy wandb/taps/$CASK_NAME"
     log "(or pass --binary to switch to a script-managed binary install)"
+    configure_server_endpoint
     exit 0
   fi
 
@@ -245,6 +281,7 @@ if [ "$OS" = "Darwin" ] && [ "$ARCH" = "arm64" ] && [ "$BINARY_ONLY" -ne 1 ] \
     SWITCH_CMD="brew uninstall --cask wandb/taps/$INSTALLED_CASK && brew install --cask wandb/taps/$CASK_NAME"
     if [ "$DRY_RUN" -eq 1 ]; then
       log "(dry-run) would prompt to switch casks: $SWITCH_CMD"
+      configure_server_endpoint
       exit 0
     fi
     if have brew && [ "$TTY_OK" -eq 1 ]; then
@@ -309,6 +346,7 @@ with brew:
     brew upgrade --greedy wandb/taps/$CASK_NAME    # force-reinstall latest
     brew uninstall --cask wandb/taps/$CASK_NAME    # clean uninstall
 EOS
+      configure_server_endpoint
       exit 0
     fi
   elif have brew; then
@@ -615,6 +653,10 @@ else
   } > "$MARKER"
   chmod 644 "$MARKER"
 fi
+
+# Set the self-hosted endpoint before the upgrade-restart below, so a restart
+# brings the daemon up already pointed at the right server.
+configure_server_endpoint "$INSTALL_PATH"
 
 # ─── PATH check ───────────────────────────────────────────────────────
 case ":$PATH:" in

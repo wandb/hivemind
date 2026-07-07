@@ -1,0 +1,8 @@
+# TLS-terminating reverse proxy for the AgentStream self-host stack.
+# The site address carries the scheme: http://localhost (the default) serves
+# plain HTTP for local testing — no TLS, no HTTP->HTTPS redirect, which would
+# break daemons (they don't follow redirects). An https:// address gets
+# automatic Let's Encrypt certificates and the standard HTTP->HTTPS redirect.
+{$SITE_ADDRESS:http://localhost} {
+	reverse_proxy app:8080
+}

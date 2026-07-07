@@ -1,0 +1,108 @@
+# Bundled ClickHouse for the AgentStream self-host stack.
+#
+# `hivemind serve` layers this onto docker-compose.yml automatically, unless
+# setup points the stack at an external/managed ClickHouse (CLICKHOUSE_HOST),
+# in which case it's omitted and the app/worker connect there instead.
+#
+# It's a separate file rather than a compose profile so the container can be
+# truly absent: the app/worker `depends_on: clickhouse` lives here too, so
+# omitting the overlay leaves no dangling dependency on an unstarted service.
+
+services:
+  # Re-attach the healthcheck dependency only when the bundled container is
+  # present. Merged onto the base app/worker definitions (depends_on maps are
+  # unioned across compose files).
+  app:
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  worker:
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  clickhouse:
+    # LTS line; keep in lockstep with backend/docker-compose.dev.yaml and
+    # .github/workflows/python.yml (test-api) — migrations are exercised
+    # against this version. Needs >= 25.8: migration 0004's vector
+    # similarity index was experimental before that.
+    image: clickhouse/clickhouse-server:26.3
+    restart: unless-stopped
+    environment:
+      - CLICKHOUSE_DB=${CLICKHOUSE_DB:-agentstream}
+      # Match the creds the app/worker connect with so an operator who sets
+      # these in .env doesn't end up with a client/server mismatch. The image
+      # provisions this user on first boot (removing the stock passwordless
+      # default when a password is set).
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-default}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+      # Optional S3-backed storage with a local cache (ClickHouse Cloud style).
+      # `hivemind serve setup` points CLICKHOUSE_STORAGE_CONFIG at
+      # clickhouse-storage.xml and sets the endpoint when you opt in; otherwise
+      # the disabled no-op config below keeps data on the local volume.
+      # Credentials are reused from the app's AWS_* values (one set of keys),
+      # read by clickhouse-storage.xml via from_env.
+      - CLICKHOUSE_S3_ENDPOINT=${CLICKHOUSE_S3_ENDPOINT:-}
+      - CLICKHOUSE_S3_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - CLICKHOUSE_S3_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - CLICKHOUSE_S3_CACHE_SIZE=${CLICKHOUSE_S3_CACHE_SIZE:-10Gi}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      # ./01-init.sh is a symlink to ../backend/db/01-init.sh in the source
+      # checkout; `hivemind serve up` materializes the real file into the
+      # instance dir so the stack runs without the source tree present.
+      - ./01-init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+      # Storage policy config. Defaults to a no-op (<clickhouse/>); setup swaps
+      # CLICKHOUSE_STORAGE_CONFIG to ./clickhouse-storage.xml to back tables
+      # with object storage. Both files are materialized into the instance dir.
+      - ${CLICKHOUSE_STORAGE_CONFIG:-./clickhouse-storage.disabled.xml}:/etc/clickhouse-server/config.d/zzz-agentstream-storage.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Nightly ClickHouse backup to object storage (opt-in). Gated behind the
+  # `backup` compose profile: `hivemind serve setup` writes COMPOSE_PROFILES=backup
+  # (plus the CLICKHOUSE_BACKUP_* vars) when you enable backups after choosing
+  # object storage. The backup is ClickHouse's native `BACKUP ... TO S3`; the
+  # retention prune is `rclone delete --min-age`. Both reuse the app's S3
+  # credentials and target <bucket>/clickhouse-backups/. See docs/self-hosting.md.
+  # Only meaningful for the bundled container — external/managed ClickHouse owns
+  # its own backups, so `hivemind serve setup` skips this offer there.
+  clickhouse-backup:
+    image: rclone/rclone:1
+    restart: unless-stopped
+    profiles: ["backup"]
+    entrypoint: ["/bin/sh", "/usr/local/bin/clickhouse-backup.sh", "--daemon"]
+    environment:
+      - CLICKHOUSE_HTTP_URL=http://clickhouse:8123
+      - CLICKHOUSE_DB=${CLICKHOUSE_DB:-agentstream}
+      - CLICKHOUSE_BACKUP_S3_ENDPOINT=${CLICKHOUSE_BACKUP_S3_ENDPOINT:-}
+      - CLICKHOUSE_BACKUP_RETENTION_DAYS=${CLICKHOUSE_BACKUP_RETENTION_DAYS:-3}
+      - CLICKHOUSE_BACKUP_HOUR=${CLICKHOUSE_BACKUP_HOUR:-3}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      # rclone remote `backup` for the prune step, derived from the app's S3
+      # config (same bucket, creds, endpoint, region) via RCLONE_CONFIG_* env.
+      - CLICKHOUSE_BACKUP_RCLONE_PATH=backup:${S3_BUCKET_NAME:-}/clickhouse-backups
+      - RCLONE_CONFIG_BACKUP_TYPE=s3
+      - RCLONE_CONFIG_BACKUP_PROVIDER=${CLICKHOUSE_BACKUP_RCLONE_PROVIDER:-AWS}
+      - RCLONE_CONFIG_BACKUP_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - RCLONE_CONFIG_BACKUP_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - RCLONE_CONFIG_BACKUP_ENDPOINT=${S3_ENDPOINT_URL:-}
+      - RCLONE_CONFIG_BACKUP_REGION=${AWS_REGION:-}
+    volumes:
+      - ./clickhouse-backup.sh:/usr/local/bin/clickhouse-backup.sh:ro
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+volumes:
+  clickhouse_data:

@@ -114,6 +114,29 @@ Once the daemon is running, open any supported coding agent and start working. W
 
 HiveMind also installs an `@hivemind` agent definition when the daemon starts (Claude Code, Codex, and Cursor). Type `@hivemind` in a supported agent to ask questions about past coding sessions: what you worked on last week, how a bug was fixed, where a particular change was made. It searches across your team's session history and pulls the answer into your current conversation.
 
+## Self-hosting
+
+Run HiveMind on your own infrastructure instead of [hivemind.wandb.tools](https://hivemind.wandb.tools). The self-hosted stack uses the same artifacts as the SaaS — the `ghcr.io/wandb/hivemind-server` image (API + dashboard + worker), ClickHouse, Redis, and Caddy for TLS.
+
+The recommended path is the `hivemind serve` command, which configures the instance, materializes the Compose files, and wraps `docker compose` for you:
+
+```bash
+curl -fsSL https://hivemind.wandb.tools/install | sh
+hivemind serve up
+```
+
+`hivemind serve up` generates an `.env` (domain, TLS handling, LLM provider, optional license), pulls the published images, starts the stack, and prints a one-time setup URL for creating the first admin account.
+
+Prefer to drive Docker Compose yourself? The raw stack lives in [`selfhost/`](selfhost/) — the same files `hivemind serve` runs — so you can read it or wire it into your own orchestration:
+
+```bash
+cd selfhost
+cp .env.example .env       # then set DOMAIN, EXTERNAL_URL, JWT_SECRET, …
+docker compose -f docker-compose.yml -f docker-compose.clickhouse.yml up -d
+```
+
+See the [self-hosting guide](docs/self-hosting.md) for the full walkthrough — GitHub App setup, single-player mode, external/managed ClickHouse, object storage, backups, Tailscale, upgrades, and the [LLM provider](docs/llm-providers.md) options.
+
 ## How HiveMind compares
 
 HiveMind gives you one view across every coding agent your team uses, instead of a separate dashboard per vendor. Native dashboards from individual agent vendors only show their own usage. HiveMind brings Claude Code, Codex, Cursor, Gemini, Copilot, and more together with session-level detail, spend, and outcomes in one place.

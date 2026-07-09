@@ -1,0 +1,276 @@
+# AgentStream self-hosted deployment.
+#
+# Same artifacts as the SaaS (backend/Dockerfile.cloudrun: API + dashboard in
+# one image; the worker runs the identical image), differing only in
+# configuration — see docs/self-hosting.md and https://hivemind.wandb.tools/docs.
+#
+# Quick start:   hivemind serve up   (configures .env, pulls, starts, prints
+#                                     the setup URL)
+# Manual start:  cp .env.example .env && edit && docker compose up -d
+#
+# Runs the official ghcr.io/wandb/hivemind-server image; pin a release with
+# HIVEMIND_VERSION in .env. To build from a source checkout instead (dev):
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    # Host ports default to 80/443; `hivemind serve setup` can remap them (e.g.
+    # when 80 is taken locally, or a platform proxy forwards a custom port).
+    # In upstream-TLS / plain-HTTP modes Caddy doesn't serve 443, so setup
+    # writes CADDY_HTTPS_PORT=0 — Docker then maps the unused container :443 to
+    # an ephemeral host port instead of fighting an upstream proxy for 443.
+    ports:
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+    environment:
+      # Scheme decides TLS: http://localhost = plain HTTP (no redirect),
+      # https://domain = auto-TLS + HTTP->HTTPS redirect. Behind a platform
+      # proxy that already terminates TLS (exe.dev, Cloudflare Tunnel, a
+      # cloud load balancer), set SITE_ADDRESS=http:// in .env — plain HTTP
+      # for any host — while EXTERNAL_URL stays the public https:// URL.
+      - SITE_ADDRESS=${SITE_ADDRESS:-${EXTERNAL_URL:-http://localhost}}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+  app:
+    image: ghcr.io/wandb/hivemind-server:${HIVEMIND_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      - ENVIRONMENT=selfhost
+      - JWT_SECRET=${JWT_SECRET:?run hivemind serve up or set JWT_SECRET in .env}
+      # Master key for instance_secrets (encrypted GitHub App creds, etc.).
+      # Optional: the feature no-ops if unset. `hivemind serve setup` writes it.
+      - HIVEMIND_SECRET_KEY=${HIVEMIND_SECRET_KEY:-}
+      # License (optional; unlicensed runs in warn mode with a dashboard banner).
+      - HIVEMIND_LICENSE=${HIVEMIND_LICENSE:-}
+      - LICENSE_ENFORCEMENT_MODE=${LICENSE_ENFORCEMENT_MODE:-warn}
+      # Install method, reported in the daily anonymized check-in so we can see
+      # how customers deploy (the helm chart sets "helm"). Opt out of the
+      # check-in entirely with HIVEMIND_TELEMETRY=false or DO_NOT_TRACK=1.
+      - HIVEMIND_FLAVOR=${HIVEMIND_FLAVOR:-docker-compose}
+      # EXTERNAL_URL pins the /setup wizard's manifest URLs (webhook,
+      # callbacks) — never derived from request headers when set.
+      - EXTERNAL_URL=${EXTERNAL_URL:-http://localhost}
+      - DASHBOARD_URL=${EXTERNAL_URL:-http://localhost}
+      - STATIC_FILES_DIR=/app/static
+      - AUTO_MIGRATE=true
+      # Data stores. CLICKHOUSE_* default to the bundled `clickhouse` container
+      # (see docker-compose.clickhouse.yml, layered in by `hivemind serve` unless
+      # you point these at an external/managed ClickHouse, e.g. ClickHouse Cloud).
+      # Set CLICKHOUSE_SECURE=true for a TLS endpoint (managed CH uses 8443).
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8123}
+      - CLICKHOUSE_DB=${CLICKHOUSE_DB:-agentstream}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-default}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
+      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE:-}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - QUEUE_PROVIDER=redis
+      # Storage for session screenshots and data exports. `hivemind serve
+      # setup` writes STORAGE_PROVIDER + the S3/bucket env when you choose
+      # object storage; unset falls back to the local /data volume. The s3
+      # provider covers AWS S3, Cloudflare R2, GCS (via its S3-interop
+      # endpoint), and any S3-compatible store (set S3_ENDPOINT_URL).
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
+      - STORAGE_LOCAL_DIR=/data/storage
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-}
+      - AWS_REGION=${AWS_REGION:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      # Native GCS (STORAGE_PROVIDER=gcs) uses application-default credentials;
+      # mount a service-account JSON and set GOOGLE_APPLICATION_CREDENTIALS.
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+      # GitHub App credentials: the /setup wizard stores them encrypted in
+      # ClickHouse (instance_secrets) and they're loaded into the env on boot.
+      # Explicit GITHUB_* env vars in .env still override individual values.
+      # GITHUB_CREDS_FILE only anchors the single-user owner file's directory.
+      - GITHUB_CREDS_FILE=/data/github-app.env
+      # Path to the bind-mounted .env, snapshotted (encrypted) to the bucket for
+      # `hivemind serve restore`. See the read-only mount below.
+      - CONFIG_ENV_FILE=/config/.env
+      - GITHUB_APP_ID=${GITHUB_APP_ID:-}
+      - GITHUB_APP_SLUG=${GITHUB_APP_SLUG:-}
+      - GITHUB_APP_CLIENT_ID=${GITHUB_APP_CLIENT_ID:-}
+      - GITHUB_APP_CLIENT_SECRET=${GITHUB_APP_CLIENT_SECRET:-}
+      - GITHUB_APP_WEBHOOK_SECRET=${GITHUB_APP_WEBHOOK_SECRET:-}
+      - GITHUB_APP_PRIVATE_KEY=${GITHUB_APP_PRIVATE_KEY:-}
+      # Restrict login to your GitHub org(s). "none" = anyone can log in
+      # (the server rejects a set-but-empty value as misconfiguration).
+      - ALLOWED_GITHUB_ORGS=${ALLOWED_GITHUB_ORGS:-none}
+      # If no GitHub App is configured, login uses GitHub's device flow and
+      # the first GitHub user to log in claims the instance. Set this to pin
+      # that owner explicitly. See docs/self-hosting.md.
+      - SINGLE_USER_GITHUB_LOGIN=${SINGLE_USER_GITHUB_LOGIN:-}
+      # Self-host defaults: no quotas, no retention deletion, no autoscaler.
+      # USAGE_QUOTA_MODE is a no-op on self-host: quota_mode() reads
+      # LICENSE_ENFORCEMENT_MODE instead (warn -> counters advance but never deny).
+      - USAGE_QUOTA_MODE=off
+      - RETENTION_SWEEP_MODE=off
+      # Self-hosters cover their users under their own agreement; skip the
+      # per-user clickwrap prompt.
+      - TERMS_ACCEPTANCE_ENABLED=false
+      # ── LLM provider (advanced AI features) ──────────────────────────
+      # Features (insights, PR walkthroughs, personas, enrichment, fork
+      # context) are bring-your-own-provider and quietly no-op when unset.
+      # Default is Anthropic via ANTHROPIC_API_KEY. To use an OpenAI-compatible
+      # endpoint (Ollama, vLLM, the W&B / CoreWeave inference service) or
+      # Amazon Bedrock instead, set LLM_PROVIDER + LLM_BASE_URL + LLM_API_KEY +
+      # LLM_MODEL. `hivemind serve setup` writes these. Full guide:
+      # docs/llm-providers.md.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_EXTRA_HEADERS=${LLM_EXTRA_HEADERS:-}
+      - LLM_BEDROCK_REGION=${LLM_BEDROCK_REGION:-}
+      # Per-feature overrides — titles and weekly summaries can run a smaller,
+      # cheaper model than the main one (LLM_SMALL_MODEL, then the per-feature
+      # vars; all fall back to LLM_MODEL).
+      - LLM_SMALL_MODEL=${LLM_SMALL_MODEL:-}
+      - TITLE_EXTRACTION_MODEL=${TITLE_EXTRACTION_MODEL:-}
+      - WEEKLY_SUMMARY_MODEL=${WEEKLY_SUMMARY_MODEL:-}
+      # Embeddings (insight clustering + semantic search). OpenAI-compatible;
+      # falls back to OPENAI_API_KEY. Replacement models MUST output 1536-dim
+      # vectors to match the ClickHouse index (see docs/llm-providers.md).
+      - EMBEDDINGS_API_KEY=${EMBEDDINGS_API_KEY:-}
+      - EMBEDDINGS_BASE_URL=${EMBEDDINGS_BASE_URL:-}
+      - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-}
+      # Bedrock auth (only when LLM_PROVIDER=bedrock) reuses the AWS_* set above
+      # for object storage; only the optional session token is added here.
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+    volumes:
+      - ${HIVEMIND_SERVE_DATA_DIR:-./data}:/data
+      # Read-only .env so the app can snapshot it (encrypted) to the bucket for
+      # `hivemind serve restore`. CONFIG_ENV_FILE points here.
+      - ./.env:/config/.env:ro
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    # The bundled-ClickHouse dependency is added by docker-compose.clickhouse.yml
+    # (layered in by `hivemind serve` unless CLICKHOUSE_HOST points elsewhere).
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # NOTE: the worker reads GitHub App credentials only at startup. After
+  # completing the /setup wizard, run `hivemind serve restart worker` —
+  # until then, membership checks and PR comments silently no-op.
+  worker:
+    image: ghcr.io/wandb/hivemind-server:${HIVEMIND_VERSION:-latest}
+    restart: unless-stopped
+    command: python -m agentstream_api.worker
+    # Scale out: set WORKER_REPLICAS in .env (workers share one Redis Streams
+    # consumer group; only one runs the leader/periodic tasks). See
+    # docs/self-hosting.md#scaling-the-worker.
+    deploy:
+      replicas: ${WORKER_REPLICAS:-1}
+    environment:
+      - ENVIRONMENT=selfhost
+      # Concurrent jobs per worker; unset auto-sizes from host CPU count (floor 10, cap 32).
+      - WORKER_MAX_IN_FLIGHT=${WORKER_MAX_IN_FLIGHT:-}
+      - JWT_SECRET=${JWT_SECRET:?run hivemind serve up or set JWT_SECRET in .env}
+      # Master key for instance_secrets (encrypted GitHub App creds, etc.).
+      # Optional: the feature no-ops if unset. `hivemind serve setup` writes it.
+      - HIVEMIND_SECRET_KEY=${HIVEMIND_SECRET_KEY:-}
+      - HIVEMIND_LICENSE=${HIVEMIND_LICENSE:-}
+      - LICENSE_ENFORCEMENT_MODE=${LICENSE_ENFORCEMENT_MODE:-warn}
+      # The daily anonymized self-host check-in runs from the worker leader
+      # loop. HIVEMIND_FLAVOR is reported up; the two opt-out vars suppress it.
+      - HIVEMIND_FLAVOR=${HIVEMIND_FLAVOR:-docker-compose}
+      - HIVEMIND_TELEMETRY=${HIVEMIND_TELEMETRY:-true}
+      - DO_NOT_TRACK=${DO_NOT_TRACK:-}
+      # Override where the check-in posts (defaults to the W&B SaaS). Airgapped
+      # instances can leave the default; the POST just fails silently.
+      - LICENSE_TELEMETRY_ENDPOINT=${LICENSE_TELEMETRY_ENDPOINT:-}
+      - AUTO_MIGRATE=false
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8123}
+      - CLICKHOUSE_DB=${CLICKHOUSE_DB:-agentstream}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-default}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
+      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE:-}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - QUEUE_PROVIDER=redis
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
+      - STORAGE_LOCAL_DIR=/data/storage
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-}
+      - AWS_REGION=${AWS_REGION:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+      # Leader-loop sweeps re-derive dropped jobs — the durability backstop
+      # for the Redis queue (see https://hivemind.wandb.tools/docs).
+      - WORKER_RUN_PERIODIC_TASKS=true
+      - GITHUB_CREDS_FILE=/data/github-app.env
+      - GITHUB_APP_ID=${GITHUB_APP_ID:-}
+      - GITHUB_APP_SLUG=${GITHUB_APP_SLUG:-}
+      - GITHUB_APP_CLIENT_ID=${GITHUB_APP_CLIENT_ID:-}
+      - GITHUB_APP_CLIENT_SECRET=${GITHUB_APP_CLIENT_SECRET:-}
+      - GITHUB_APP_WEBHOOK_SECRET=${GITHUB_APP_WEBHOOK_SECRET:-}
+      - GITHUB_APP_PRIVATE_KEY=${GITHUB_APP_PRIVATE_KEY:-}
+      # USAGE_QUOTA_MODE is a no-op on self-host: quota_mode() reads
+      # LICENSE_ENFORCEMENT_MODE instead (warn -> counters advance but never deny).
+      - USAGE_QUOTA_MODE=off
+      - RETENTION_SWEEP_MODE=off
+      # LLM provider — must match the app's config (the worker runs the same
+      # AI features). See docs/llm-providers.md.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_EXTRA_HEADERS=${LLM_EXTRA_HEADERS:-}
+      - LLM_BEDROCK_REGION=${LLM_BEDROCK_REGION:-}
+      - LLM_SMALL_MODEL=${LLM_SMALL_MODEL:-}
+      - TITLE_EXTRACTION_MODEL=${TITLE_EXTRACTION_MODEL:-}
+      - WEEKLY_SUMMARY_MODEL=${WEEKLY_SUMMARY_MODEL:-}
+      - EMBEDDINGS_API_KEY=${EMBEDDINGS_API_KEY:-}
+      - EMBEDDINGS_BASE_URL=${EMBEDDINGS_BASE_URL:-}
+      - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-}
+      # Bedrock auth reuses the AWS_* set above for object storage; only the
+      # optional session token is added here.
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+    volumes:
+      - ${HIVEMIND_SERVE_DATA_DIR:-./data}:/data
+    depends_on:
+      app:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # AOF everysec: the queue lives here now; ≤1s of writes at risk on hard
+    # power loss, reconciled by the worker's leader-loop sweeps.
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  caddy_data:
+  caddy_config:
+  redis_data:

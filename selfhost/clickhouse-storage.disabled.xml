@@ -1,0 +1,7 @@
+<!--
+  No-op config: object-storage backing for ClickHouse is disabled, so table
+  data stays on the local clickhouse_data volume. `hivemind serve setup` swaps
+  in clickhouse-storage.xml (by setting CLICKHOUSE_STORAGE_CONFIG in .env) when
+  you choose to back ClickHouse with object storage.
+-->
+<clickhouse/>

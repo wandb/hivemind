@@ -1,3 +1,5 @@
+<img src="logomark.png" alt="HiveMind" width="96" />
+
 # W&B HiveMind
 
 W&B HiveMind is a shared dashboard for AI coding sessions. A lightweight daemon runs on each developer's machine, watches for coding agent activity, and sends session transcripts to [hivemind.wandb.tools](https://hivemind.wandb.tools).

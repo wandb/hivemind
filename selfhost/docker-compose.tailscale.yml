@@ -1,4 +1,4 @@
-# Tailscale ingress overlay for the AgentStream self-host stack.
+# Tailscale ingress overlay for the HiveMind self-host stack.
 #
 # Enabled by `hivemind serve setup` or `hivemind serve tailscale enable`, which
 # set TAILSCALE_MODE=sidecar in .env; `hivemind serve up` then layers this file

@@ -17,8 +17,8 @@ Architecture and rationale: [self-hosting-design.md](https://hivemind.wandb.tool
 ## Quick start
 
 ```bash
-git clone https://github.com/wandb/agentstream
-cd agentstream/selfhost
+git clone https://github.com/wandb/hivemind
+cd hivemind/selfhost
 hivemind serve up
 ```
 
@@ -163,7 +163,7 @@ needed.
 ## Operations
 
 ```bash
-cd agentstream/selfhost
+cd hivemind/selfhost
 hivemind serve status                  # service status
 hivemind serve logs app                # API logs
 hivemind serve logs worker             # normalization/enrichment logs
@@ -253,7 +253,7 @@ upgrade the CLI first (`brew upgrade hivemind` or
 | `CLICKHOUSE_HOST` | no | Point at an [external/managed ClickHouse](#database-clickhouse); any value other than `clickhouse` disables the bundled container |
 | `CLICKHOUSE_PORT` | no | ClickHouse HTTP(S) port (bundled `8123`; managed CH is usually `8443`) |
 | `CLICKHOUSE_SECURE` | no | Force TLS. Port `8443`/`443` already auto-enables it, so managed CH usually needs nothing here; set `true` only for TLS on a non-standard port |
-| `CLICKHOUSE_DB` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | no | Database name (default `agentstream`), username (default `default`), and password for an external ClickHouse |
+| `CLICKHOUSE_DB` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | no | Database name (default `hivemind`; fallback `agentstream` when unset for older installs), username (default `default`), and password for an external ClickHouse |
 | `HIVEMIND_LICENSE` | no | Signed [license](#license) token (verified offline); unset runs unlicensed with a banner |
 | `LICENSE_ENFORCEMENT_MODE` | no | `off` \| `warn` (default) \| `enforce`; `warn` shows banners but never disables anything |
 | `GITHUB_APP_*` | via wizard | GitHub App credentials; the wizard stores them encrypted in ClickHouse (`instance_secrets`). Set here only to override the wizard or bring your own app |
@@ -467,12 +467,12 @@ CLICKHOUSE_HOST=abc123.us-east-1.aws.clickhouse.cloud
 CLICKHOUSE_PORT=8443        # managed CH speaks HTTPS on 8443; bundled uses 8123
 # CLICKHOUSE_SECURE is unnecessary here — port 8443/443 auto-enables TLS. Set
 # CLICKHOUSE_SECURE=true only to force TLS on a non-standard port.
-CLICKHOUSE_DB=agentstream
+CLICKHOUSE_DB=hivemind
 CLICKHOUSE_USER=default
 CLICKHOUSE_PASSWORD=…
 ```
 
-The `agentstream` database is created automatically on first boot
+The database named by `CLICKHOUSE_DB` (default `hivemind`) is created automatically on first boot
 (`AUTO_MIGRATE=true`), so the credentials only need `CREATE DATABASE` plus table
 DDL. To switch an existing instance, set these in `.env` and
 `hivemind serve up` — but note the two stores are separate: data in the bundled
@@ -523,7 +523,7 @@ sidecar (the `rclone/rclone` image) under the `backup` compose profile:
 | `CLICKHOUSE_BACKUP_RCLONE_PROVIDER` | `AWS` | `AWS` for S3; `Other` for R2 / GCS / MinIO |
 
 How it works: the sidecar runs ClickHouse's native
-[`BACKUP DATABASE agentstream TO S3(...)`](https://clickhouse.com/docs/en/operations/backup)
+[`BACKUP DATABASE <CLICKHOUSE_DB> TO S3(...)`](https://clickhouse.com/docs/en/operations/backup)
 each night — a consistent, self-contained snapshot of schema **and** data that
 works whether tables live on the local disk or the S3 storage policy. Each run
 writes a timestamped folder under `clickhouse-backups/`, then prunes folders
@@ -585,7 +585,7 @@ Then point `clickhouse-client` at the instance and restore a chosen backup
 folder (start with `AUTO_MIGRATE=false` — the backup carries the schema):
 
 ```sql
-RESTORE DATABASE agentstream
+RESTORE DATABASE <CLICKHOUSE_DB>
 FROM S3('https://<bucket>.s3.<region>.amazonaws.com/clickhouse-backups/<TIMESTAMP>',
         '<ACCESS_KEY>', '<SECRET_KEY>');
 ```

@@ -1,4 +1,4 @@
-# Bundled ClickHouse for the AgentStream self-host stack.
+# Bundled ClickHouse for the HiveMind self-host stack.
 #
 # `hivemind serve` layers this onto docker-compose.yml automatically, unless
 # setup points the stack at an external/managed ClickHouse (CLICKHOUSE_HOST),

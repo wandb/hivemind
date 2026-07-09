@@ -1,4 +1,4 @@
-# AgentStream self-host stack
+# HiveMind self-host stack
 
 ```bash
 hivemind serve up

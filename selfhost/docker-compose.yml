@@ -1,4 +1,4 @@
-# AgentStream self-hosted deployment.
+# HiveMind self-hosted deployment.
 #
 # Same artifacts as the SaaS (backend/Dockerfile.cloudrun: API + dashboard in
 # one image; the worker runs the identical image), differing only in

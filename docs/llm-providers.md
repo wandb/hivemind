@@ -1,6 +1,6 @@
 # LLM Providers
 
-AgentStream's advanced AI features call an LLM:
+HiveMind's advanced AI features call an LLM:
 
 - **Session enrichment** — chapter segmentation, titles, session classification
 - **Insights pipeline** — per-session extraction (Stage 1) and cluster matching (Stage 2)

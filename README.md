@@ -127,6 +127,18 @@ If you already use W&B Weave, it works together with HiveMind. They cover differ
 - Weave observes what your AI application does in _production_, tracking LLM and agent traces, evaluations, and quality.
 - HiveMind observes how your team _builds software_ with AI coding agents, tracking details like sessions, spend, and productivity.
 
+## Self-hosting
+
+The steps above connect you to the hosted service at [hivemind.wandb.tools](https://hivemind.wandb.tools) — the fastest way to start and what most teams should use. If you'd rather run the whole stack on your own infrastructure (dashboard, API, worker, ClickHouse, Redis), HiveMind self-hosts with Docker Compose:
+
+```bash
+hivemind serve up
+```
+
+On first run this configures a local instance, starts every service, and prints a one-time `/setup` URL for creating your admin account. Your daemons then point at your own instance instead of the hosted one.
+
+Self-hosting is optional — nothing above requires it. For the full walkthrough (domains, TLS, external ClickHouse, backups, LLM providers), see the [self-host guide](selfhost/README.md).
+
 ## Next steps
 
 - [hivemind.wandb.tools](https://hivemind.wandb.tools): Sign in and see your team's sessions on the live dashboard

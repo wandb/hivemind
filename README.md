@@ -116,13 +116,25 @@ Once the daemon is running, open any supported coding agent and start working. W
 
 HiveMind also installs an `@hivemind` agent definition when the daemon starts (Claude Code, Codex, and Cursor). Type `@hivemind` in a supported agent to ask questions about past coding sessions: what you worked on last week, how a bug was fixed, where a particular change was made. It searches across your team's session history and pulls the answer into your current conversation.
 
+## Self-hosting
+
+The steps above connect you to the hosted service at [hivemind.wandb.tools](https://hivemind.wandb.tools) — the fastest way to start and what most teams should use. If you'd rather run the whole stack on your own infrastructure (dashboard, API, worker, ClickHouse, Redis), HiveMind self-hosts with Docker Compose:
+
+```bash
+hivemind serve up
+```
+
+On first run this configures a local instance, starts every service, and prints a one-time `/setup` URL for creating your admin account. Your daemons then point at your own instance instead of the hosted one.
+
+Self-hosting is optional — nothing above requires it. For the full walkthrough (domains, TLS, external ClickHouse, backups, LLM providers), see the [self-host guide](selfhost/README.md).
+
 ## How HiveMind compares
 
 HiveMind gives you one view across every coding agent your team uses, instead of a separate dashboard per vendor. Native dashboards from individual agent vendors only show their own usage. HiveMind brings Claude Code, Codex, Cursor, Gemini, Copilot, and more together with session-level detail, spend, and outcomes in one place.
 
 ### HiveMind and Weave
 
-If you already use W&B Weave, it works together with HiveMind. They cover different stages and answer different questions.
+If you already use [W&B Weave](https://wandb.ai/site/weave/), it works together with HiveMind. They cover different stages and answer different questions.
 
 - Weave observes what your AI application does in _production_, tracking LLM and agent traces, evaluations, and quality.
 - HiveMind observes how your team _builds software_ with AI coding agents, tracking details like sessions, spend, and productivity.

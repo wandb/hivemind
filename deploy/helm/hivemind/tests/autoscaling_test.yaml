@@ -1,0 +1,62 @@
+suite: autoscaling wiring
+release:
+  name: hivemind
+  namespace: hivemind
+tests:
+  - it: omits the api replica count when the HPA is enabled (default)
+    templates:
+      - templates/api-deployment.yaml
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - notExists:
+          path: spec.replicas
+
+  - it: pins the api replica count when autoscaling is off
+    templates:
+      - templates/api-deployment.yaml
+    set:
+      api.autoscaling.enabled: false
+      api.replicaCount: 3
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
+
+  - it: renders the api HPA by default
+    templates:
+      - templates/api-hpa.yaml
+    asserts:
+      - isKind:
+          of: HorizontalPodAutoscaler
+
+  - it: renders a KEDA ScaledObject for the worker by default
+    templates:
+      - templates/worker-scaledobject.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: ScaledObject
+
+  - it: renders no ScaledObject when the worker uses the CPU HPA
+    templates:
+      - templates/worker-scaledobject.yaml
+    set:
+      worker.autoscaling.mode: hpa
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: adds a KEDA TriggerAuthentication when redis has a password
+    templates:
+      - templates/worker-scaledobject.yaml
+    set:
+      redis.password: s3cret
+    asserts:
+      - hasDocuments:
+          count: 2

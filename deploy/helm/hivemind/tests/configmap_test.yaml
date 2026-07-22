@@ -1,0 +1,104 @@
+suite: application configmap
+release:
+  name: hivemind
+  namespace: hivemind
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: omits LLM/embeddings provider env by default (features no-op)
+    asserts:
+      - notExists:
+          path: data.LLM_PROVIDER
+      - notExists:
+          path: data.LLM_BASE_URL
+      - notExists:
+          path: data.LLM_MODEL
+      - notExists:
+          path: data.EMBEDDINGS_PROVIDER
+      - notExists:
+          path: data.EMBEDDINGS_MODEL
+
+  - it: wires an OpenAI-compatible LLM provider
+    set:
+      config.llm.provider: openai
+      config.llm.baseURL: https://api.inference.wandb.ai/v1
+      config.llm.model: meta-llama/Llama-3.3-70B-Instruct
+      config.llm.smallModel: meta-llama/Llama-3.1-8B-Instruct
+      config.llm.extraHeaders: '{"OpenAI-Project": "team/proj"}'
+      config.llm.models.enrichment: custom-enrichment
+    asserts:
+      - equal:
+          path: data.LLM_PROVIDER
+          value: openai
+      - equal:
+          path: data.LLM_BASE_URL
+          value: https://api.inference.wandb.ai/v1
+      - equal:
+          path: data.LLM_MODEL
+          value: meta-llama/Llama-3.3-70B-Instruct
+      - equal:
+          path: data.LLM_SMALL_MODEL
+          value: meta-llama/Llama-3.1-8B-Instruct
+      - equal:
+          path: data.LLM_EXTRA_HEADERS
+          value: '{"OpenAI-Project": "team/proj"}'
+      - equal:
+          path: data.ENRICHMENT_MODEL
+          value: custom-enrichment
+
+  - it: wires a Bedrock LLM provider
+    set:
+      config.llm.provider: bedrock
+      config.llm.bedrockRegion: us-east-1
+      config.llm.model: us.anthropic.claude-sonnet-4-20250514-v1:0
+    asserts:
+      - equal:
+          path: data.LLM_PROVIDER
+          value: bedrock
+      - equal:
+          path: data.LLM_BEDROCK_REGION
+          value: us-east-1
+
+  - it: disables embeddings when provider is none
+    set:
+      config.embeddings.provider: none
+    asserts:
+      - equal:
+          path: data.EMBEDDINGS_PROVIDER
+          value: none
+
+  - it: leaves telemetry on by default and opts out when disabled
+    asserts:
+      - notExists:
+          path: data.HIVEMIND_TELEMETRY
+  - it: opts out of telemetry
+    set:
+      config.telemetry: false
+    asserts:
+      - equal:
+          path: data.HIVEMIND_TELEMETRY
+          value: "false"
+
+  - it: renders the license telemetry endpoint override only when set
+    set:
+      config.license.telemetryEndpoint: https://license.example.com/checkin
+    asserts:
+      - equal:
+          path: data.LICENSE_TELEMETRY_ENDPOINT
+          value: https://license.example.com/checkin
+
+  - it: does not force ClickHouse TLS for the bundled node
+    asserts:
+      - notExists:
+          path: data.CLICKHOUSE_SECURE
+
+  - it: forces ClickHouse TLS for an external secure endpoint
+    set:
+      clickhouse.enabled: false
+      externalClickHouse.host: abc.clickhouse.cloud
+      externalClickHouse.httpPort: 8443
+      externalClickHouse.secure: true
+    asserts:
+      - equal:
+          path: data.CLICKHOUSE_SECURE
+          value: "true"

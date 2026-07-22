@@ -1,0 +1,240 @@
+{{- if .Values.observability.clickstack.enabled }}
+{{- $fullname := include "hivemind.fullname" . }}
+{{- $cs := .Values.observability.clickstack }}
+{{- if $cs.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}-clickstack
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "clickstack") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with $cs.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $cs.persistence.size | quote }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-clickstack
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "clickstack") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: ui
+      port: {{ $cs.uiPort }}
+      targetPort: ui
+    - name: otlp-grpc
+      port: {{ $cs.otlpGrpcPort }}
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: {{ $cs.otlpHttpPort }}
+      targetPort: otlp-http
+    # Native ClickHouse port — the standalone OTel collector writes spans to the
+    # bundled ClickHouse here. Not a declared containerPort on the all-in-one, so
+    # target the port number directly.
+    - name: clickhouse
+      port: 9000
+      targetPort: 9000
+  selector:
+    {{- include "hivemind.componentSelectorLabels" (dict "ctx" . "component" "clickstack") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-clickstack
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "clickstack") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "hivemind.componentSelectorLabels" (dict "ctx" . "component" "clickstack") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hivemind.componentLabels" (dict "ctx" . "component" "clickstack") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # The all-in-one entrypoint appends `ch-server`/`db` to /etc/hosts and then
+      # blocks on `curl http://ch-server:8123` before starting the API. Kubelet
+      # owns the pod's /etc/hosts and rewrites it on status syncs, racing away
+      # that append — when it loses, the container hangs forever on "Waiting for
+      # ClickHouse to be ready". Declaring the aliases here makes kubelet bake
+      # them into every rewrite, so resolution is deterministic.
+      hostAliases:
+        - ip: "127.0.0.1"
+          hostnames: ["ch-server", "db"]
+      {{- if $cs.persistence.enabled }}
+      initContainers:
+        # The all-in-one runs ClickHouse and MongoDB as background processes and
+        # doesn't forward SIGTERM to them on pod termination, so a restart leaves
+        # stale lock files: /var/lib/clickhouse/status and /data/db/mongod.lock.
+        # Each server's liveness check then false-positives against a reused PID
+        # (or a held flock) in the fresh container and refuses to start —
+        # ClickHouse "Another server instance ... already running", Mongo
+        # "DBPathInUse" — wedging the all-in-one (the UI comes up but has no DB).
+        # The RWO PVC + Recreate strategy already guarantee single access, so
+        # clearing stale locks on startup is safe (and a no-op after a clean
+        # shutdown, which removes the files itself).
+        - name: clear-stale-locks
+          image: "{{ $cs.image.repository }}:{{ $cs.image.tag }}"
+          imagePullPolicy: {{ $cs.image.pullPolicy }}
+          command: ["/bin/sh", "-c", "rm -f /var/lib/clickhouse/status /data/db/mongod.lock && echo 'cleared stale ClickHouse + Mongo lock files (if any)'"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+              subPath: clickhouse
+            - name: data
+              mountPath: /data/db
+              subPath: db
+      {{- end }}
+      containers:
+        - name: clickstack
+          image: "{{ $cs.image.repository }}:{{ $cs.image.tag }}"
+          imagePullPolicy: {{ $cs.image.pullPolicy }}
+          {{- $extURL := include "hivemind.clickstack.externalURL" . }}
+          {{- if or $cs.autoProvision $extURL }}
+          env:
+            {{- with $extURL }}
+            # Anchor HyperDX's post-login / auth redirects on the real host;
+            # without it FRONTEND_REDIRECT_BASE falls back to http://localhost:8080.
+            - name: FRONTEND_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $cs.autoProvision }}
+            # Seed a default connection + OTel sources at first boot so HyperDX's
+            # OpAMP server hands the bundled collector a config with OTLP
+            # receivers — otherwise it runs with no pipelines and nothing listens
+            # on 4317/4318. Only applied on a clean (empty-Mongo) install.
+            - name: DEFAULT_CONNECTIONS
+              value: {{ $cs.defaultConnections | quote }}
+            - name: DEFAULT_SOURCES
+              value: {{ $cs.defaultSources | quote }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: ui
+              containerPort: {{ $cs.uiPort }}
+            - name: otlp-grpc
+              containerPort: {{ $cs.otlpGrpcPort }}
+            - name: otlp-http
+              containerPort: {{ $cs.otlpHttpPort }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: ui
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 10
+          resources:
+            {{- toYaml $cs.resources | nindent 12 }}
+          {{- if $cs.persistence.enabled }}
+          volumeMounts:
+            # The all-in-one keeps MongoDB metadata at /data/db and ClickHouse
+            # telemetry at /var/lib/clickhouse. Mount those two paths via subPaths
+            # of one PVC — NOT /data as a whole: an empty volume over /data hides
+            # the image's pre-created /data/db, and MongoDB 4.x refuses to start
+            # (NonExistentPath: /data/db), which cascades into the HyperDX API
+            # 500ing on every request and the OpAMP collector never binding OTLP.
+            - name: data
+              mountPath: /data/db
+              subPath: db
+            - name: data
+              mountPath: /var/lib/clickhouse
+              subPath: clickhouse
+          {{- end }}
+        {{- if or $cs.dashboards.enabled $cs.appClickHouseConnection.enabled }}
+        - name: hyperdx-provisioner
+          image: "{{ $cs.image.repository }}:{{ $cs.image.tag }}"
+          imagePullPolicy: {{ $cs.image.pullPolicy }}
+          command: ["/bin/sh", "/etc/hyperdx/dashboards/provision.sh"]
+          env:
+            - name: PROVISION_INTERVAL_SECONDS
+              value: {{ $cs.dashboards.intervalSeconds | quote }}
+            - name: PROVISION_DASHBOARDS
+              value: {{ $cs.dashboards.enabled | quote }}
+            {{- if $cs.appClickHouseConnection.enabled }}
+            - name: APP_CH_CONNECTION_NAME
+              value: {{ $cs.appClickHouseConnection.name | quote }}
+            - name: APP_CH_HOST
+              value: {{ printf "http://%s:%v" (include "hivemind.clickhouse.host" .) (include "hivemind.clickhouse.httpPort" .) | quote }}
+            - name: APP_CH_USERNAME
+              value: {{ include "hivemind.clickhouse.user" . | quote }}
+            {{- include "hivemind.datastorePasswordEnv" . | nindent 12 }}
+            {{- end }}
+          # The configMap carries provision.sh (always) plus the dashboard JSON,
+          # so it's mounted whenever the sidecar runs, not only for dashboards.
+          volumeMounts:
+            - name: dashboard-templates
+              mountPath: /etc/hyperdx/dashboards
+            - name: dashboard-out
+              mountPath: /tmp/dashboards
+          resources:
+            {{- toYaml $cs.dashboards.resources | nindent 12 }}
+        {{- end }}
+      {{- $provisioner := or $cs.dashboards.enabled $cs.appClickHouseConnection.enabled }}
+      {{- if or $cs.persistence.enabled $provisioner }}
+      volumes:
+        {{- if $cs.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ $fullname }}-clickstack
+        {{- end }}
+        {{- if $provisioner }}
+        - name: dashboard-templates
+          configMap:
+            name: {{ $fullname }}-clickstack-dashboards
+        - name: dashboard-out
+          emptyDir: {}
+        {{- end }}
+      {{- end }}
+{{- if $cs.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}-clickstack
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "clickstack") | nindent 4 }}
+  {{- with $cs.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $cs.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if $cs.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $cs.ingress.host | quote }}
+      secretName: {{ $cs.ingress.tls.secretName | default (printf "%s-clickstack-tls" $fullname) }}
+  {{- end }}
+  rules:
+    - host: {{ required "observability.clickstack.ingress.host is required when the ClickStack ingress is enabled" $cs.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-clickstack
+                port:
+                  number: {{ $cs.uiPort }}
+{{- end }}
+{{- end }}

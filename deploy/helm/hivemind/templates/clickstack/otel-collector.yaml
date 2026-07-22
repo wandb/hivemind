@@ -1,0 +1,140 @@
+{{- if and .Values.observability.collector.enabled .Values.observability.clickstack.enabled (not .Values.observability.tracing.otlpEndpoint) }}
+{{- $fullname := include "hivemind.fullname" . }}
+{{- $col := .Values.observability.collector }}
+{{- $redisMetrics := and $col.redisMetrics $col.redisMetrics.enabled (or .Values.redis.enabled .Values.externalRedis.host) }}
+{{- $redisPassword := eq (include "hivemind.redis.passwordSet" .) "true" }}
+{{/*
+A standalone OpenTelemetry Collector with a STATIC otlp -> clickhouse pipeline.
+The bundled HyperDX all-in-one's collector is OpAMP-managed and never wires OTLP
+ingestion into its pipelines without manual UI onboarding, so the api/worker
+spans are sent here instead. It writes to ClickStack's own ClickHouse using the
+standard otel_traces schema, which is exactly what the autoProvisioned HyperDX
+"Traces" source reads — so traces appear in HyperDX out of the box.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-otel-collector
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "otel-collector") | nindent 4 }}
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      {{- if $redisMetrics }}
+      redis:
+        endpoint: {{ include "hivemind.redis.host" . }}:{{ include "hivemind.redis.port" . }}
+        collection_interval: {{ $col.redisMetrics.collectionInterval }}
+        {{- if $redisPassword }}
+        password: ${env:REDIS_PASSWORD}
+        {{- end }}
+      {{- end }}
+    processors:
+      batch: {}
+    exporters:
+      clickhouse:
+        endpoint: tcp://{{ $fullname }}-clickstack:9000?dial_timeout=10s
+        database: {{ $col.clickhouse.database }}
+        username: {{ $col.clickhouse.username }}
+        password: {{ $col.clickhouse.password | quote }}
+        create_schema: true
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [clickhouse]
+        {{- if $redisMetrics }}
+        metrics:
+          receivers: [redis]
+          processors: [batch]
+          exporters: [clickhouse]
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-otel-collector
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "otel-collector") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+  selector:
+    {{- include "hivemind.componentSelectorLabels" (dict "ctx" . "component" "otel-collector") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-otel-collector
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "otel-collector") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "hivemind.componentSelectorLabels" (dict "ctx" . "component" "otel-collector") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- $checksumInput := $col | toYaml }}
+        {{- if $redisMetrics }}
+        {{- $checksumInput = cat $checksumInput (include "hivemind.redis.host" .) (include "hivemind.redis.port" .) (include "hivemind.redis.passwordSet" .) }}
+        {{- end }}
+        checksum/config: {{ $checksumInput | sha256sum }}
+      labels:
+        {{- include "hivemind.componentLabels" (dict "ctx" . "component" "otel-collector") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: otel-collector
+          image: "{{ $col.image.repository }}:{{ $col.image.tag }}"
+          imagePullPolicy: {{ $col.image.pullPolicy }}
+          args: ["--config=/etc/otel/config.yaml"]
+          {{- if and $redisMetrics $redisPassword }}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  {{- if and (not .Values.redis.enabled) .Values.externalRedis.existingSecret }}
+                  name: {{ .Values.externalRedis.existingSecret }}
+                  key: {{ .Values.externalRedis.existingSecretKey }}
+                  {{- else }}
+                  name: {{ include "hivemind.secretName" . }}
+                  key: REDIS_PASSWORD
+                  {{- end }}
+          {{- end }}
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          readinessProbe:
+            tcpSocket:
+              port: otlp-grpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml $col.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}-otel-collector
+{{- end }}

@@ -1,0 +1,81 @@
+suite: security contexts
+release:
+  name: hivemind
+  namespace: hivemind
+tests:
+  - it: hardens the app container security context (api + worker)
+    templates:
+      - templates/api-deployment.yaml
+      - templates/worker-deployment.yaml
+    documentSelector:
+      path: kind
+      value: Deployment
+      matchMany: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          content: ALL
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.seccompProfile.type
+          value: RuntimeDefault
+
+  - it: sets the pod-level seccomp profile
+    templates:
+      - templates/api-deployment.yaml
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.seccompProfile.type
+          value: RuntimeDefault
+
+  - it: hardens the wait-for-clickhouse init container
+    templates:
+      - templates/api-deployment.yaml
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - contains:
+          path: spec.template.spec.initContainers[0].securityContext.capabilities.drop
+          content: ALL
+
+  - it: hardens the bundled datastore containers
+    templates:
+      - templates/clickhouse.yaml
+      - templates/redis.yaml
+    documentSelector:
+      path: kind
+      value: StatefulSet
+      matchMany: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          content: ALL
+
+  - it: runs ClickHouse as its non-root user with a matching fsGroup
+    templates:
+      - templates/clickhouse.yaml
+    documentSelector:
+      path: kind
+      value: StatefulSet
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 101
+      - equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 101

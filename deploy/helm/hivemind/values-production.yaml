@@ -1,0 +1,162 @@
+# Example production-flavored values for the Hivemind chart.
+#
+#   helm install hivemind deploy/helm/hivemind \
+#     -f deploy/helm/hivemind/values-production.yaml \
+#     --set externalURL=https://hivemind.example.com \
+#     --set ingress.host=hivemind.example.com
+#
+# This profile assumes:
+#   - KEDA is installed (https://keda.sh) for queue-depth worker autoscaling
+#   - cert-manager issues TLS
+#   - an S3-compatible bucket for HA-friendly storage (no RWX volume needed)
+# Tune the datastore sizes to your data volume; ClickHouse is the resource floor.
+
+image:
+  tag: ""   # pin a released hivemind-server tag for reproducible upgrades
+
+# --- Routing: Gateway API (recommended) -------------------------------------
+# Attaches an HTTPRoute to a Gateway your platform team runs (which terminates
+# TLS on its listener). Set parentRefs to your Gateway.
+ingress:
+  enabled: false
+gateway:
+  enabled: true
+  parentRefs:
+    - name: external          # <-- your Gateway's name
+      namespace: infra        # <-- your Gateway's namespace
+  # hostnames default to the externalURL host; override if the Gateway listener
+  # serves a different set.
+
+# Or, to use a legacy Ingress + cert-manager instead, flip the two blocks above:
+#   gateway:
+#     enabled: false
+#   ingress:
+#     enabled: true
+#     className: nginx
+#     annotations:
+#       cert-manager.io/cluster-issuer: letsencrypt-prod
+#     tls:
+#       enabled: true
+
+# --- API: horizontally scaled --------------------------------------------------
+api:
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 65
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: api
+
+# --- Worker: KEDA queue-depth autoscaling -------------------------------------
+worker:
+  autoscaling:
+    mode: keda
+    minReplicas: 2
+    maxReplicas: 20
+    keda:
+      pollingInterval: 10
+      cooldownPeriod: 180
+      triggers:
+        - stream: normal
+          lagCount: "75"
+          activationLagCount: "5"
+        - stream: long
+          lagCount: "15"
+          activationLagCount: "1"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+
+# --- Storage: S3 (no RWX volume required) -------------------------------------
+storage:
+  provider: s3
+  s3:
+    bucket: hivemind-prod
+    region: us-east-1
+    # Prefer IRSA / pod identity over static keys where possible.
+    # accessKeyId / secretAccessKey can be left blank to use the node role.
+
+# --- ClickHouse: give it real resources + a roomy volume ----------------------
+clickhouse:
+  enabled: true
+  resources:
+    requests:
+      cpu: "2"
+      memory: 8Gi
+    limits:
+      cpu: "8"
+      memory: 24Gi
+  persistence:
+    enabled: true
+    size: 200Gi
+    storageClass: ""   # use a fast SSD class
+
+# For a managed ClickHouse (e.g. ClickHouse Cloud) instead:
+#   clickhouse.enabled: false
+#   externalClickHouse:
+#     host: xxx.clickhouse.cloud
+#     httpPort: 8443                       # 443/8443 auto-negotiates TLS
+#     existingSecret: clickhouse-credentials
+# Port 8443 (or 443) makes the app + migrations connect over HTTPS automatically
+# (clickhouse_connect infers TLS from the port); the wait-for-clickhouse init
+# uses a scheme-agnostic TCP check, so the TLS endpoint works as-is.
+
+# --- Redis: persistent (it backs the durable queue) ---------------------------
+redis:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 16Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+# --- Observability: ClickStack (HyperDX) --------------------------------------
+observability:
+  tracing:
+    enabled: true
+    sampleRate: "0.3"   # sample at 30% to bound telemetry cost under load
+  clickstack:
+    enabled: true
+    persistence:
+      enabled: true
+      size: 50Gi
+    # The HyperDX UI is an internal tool; expose it through your Gateway, a
+    # separate Ingress, or `kubectl port-forward` as you prefer. Its bundled
+    # Ingress is left off here to keep this Gateway-based profile consistent.
+    ingress:
+      enabled: false
+
+# --- Secrets: supply via --set / --set-file / a sealed secret, e.g. -----------
+# secrets:
+#   githubApp:
+#     appId: "123456"
+#     clientId: "Iv1.xxxx"
+#     clientSecret: "..."
+#     webhookSecret: "..."
+#     privateKey: |
+#       -----BEGIN RSA PRIVATE KEY-----
+#       ...
+#   llm:
+#     anthropicApiKey: "sk-ant-..."

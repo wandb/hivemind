@@ -1,0 +1,118 @@
+{
+  "name": "Hivemind — Redis health",
+  "tags": ["provisioned"],
+  "tiles": [
+    {
+      "id": "redis-memory", "x": 0, "y": 0, "w": 12, "h": 4,
+      "config": {
+        "name": "Memory (bytes)",
+        "source": "__METRICS_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "avg", "metricName": "redis.memory.used", "metricType": "gauge", "alias": "used", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"},
+          {"aggFn": "avg", "metricName": "redis.memory.rss", "metricType": "gauge", "alias": "rss", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"},
+          {"aggFn": "avg", "metricName": "redis.memory.peak", "metricType": "gauge", "alias": "peak", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "redis-clients", "x": 12, "y": 0, "w": 12, "h": 4,
+      "config": {
+        "name": "Connected / blocked clients",
+        "source": "__METRICS_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "avg", "metricName": "redis.clients.connected", "metricType": "sum", "alias": "connected", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"},
+          {"aggFn": "avg", "metricName": "redis.clients.blocked", "metricType": "sum", "alias": "blocked", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "redis-ops", "x": 0, "y": 4, "w": 12, "h": 4,
+      "config": {
+        "name": "Operations per second",
+        "source": "__METRICS_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "avg", "metricName": "redis.commands", "metricType": "gauge", "alias": "ops/sec", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "redis-keyspace", "x": 12, "y": 4, "w": 12, "h": 4,
+      "config": {
+        "name": "Keyspace hits / misses (rate)",
+        "source": "__METRICS_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "sum", "metricName": "redis.keyspace.hits", "metricType": "sum", "alias": "hits", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"},
+          {"aggFn": "sum", "metricName": "redis.keyspace.misses", "metricType": "sum", "alias": "misses", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "redis-net", "x": 0, "y": 8, "w": 12, "h": 4,
+      "config": {
+        "name": "Network I/O (bytes, rate)",
+        "source": "__METRICS_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "sum", "metricName": "redis.net.input", "metricType": "sum", "alias": "in", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"},
+          {"aggFn": "sum", "metricName": "redis.net.output", "metricType": "sum", "alias": "out", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "redis-keys", "x": 12, "y": 8, "w": 12, "h": 4,
+      "config": {
+        "name": "Keys: total / expired / evicted",
+        "source": "__METRICS_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "sum", "metricName": "redis.db.keys", "metricType": "gauge", "alias": "total keys", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"},
+          {"aggFn": "sum", "metricName": "redis.keys.expired", "metricType": "sum", "alias": "expired", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"},
+          {"aggFn": "sum", "metricName": "redis.keys.evicted", "metricType": "sum", "alias": "evicted", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "redis-fragmentation", "x": 0, "y": 12, "w": 24, "h": 4,
+      "config": {
+        "name": "Memory fragmentation ratio",
+        "source": "__METRICS_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "avg", "metricName": "redis.memory.fragmentation_ratio", "metricType": "gauge", "alias": "fragmentation", "valueExpression": "Value", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    }
+  ]
+}

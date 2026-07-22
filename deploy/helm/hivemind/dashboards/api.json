@@ -1,0 +1,82 @@
+{
+  "name": "Hivemind — API health",
+  "tags": ["provisioned"],
+  "tiles": [
+    {
+      "id": "api-request-rate", "x": 0, "y": 0, "w": 12, "h": 4,
+      "config": {
+        "name": "Request rate (server spans)",
+        "source": "__TRACES_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "count", "valueExpression": "", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "ServiceName = 'hivemind-api' AND SpanKind = 'Server'",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "api-5xx", "x": 12, "y": 0, "w": 12, "h": 4,
+      "config": {
+        "name": "5xx responses",
+        "source": "__TRACES_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "count", "valueExpression": "", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "ServiceName = 'hivemind-api' AND SpanKind = 'Server' AND toInt16OrZero(SpanAttributes['http.status_code']) >= 500",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "api-latency", "x": 0, "y": 4, "w": 12, "h": 4,
+      "config": {
+        "name": "Request latency p50 / p95 (ms)",
+        "source": "__TRACES_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "quantile", "level": 0.5, "valueExpression": "Duration/1000000", "aggCondition": "", "aggConditionLanguage": "sql"},
+          {"aggFn": "quantile", "level": 0.95, "valueExpression": "Duration/1000000", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "ServiceName = 'hivemind-api' AND SpanKind = 'Server'",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "api-slowest-endpoints", "x": 12, "y": 4, "w": 12, "h": 4,
+      "config": {
+        "name": "Slowest endpoints (p95 ms)",
+        "source": "__TRACES_SOURCE_ID__",
+        "displayType": "table",
+        "select": [
+          {"aggFn": "quantile", "level": 0.95, "valueExpression": "Duration/1000000", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "ServiceName = 'hivemind-api' AND SpanKind = 'Server'",
+        "whereLanguage": "sql",
+        "groupBy": "SpanName",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "api-clickhouse-latency", "x": 0, "y": 8, "w": 24, "h": 4,
+      "config": {
+        "name": "ClickHouse dependency latency p95 (ms)",
+        "source": "__TRACES_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "quantile", "level": 0.95, "valueExpression": "Duration/1000000", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "ServiceName = 'hivemind-api' AND SpanName LIKE 'clickhouse.%'",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    }
+  ]
+}

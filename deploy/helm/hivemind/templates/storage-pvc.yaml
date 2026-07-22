@@ -1,0 +1,20 @@
+{{- if and (eq .Values.storage.provider "local") .Values.storage.local.persistence.enabled (not .Values.storage.local.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "hivemind.fullname" . }}-storage
+  labels:
+    {{- include "hivemind.labels" . | nindent 4 }}
+  annotations:
+    # Keep user-uploaded screenshots/exports across `helm uninstall`.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ .Values.storage.local.persistence.accessMode }}
+  {{- with .Values.storage.local.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.local.persistence.size | quote }}
+{{- end }}

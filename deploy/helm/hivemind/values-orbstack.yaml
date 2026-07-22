@@ -1,0 +1,136 @@
+# Local-development overlay for running the chart on OrbStack's built-in
+# Kubernetes (kubectl context `orbstack`). Driven by `hivemindctl orb`
+# (see scripts/orb_dev.py); also usable directly:
+#
+#   helm upgrade --install hivemind deploy/helm/hivemind --kube-context orbstack \
+#     -n hivemind --create-namespace -f deploy/helm/hivemind/values-orbstack.yaml
+#
+# The smallest footprint that exercises the full stack on a laptop, fronted
+# through a real Envoy Gateway exposed by OrbStack at *.k8s.orb.local with
+# automatic, trusted HTTPS — no mkcert, no host ports.
+# NOT a production profile — see values-production.yaml.
+
+# Pin a published, anonymously-pullable image.
+image:
+  tag: "1.0.0"
+
+# Served through the Envoy Gateway, which OrbStack exposes at
+# hivemind.k8s.orb.local with automatic trusted TLS. The gateway listens on
+# plain HTTP (:80, no redirect); OrbStack adds HTTPS in front.
+externalURL: "https://hivemind.k8s.orb.local"
+
+config:
+  allowedGithubOrgs: "none"
+  logLevel: "DEBUG"
+
+# Single replica, no autoscaling, no PodDisruptionBudget — minimal footprint.
+api:
+  replicaCount: 1
+  autoscaling:
+    enabled: false
+  podDisruptionBudget:
+    enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+worker:
+  replicaCount: 1
+  # No KEDA operator in the OrbStack cluster — run a fixed replica count.
+  autoscaling:
+    mode: none
+  podDisruptionBudget:
+    enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 384Mi
+    limits:
+      cpu: "1"
+      memory: 1536Mi
+
+migrations:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+clickhouse:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 3Gi
+  persistence:
+    size: 5Gi
+
+redis:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  persistence:
+    size: 2Gi
+
+storage:
+  local:
+    persistence:
+      size: 2Gi
+
+# Front the api through the shared Envoy Gateway (deploy/orb/gateway/), which the
+# helper installs. OrbStack exposes the gateway's LoadBalancer at
+# hivemind.k8s.orb.local and terminates TLS, so the HTTPRoute carries no redirect.
+ingress:
+  enabled: false
+gateway:
+  enabled: true
+  parentRefs:
+    # The Gateway lives in this release's namespace, so no `namespace` needed.
+    - name: hivemind
+  hostnames:
+    - hivemind.k8s.orb.local
+
+# ClickStack (HyperDX) on, with api/worker tracing wired to its bundled collector.
+observability:
+  tracing:
+    enabled: true
+    sampleRate: "1.0"
+  clickstack:
+    enabled: true
+    # HyperDX local mode doesn't validate the ingestion key — any non-empty value
+    # works, so traces flow out of the box (see values.yaml).
+    ingestionApiKey: "local-dev-ingest"
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 3Gi
+    persistence:
+      size: 5Gi
+    # Feed the local cluster's infra telemetry into ClickStack so HyperDX's
+    # Kubernetes dashboards work end to end on the dev stack.
+    kubernetesMetrics:
+      enabled: true
+      clusterName: orbstack
+    ingress:
+      enabled: false
+    # Front the HyperDX UI through the same shared Gateway.
+    gateway:
+      enabled: true
+      parentRefs:
+        - name: hivemind
+      hostname: clickstack.k8s.orb.local

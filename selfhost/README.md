@@ -41,3 +41,11 @@ You then own the pieces `hivemind serve` handles for you (secret generation,
 `.env` prompts, upgrades).
 
 Full guide: [docs/self-hosting.md](../docs/self-hosting.md).
+
+## Kubernetes
+
+For a clustered deployment with api/worker autoscaling and optional ClickStack
+observability, use the Helm chart at
+[`deploy/helm/hivemind`](../deploy/helm/hivemind) — the same image and
+configuration model as this Compose stack. See its
+[README](../deploy/helm/hivemind/README.md).

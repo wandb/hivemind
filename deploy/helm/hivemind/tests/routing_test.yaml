@@ -1,0 +1,25 @@
+suite: routing mutual exclusion
+release:
+  name: hivemind
+  namespace: hivemind
+templates:
+  - templates/validations.yaml
+tests:
+  - it: rejects enabling both ingress and gateway
+    set:
+      ingress.enabled: true
+      gateway.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "Enable only one of `ingress.enabled` or `gateway.enabled`, not both."
+
+  - it: allows ingress alone (default)
+    asserts:
+      - notFailedTemplate: {}
+
+  - it: allows gateway alone
+    set:
+      ingress.enabled: false
+      gateway.enabled: true
+    asserts:
+      - notFailedTemplate: {}

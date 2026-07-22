@@ -1,0 +1,57 @@
+suite: kubernetes metrics collector
+release:
+  name: hivemind
+  namespace: hivemind
+templates:
+  - templates/clickstack/k8s-metrics.yaml
+tests:
+  - it: renders nothing by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders nothing when clickstack is on but k8s metrics are off
+    set:
+      observability.clickstack.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders collectors + RBAC when enabled
+    set:
+      observability.clickstack.enabled: true
+      observability.clickstack.kubernetesMetrics.enabled: true
+    asserts:
+      # SA + ClusterRole + ClusterRoleBinding + 2 ConfigMaps + DaemonSet + Deployment
+      - hasDocuments:
+          count: 7
+
+  - it: grants the ClusterRole read access to nodes/stats for kubeletstats
+    set:
+      observability.clickstack.enabled: true
+      observability.clickstack.kubernetesMetrics.enabled: true
+    documentSelector:
+      path: kind
+      value: ClusterRole
+    asserts:
+      - contains:
+          path: rules[1].resources
+          content: nodes/stats
+
+  - it: node DaemonSet runs as root with all caps dropped and read-only rootfs
+    set:
+      observability.clickstack.enabled: true
+      observability.clickstack.kubernetesMetrics.enabled: true
+    documentSelector:
+      path: kind
+      value: DaemonSet
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 0
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          content: ALL

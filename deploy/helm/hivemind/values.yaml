@@ -1,0 +1,752 @@
+# Default values for the Hivemind self-hosted chart.
+#
+# This mirrors selfhost/docker-compose.yml but is Kubernetes-native:
+#   - Caddy  -> Ingress (+ optional cert-manager TLS)
+#   - app    -> api Deployment (FastAPI + dashboard static, port 8080)
+#   - worker -> worker Deployment (same image, `python -m agentstream_api.worker`)
+#   - redis  -> Redis StatefulSet (AOF; backs the QUEUE_PROVIDER=redis queue)
+#   - clickhouse -> ClickHouse StatefulSet
+#
+# Quick start (defaults give a single-node, localhost stack):
+#   helm install hivemind deploy/helm/hivemind \
+#     --set externalURL=https://hivemind.example.com \
+#     --set ingress.host=hivemind.example.com
+#
+# Everything below is documented inline. The only hard requirement is a
+# JWT secret, which is auto-generated and preserved across upgrades when left
+# blank (see `secrets.jwtSecret`).
+
+# -----------------------------------------------------------------------------
+# Application image (API + dashboard + worker are the SAME image).
+# -----------------------------------------------------------------------------
+image:
+  repository: ghcr.io/wandb/hivemind-server
+  # Defaults to Chart.appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Public base URL of this instance (scheme + host). Pins OAuth/redirect/webhook
+# URLs (EXTERNAL_URL + DASHBOARD_URL). For real domains use https://.
+externalURL: "http://localhost"
+
+# -----------------------------------------------------------------------------
+# Non-secret application configuration (rendered into a ConfigMap).
+# See docs/self-hosting.md for the meaning of each.
+# -----------------------------------------------------------------------------
+config:
+  # Marks the deployment flavor; self-host disables SaaS-only behaviors.
+  environment: selfhost
+  # Restrict login to these GitHub orgs (comma-separated). "none" lets anyone
+  # with a GitHub account log in. A set-but-empty value is rejected by the
+  # server as a misconfiguration, so keep "none" rather than "".
+  allowedGithubOrgs: "none"
+  # Pin the single-player owner (GitHub login) when no GitHub App is set.
+  # Empty = first GitHub user to log in claims the instance.
+  singleUserGithubLogin: ""
+  # Self-host defaults: no quotas, no retention deletion, no per-user clickwrap.
+  usageQuotaMode: "off"        # off | shadow | enforce
+  retentionSweepMode: "off"    # off | dry_run | enforce
+  termsAcceptanceEnabled: false
+  logLevel: "INFO"
+
+  # --- LLM provider (advanced AI features) ---
+  # Insights, PR walkthroughs, personas, session enrichment and fork-context all
+  # reach an LLM through agentstream_api.llm. Bring-your-own-provider; every
+  # feature quietly no-ops when nothing here is set. API keys are secrets and
+  # live under `secrets.llm`. Full guide: docs/llm-providers.md.
+  llm:
+    # anthropic | openai | bedrock. Empty auto-detects: `openai` once baseURL or
+    # an OpenAI-style key is set, else `anthropic` when an Anthropic key is set.
+    provider: ""
+    # OpenAI-compatible endpoint (Ollama, vLLM, W&B/CoreWeave, ...). Its presence
+    # auto-selects the openai provider. e.g. https://api.inference.wandb.ai/v1
+    baseURL: ""
+    # Default model id (falls back to the per-provider default when empty).
+    model: ""
+    # Cheaper model for short-prompt features (titles, weekly summaries). Falls
+    # back to `model` when unset.
+    smallModel: ""
+    # Amazon Bedrock region (provider: bedrock; Anthropic models via AWS creds).
+    bedrockRegion: ""
+    # Extra headers for the OpenAI-compatible endpoint, as a JSON string:
+    #   extraHeaders: '{"OpenAI-Project": "my-team/my-project"}'
+    extraHeaders: ""
+    # Per-feature model overrides (each falls back to `model`).
+    models:
+      enrichment: ""
+      titleExtraction: ""
+      weeklySummary: ""
+      persona: ""
+      forkContext: ""
+      insightsMatcher: ""
+
+  # --- Embeddings (insight clustering + semantic search) ---
+  # OpenAI-compatible; the API key falls back to secrets.llm.openaiApiKey when
+  # embeddingsApiKey is unset. A replacement model MUST emit 1536-dim vectors to
+  # match the ClickHouse vector index. Set provider "none" to disable embeddings.
+  embeddings:
+    provider: ""          # "" (auto) | none
+    baseURL: ""
+    model: ""             # default text-embedding-3-small
+
+  # --- Self-host licensing ---
+  # Unlicensed instances keep working and show a "get a license" banner. The
+  # signed license blob is a secret — set it under `secrets.license`. The
+  # enforcement level is fixed by the license itself, not a chart knob.
+  license:
+    # Override where the daily license check-in posts (defaults to the W&B SaaS).
+    # Airgapped instances can ignore this — the POST fails silently.
+    telemetryEndpoint: ""
+
+  # Daily anonymized check-in (install id, server version, license state — never
+  # raw session data). On by default; set false to opt out (maps HIVEMIND_TELEMETRY).
+  telemetry: true
+  # Redis Streams key prefix for the job queue (QUEUE_REDIS_PREFIX). Kept in
+  # sync with the KEDA scaler's stream names. Full stream = "<prefix>:<name>".
+  queueRedisPrefix: "queue:jobs"
+  # Free-form extra env for the api + worker pods (escape hatch).
+  #   extraEnv:
+  #     - name: SOME_FLAG
+  #       value: "1"
+  extraEnv: []
+  # Mount additional ConfigMaps/Secrets as env (envFrom).
+  extraEnvFrom: []
+
+# -----------------------------------------------------------------------------
+# Secrets. By default a Secret is created from the values below; set
+# `existingSecret` to bring your own (it must contain the same keys).
+# JWT_SECRET is auto-generated (and preserved across upgrades via lookup) when
+# left blank.
+# -----------------------------------------------------------------------------
+secrets:
+  create: true
+  existingSecret: ""
+  # Signing secret for Hivemind session tokens. Leave blank to auto-generate
+  # a stable 64-char secret on first install (preserved on subsequent upgrades).
+  jwtSecret: ""
+  # Master key (HIVEMIND_SECRET_KEY) that encrypts instance-wide secrets — the
+  # GitHub App credentials the first-boot /setup wizard stores in ClickHouse, and
+  # any future shared key — at rest so they ride the backup. Optional on
+  # Kubernetes if you supply `githubApp.*` directly below (GitOps). Generate with
+  #   python -c "import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+  # BACK IT UP: losing it makes those secrets unrecoverable (session data is
+  # unaffected).
+  hivemindSecretKey: ""
+  # Signed self-host license blob (HIVEMIND_LICENSE) from the Hivemind admin
+  # console. Verified offline (Ed25519), so it works airgapped. Enforcement level
+  # is set by config.license.enforcementMode.
+  license: ""
+  # GitHub App credentials. Normally written by the first-boot /setup wizard,
+  # but for GitOps you can supply them here (recommended on Kubernetes, since it
+  # avoids needing a shared writable volume across replicas).
+  githubApp:
+    appId: ""
+    slug: ""
+    clientId: ""
+    clientSecret: ""
+    webhookSecret: ""
+    # PEM private key (use --set-file or a values file; multi-line is fine).
+    privateKey: ""
+  # Optional dedicated dashboard "Login with GitHub" OAuth App. Falls back to
+  # the GitHub App when unset.
+  githubOAuth:
+    clientId: ""
+    clientSecret: ""
+  # Bring-your-own-key LLM features (insights, walkthroughs, personas,
+  # embeddings). All quietly no-op when unset. Non-secret provider settings
+  # (endpoint, model, per-feature overrides) live under `config.llm`.
+  llm:
+    anthropicApiKey: ""
+    openaiApiKey: ""
+    # Generic key for an OpenAI-compatible / non-Anthropic provider (LLM_API_KEY),
+    # e.g. a W&B/CoreWeave inference key. For Bedrock, supply AWS creds via the
+    # standard env chain / IRSA instead.
+    apiKey: ""
+    # Embeddings key (EMBEDDINGS_API_KEY). Falls back to openaiApiKey when unset.
+    embeddingsApiKey: ""
+
+# -----------------------------------------------------------------------------
+# API (app): FastAPI + dashboard static, serves on :8080, exposes /health.
+# Stateless and horizontally scalable.
+# -----------------------------------------------------------------------------
+api:
+  replicaCount: 2
+  # AUTO_MIGRATE on the app races across replicas, so migrations run as a
+  # dedicated Job (see `migrations`). Leave this false unless you disable the
+  # migration Job and pin replicaCount to 1.
+  autoMigrate: false
+  service:
+    type: ClusterIP
+    port: 80
+    annotations: {}
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    # Set to enable memory-based scaling too (null disables).
+    targetMemoryUtilizationPercentage: null
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # Block serving until ClickHouse is reachable on first boot.
+  waitForClickHouse: true
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  # Probe tuning (the app may cold-start ClickHouse on first install).
+  startupProbe:
+    failureThreshold: 30
+    periodSeconds: 5
+  livenessProbe:
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+  readinessProbe:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# -----------------------------------------------------------------------------
+# Worker: same image, `python -m agentstream_api.worker`. Pulls jobs from the
+# Redis-Streams consumer group `workers`. Horizontally scalable; periodic
+# leader-loop sweeps (the queue durability backstop) run on exactly one elected
+# replica, so keep minReplicas >= 1.
+# -----------------------------------------------------------------------------
+worker:
+  replicaCount: 1
+  # Leader-loop sweeps re-derive dropped jobs. Disable only if you understand
+  # the durability tradeoff (see docs/self-hosting-design.md).
+  runPeriodicTasks: true
+  # Max concurrent in-flight jobs per worker pod.
+  maxInFlight: 10
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      # Persona/insight analysis can peak ~2GB on top of Python overhead.
+      memory: 4Gi
+  autoscaling:
+    # keda  -> scale on Redis-Streams consumer-group lag (recommended)
+    # hpa   -> scale on CPU only (no KEDA required)
+    # none  -> fixed replicaCount
+    mode: keda
+    minReplicas: 1
+    maxReplicas: 15
+    # --- KEDA (mode: keda) -------------------------------------------------
+    # Requires the KEDA operator installed in the cluster (https://keda.sh) and
+    # Redis >= 7 (consumer-group lag). Scales on pending backlog (lag) of the
+    # latency-sensitive streams. One trigger per stream; KEDA takes the max.
+    keda:
+      pollingInterval: 15
+      cooldownPeriod: 120
+      # Streams to watch and their target lag per replica. The queue uses the
+      # prefix `queue:jobs` by default (QUEUE_REDIS_PREFIX); the full stream
+      # name is "<prefix>:<name>".
+      triggers:
+        - stream: normal
+          lagCount: "100"
+          activationLagCount: "5"
+        - stream: long
+          lagCount: "20"
+          activationLagCount: "1"
+    # --- CPU HPA fallback (mode: hpa) --------------------------------------
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    # maxUnavailable (not minAvailable) so a single-replica worker can still be
+    # evicted for node maintenance — the Deployment reschedules it.
+    maxUnavailable: 1
+  # Workers drain in-flight jobs on SIGTERM; give them room before SIGKILL.
+  terminationGracePeriodSeconds: 120
+  waitForClickHouse: true
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+# -----------------------------------------------------------------------------
+# Schema migrations. Runs `python -m agentstream_api.migrations migrate` as a
+# Job (with a wait-for-clickhouse init container) on install/upgrade.
+# -----------------------------------------------------------------------------
+migrations:
+  enabled: true
+  backoffLimit: 6
+  # Runs as a normal Job (named per release revision) with a wait-for-clickhouse
+  # init container — NOT a Helm hook. Hooks run before the bundled ClickHouse,
+  # ConfigMap, and Secret exist, which would deadlock first install. The api
+  # pods carry AUTO_MIGRATE=false and converge to Ready once this Job applies
+  # the schema. Finished Jobs are cleaned up after ttlSecondsAfterFinished.
+  ttlSecondsAfterFinished: 600
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# -----------------------------------------------------------------------------
+# Object/file storage for session screenshots and data exports.
+#   local -> a PVC mounted at STORAGE_LOCAL_DIR (needs ReadWriteMany if the api
+#            runs >1 replica, since exports are served back through the API).
+#   s3    -> any S3-compatible store (AWS, MinIO, R2). Recommended for HA.
+#   gcs   -> Google Cloud Storage.
+# -----------------------------------------------------------------------------
+storage:
+  provider: local
+  local:
+    mountPath: /data/storage
+    persistence:
+      enabled: true
+      size: 10Gi
+      storageClass: ""
+      # MUST be ReadWriteMany when api.replicaCount/maxReplicas > 1.
+      accessMode: ReadWriteOnce
+      existingClaim: ""
+  s3:
+    bucket: ""
+    endpointURL: ""   # set for MinIO / R2 / S3-interop
+    region: ""
+    # Credentials: either inline (rendered into the Secret) or via the standard
+    # AWS env chain / IRSA (leave blank and rely on the node/pod identity).
+    accessKeyId: ""
+    secretAccessKey: ""
+  gcs:
+    bucket: ""
+    # Mount a service-account JSON key via an existing Secret for signed URLs.
+    existingSecret: ""
+    secretKey: "key.json"
+
+# -----------------------------------------------------------------------------
+# Bundled ClickHouse (single node). Disable and use `externalClickHouse` to
+# point at ClickHouse Cloud or your own cluster.
+# -----------------------------------------------------------------------------
+clickhouse:
+  enabled: true
+  image:
+    repository: clickhouse/clickhouse-server
+    # LTS line; keep in lockstep with selfhost/docker-compose.yml.
+    tag: "26.3"
+    pullPolicy: IfNotPresent
+  database: agentstream
+  user: default
+  # Empty password matches the bundled defaults. For external, prefer
+  # externalClickHouse.existingSecret.
+  password: ""
+  httpPort: 8123
+  nativePort: 9000
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClass: ""
+  # Run ClickHouse as its built-in non-root user (uid/gid 101) with a matching
+  # fsGroup so the data volume is group-writable. The official entrypoint then
+  # skips the as-root chown of /var/lib/clickhouse — which would otherwise fail
+  # once CAP_CHOWN is dropped below — so the pod is hardened AND boots cleanly.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    runAsGroup: 101
+    fsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+  # Container-level hardening for the ClickHouse container.
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+externalClickHouse:
+  # Used when clickhouse.enabled = false.
+  host: ""
+  httpPort: 8123
+  # Force TLS (CLICKHOUSE_SECURE). The client already auto-negotiates TLS on
+  # port 8443/443 (e.g. ClickHouse Cloud, which uses 8443), so leave this false
+  # unless your managed ClickHouse serves TLS on a non-standard port.
+  secure: false
+  database: agentstream
+  user: default
+  password: ""
+  # Read CLICKHOUSE_PASSWORD from an existing Secret instead of `password`.
+  existingSecret: ""
+  existingSecretKey: "CLICKHOUSE_PASSWORD"
+
+# -----------------------------------------------------------------------------
+# Bundled Redis (single node, AOF). It backs BOTH the job queue (Redis Streams)
+# and live-streaming pub/sub, so persistence is enabled by default. Disable and
+# use `externalRedis` for a managed Redis.
+# -----------------------------------------------------------------------------
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  port: 6379
+  # Optional password. When set, it is applied via --requirepass and wired to
+  # the app, worker, and KEDA trigger auth.
+  password: ""
+  # AOF everysec: <=1s of queue writes at risk on hard power loss, reconciled
+  # by the worker leader-loop sweeps.
+  appendonly: true
+  appendfsync: everysec
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  persistence:
+    enabled: true
+    size: 8Gi
+    storageClass: ""
+  # Container security context for the Redis pod.
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+externalRedis:
+  # Used when redis.enabled = false.
+  host: ""
+  port: 6379
+  password: ""
+  existingSecret: ""
+  existingSecretKey: "REDIS_PASSWORD"
+
+# -----------------------------------------------------------------------------
+# Routing — expose the api Service externally (replaces Caddy from the Compose
+# stack). Pick ONE of `gateway` (Gateway API — the modern GA standard and
+# successor to Ingress) or `ingress` (legacy, feature-frozen). Enabling both is
+# rejected at render time.
+# -----------------------------------------------------------------------------
+
+# Gateway API — gateway.networking.k8s.io/v1 HTTPRoute (recommended).
+# Requires the Gateway API CRDs and a controller (Envoy Gateway, Istio, Cilium,
+# NGINX Gateway Fabric, Traefik, the cloud gateways, ...). TLS is terminated on
+# the Gateway listener — owned by the platform/cluster team — not on the
+# HTTPRoute; that role split is the point of Gateway API.
+gateway:
+  enabled: false
+  # Gateway(s) to attach this route to (usually shared infra in another ns).
+  parentRefs:
+    - name: ""            # required when enabled, e.g. "eg" or "external"
+      namespace: ""       # Gateway's namespace (omit if same as the release)
+      sectionName: ""     # listener name on the Gateway (optional)
+      # port: 443         # listener port (optional)
+  # Route hostnames; defaults to the host parsed from externalURL when empty.
+  hostnames: []
+  annotations: {}
+
+# Ingress — networking.k8s.io/v1 Ingress (legacy). TLS via cert-manager or a
+# pre-created Secret. Note: the Ingress-NGINX controller is retired as of
+# 2026-03; prefer `gateway` above on new clusters.
+ingress:
+  enabled: true
+  className: ""
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  # Defaults to the host parsed from externalURL when empty.
+  host: ""
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: false
+    secretName: ""
+
+# -----------------------------------------------------------------------------
+# Observability: ClickStack (OpenTelemetry Collector -> ClickHouse + HyperDX).
+# The app already emits OTLP traces/logs when tracing is enabled; the collector
+# lands them in ClickHouse and HyperDX provides search, dashboards, and alerts.
+# -----------------------------------------------------------------------------
+observability:
+  tracing:
+    # Turn on OTLP export from the api + worker. When clickstack.enabled, this
+    # defaults to the bundled ClickStack endpoint; otherwise set otlpEndpoint to
+    # your own collector (e.g. a standalone OTel Collector writing to your
+    # existing ClickHouse).
+    enabled: false
+    otlpEndpoint: ""
+    sampleRate: "1.0"
+    # Extra OTLP exporter headers as a raw "key=value,key2=value2" string
+    # (sets OTEL_EXPORTER_OTLP_HEADERS on api + worker). For collectors that
+    # require auth. For the bundled ClickStack, prefer clickstack.ingestionApiKey
+    # below — it fills this in as "authorization=<key>" when this is empty.
+    otlpHeaders: ""
+  # Standalone OpenTelemetry Collector (static otlp -> ClickHouse pipeline). The
+  # bundled HyperDX all-in-one's collector is OpAMP-managed and won't wire OTLP
+  # ingestion without manual UI onboarding, so when ClickStack is enabled the
+  # api/worker send their OTLP here instead; it writes to ClickStack's ClickHouse
+  # (the standard otel_traces schema the autoProvisioned HyperDX "Traces" source
+  # reads) — so traces land in HyperDX out of the box. Only rendered/used when
+  # clickstack.enabled and tracing.otlpEndpoint is unset.
+  collector:
+    enabled: true
+    image:
+      repository: otel/opentelemetry-collector-contrib
+      tag: "0.121.0"
+      pullPolicy: IfNotPresent
+    # Scrape Redis INFO stats (memory, clients, ops/sec, keyspace, network) into
+    # ClickStack's ClickHouse via this collector's `redis` receiver, so the
+    # provisioned "Redis health" dashboard lights up. Lives here (not in the
+    # kubernetesMetrics collector, which is off by default and absent in prod) so
+    # it runs whenever the bundled ClickStack does. No-op unless a Redis is
+    # configured (bundled `redis.enabled` or `externalRedis.host`).
+    redisMetrics:
+      enabled: true
+      collectionInterval: 30s
+    # Native-TCP (9000) connection the clickhouse exporter uses to write spans
+    # into ClickStack's bundled ClickHouse. The image's `default` user is pinned
+    # to localhost only (users.d/default-user.xml), so a sidecar collector in
+    # another pod must authenticate as a network-reachable user — the all-in-one
+    # ships `api`/`api` with networks ::/0, which is what HyperDX's own API uses.
+    clickhouse:
+      database: default
+      username: api
+      password: api
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+  # ClickStack = HyperDX's all-in-one observability backend (a telemetry-tuned
+  # ClickHouse + OpenTelemetry Collector + the HyperDX UI in one image). The
+  # api/worker ship their OTLP traces/logs here and HyperDX provides search,
+  # dashboards, and alerting. Self-contained, so it does not touch the
+  # application ClickHouse.
+  #
+  # QUICKSTART / SMALL SELF-HOST ONLY. The all-in-one is a single, non-HA pod
+  # built for `docker run`; running it under k8s needs several workarounds (the
+  # standalone collector, hostAliases, the stale-lock init container, the
+  # dashboards sidecar — all gated on this block). For production / scale, leave
+  # this disabled and set `tracing.otlpEndpoint` to a managed ClickStack
+  # (ClickHouse Cloud), a self-hosted scalable HyperDX, or any OTLP backend. See
+  # the chart README's "Observability — tracing" section.
+  clickstack:
+    enabled: false
+    image:
+      repository: docker.hyperdx.io/hyperdx/hyperdx-all-in-one
+      tag: "2"
+      pullPolicy: IfNotPresent
+    uiPort: 8080
+    otlpGrpcPort: 4317
+    otlpHttpPort: 4318
+    # HyperDX ingestion API key, wired as OTEL_EXPORTER_OTLP_HEADERS=
+    # "authorization=<key>". The all-in-one runs in HyperDX "local mode", which
+    # does NOT validate the key — any non-empty value is accepted (it just must
+    # be present; an absent header is rejected with 401). So for a self-contained
+    # install you can set any constant here and traces flow on first boot (see
+    # values-orbstack.yaml). A multi-user HyperDX deployment instead generates a real
+    # key at first-run team setup (Team Settings → API Keys) — supply that on a
+    # follow-up `helm upgrade --set`.
+    ingestionApiKey: ""
+    # Seed a default ClickHouse connection + OpenTelemetry sources into HyperDX at
+    # first boot so the bundled OTel collector binds its OTLP receivers
+    # (4317/4318) and traces flow WITHOUT manual HyperDX UI onboarding. Pointed at
+    # the all-in-one's own ClickHouse. NOTE: HyperDX applies these only on a clean
+    # install (empty Mongo) — they don't retro-provision an existing volume.
+    autoProvision: true
+    defaultConnections: '[{"name":"Local ClickHouse","host":"http://localhost:8123","username":"default","password":""}]'
+    defaultSources: '[{"from":{"databaseName":"default","tableName":"otel_logs"},"kind":"log","timestampValueExpression":"Timestamp","name":"Logs","displayedTimestampValueExpression":"Timestamp","implicitColumnExpression":"Body","serviceNameExpression":"ServiceName","bodyExpression":"Body","eventAttributesExpression":"LogAttributes","resourceAttributesExpression":"ResourceAttributes","defaultTableSelectExpression":"Timestamp,ServiceName,SeverityText,Body","severityTextExpression":"SeverityText","traceIdExpression":"TraceId","spanIdExpression":"SpanId","metadataMaterializedViews":{"keyRollupTable":"otel_logs_key_rollup_15m","kvRollupTable":"otel_logs_kv_rollup_15m","granularity":"15 minute"},"connection":"Local ClickHouse","traceSourceId":"Traces","sessionSourceId":"Sessions","metricSourceId":"Metrics"},{"from":{"databaseName":"default","tableName":"otel_traces"},"kind":"trace","timestampValueExpression":"Timestamp","name":"Traces","displayedTimestampValueExpression":"Timestamp","implicitColumnExpression":"SpanName","serviceNameExpression":"ServiceName","eventAttributesExpression":"SpanAttributes","resourceAttributesExpression":"ResourceAttributes","defaultTableSelectExpression":"Timestamp,ServiceName,StatusCode,round(Duration/1e6),SpanName","traceIdExpression":"TraceId","spanIdExpression":"SpanId","durationExpression":"Duration","durationPrecision":9,"parentSpanIdExpression":"ParentSpanId","spanNameExpression":"SpanName","spanKindExpression":"SpanKind","statusCodeExpression":"StatusCode","statusMessageExpression":"StatusMessage","metadataMaterializedViews":{"keyRollupTable":"otel_traces_key_rollup_15m","kvRollupTable":"otel_traces_kv_rollup_15m","granularity":"15 minute"},"connection":"Local ClickHouse","logSourceId":"Logs","sessionSourceId":"Sessions","metricSourceId":"Metrics"},{"from":{"databaseName":"default","tableName":""},"kind":"metric","timestampValueExpression":"TimeUnix","name":"Metrics","resourceAttributesExpression":"ResourceAttributes","metricTables":{"gauge":"otel_metrics_gauge","histogram":"otel_metrics_histogram","sum":"otel_metrics_sum","_id":"682586a8b1f81924e628e808","id":"682586a8b1f81924e628e808"},"connection":"Local ClickHouse","logSourceId":"Logs","traceSourceId":"Traces","sessionSourceId":"Sessions"},{"from":{"databaseName":"default","tableName":"hyperdx_sessions"},"kind":"session","timestampValueExpression":"TimestampTime","name":"Sessions","displayedTimestampValueExpression":"Timestamp","implicitColumnExpression":"Body","serviceNameExpression":"ServiceName","bodyExpression":"Body","eventAttributesExpression":"LogAttributes","resourceAttributesExpression":"ResourceAttributes","defaultTableSelectExpression":"Timestamp,ServiceName,SeverityText,Body","severityTextExpression":"SeverityText","traceIdExpression":"TraceId","spanIdExpression":"SpanId","connection":"Local ClickHouse","logSourceId":"Logs","traceSourceId":"Traces","metricSourceId":"Metrics"}]'
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    # The all-in-one stores its telemetry ClickHouse + metadata here.
+    persistence:
+      enabled: true
+      size: 20Gi
+      storageClass: ""
+    # Auto-provision a couple of starter HyperDX dashboards (API health, Worker
+    # health) built on the api/worker OTLP traces. A sidecar in the ClickStack
+    # pod resolves the per-install Source ids, templates them into the dashboard
+    # JSON (chart `dashboards/*.json`), and runs HyperDX's provisioner on a loop
+    # — so they appear once you've finished HyperDX account setup, with no manual
+    # import. Idempotent; provisioned dashboards are tagged and coexist with any
+    # you create by hand. Alerts are NOT provisionable in HyperDX (they live in
+    # Mongo keyed to a team); add them in the UI off these dashboard tiles — see
+    # the chart README.
+    dashboards:
+      enabled: true
+      # How often the sidecar re-runs the provisioner (also the retry cadence
+      # while it waits for account setup to create a team).
+      intervalSeconds: 300
+      resources:
+        requests:
+          cpu: 10m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 256Mi
+    # Register the application's OWN ClickHouse as a HyperDX connection so the
+    # built-in "ClickHouse" preset dashboard (left nav → ClickHouse) can target
+    # it. That dashboard reads system.query_log / system.metric_log /
+    # asynchronous_metric_log directly over a CONNECTION — query latency, slow
+    # queries, inserts, parts, CPU/memory — NOT OTel metrics, so all it needs is
+    # a connection; no extra collector or Prometheus endpoint. The provisioner
+    # sidecar (shared with `dashboards`) upserts it into HyperDX's Mongo,
+    # idempotently and only if absent, so it self-heals after account setup AND
+    # works on already-provisioned installs that DEFAULT_CONNECTIONS can only
+    # seed on a clean (empty-Mongo) first boot. Host/user/password are derived
+    # from `clickhouse.*` (or `externalClickHouse.*`), so it follows the same
+    # ClickHouse the api/worker use.
+    appClickHouseConnection:
+      enabled: true
+      # Connection label shown in the HyperDX picker.
+      name: "Application ClickHouse"
+    # Collect Kubernetes infrastructure telemetry (node/pod/container CPU,
+    # memory, network; cluster object state; pod logs + k8s events) and write it
+    # straight into ClickStack's ClickHouse — same direct path as the trace
+    # collector, so it needs no HyperDX ingestion key. HyperDX's Kubernetes
+    # dashboards read these `otel_metrics_*` tables. The node DaemonSet runs as
+    # root with read-only host mounts (a deliberate exception to the non-root
+    # defaults) to read pod logs and the node filesystem; needs cluster-wide
+    # RBAC. Requires KEDA-style cluster permissions — see templates/clickstack.
+    kubernetesMetrics:
+      enabled: false
+      image:
+        repository: otel/opentelemetry-collector-contrib
+        tag: "0.121.0"
+        pullPolicy: IfNotPresent
+      # Stamped onto every metric/log as k8s.cluster.name — HyperDX's Kubernetes
+      # dashboard keys its Cluster selector on this, so panels stay empty until
+      # it is set. Defaults to the release name when left blank.
+      clusterName: ""
+      collectionInterval: 30s
+      # Ship pod logs (filelog) and k8s events alongside the metrics.
+      logsCollection: true
+      daemonset:
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      cluster:
+        resources:
+          requests:
+            cpu: 25m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 512Mi
+    # Public URL the HyperDX UI is served at, wired as FRONTEND_URL so HyperDX
+    # anchors its post-login / auth redirects on the real host. Leave blank to
+    # derive it from `gateway`/`ingress` below (https + the gateway hostname, or
+    # the ingress host + scheme); the all-in-one otherwise defaults to
+    # http://localhost:8080 and bounces you off the gateway after login.
+    frontendURL: ""
+    # Expose the HyperDX UI. Pick ONE of `gateway` (Gateway API HTTPRoute) or
+    # `ingress` (legacy), mirroring the api routing above.
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: ""
+      tls:
+        enabled: false
+        secretName: ""
+    # Gateway API HTTPRoute for the HyperDX UI. Attaches to an existing Gateway
+    # (TLS terminated on its listener), same as the api `gateway` block.
+    gateway:
+      enabled: false
+      parentRefs:
+        - name: ""          # required when enabled
+          namespace: ""     # Gateway's namespace (omit if same as the release)
+          sectionName: ""
+          # port: 443
+      hostname: ""          # required when enabled, e.g. clickstack.example.com
+      annotations: {}
+
+# -----------------------------------------------------------------------------
+# Shared pod settings.
+# -----------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod-level security context shared by every pod (api, worker, migrate Job, and
+# the bundled datastores). seccompProfile is safe with the shipped images. To
+# run fully non-root, set runAsNonRoot/runAsUser/fsGroup here — note the
+# application image (ghcr.io/wandb/hivemind-server) currently runs as root, so
+# enabling runAsNonRoot also requires an image that supports a non-root UID.
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+  # runAsNonRoot: true
+  # runAsUser: 1000
+  # fsGroup: 1000
+
+# Container-level security context for the app containers (api, worker, migrate)
+# and the wait-for-clickhouse init container. Dropping all capabilities and
+# blocking privilege escalation is safe even while the image runs as root.
+# readOnlyRootFilesystem is left off because the app writes to the local storage
+# mount and /tmp; harden further by enabling it with a writable emptyDir /tmp.
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+commonLabels: {}
+commonAnnotations: {}
+
+# Image used by small helper init containers (wait-for-clickhouse, etc.).
+# busybox provides `nc`/`wget` for the readiness gate.
+utilityImage:
+  repository: busybox
+  tag: "1.36"
+  pullPolicy: IfNotPresent

@@ -1,0 +1,106 @@
+{{- $cs := .Values.observability.clickstack }}
+{{- if and $cs.enabled (or $cs.dashboards.enabled $cs.appClickHouseConnection.enabled) }}
+{{- $fullname := include "hivemind.fullname" . }}
+{{/*
+The HyperDX provisioner sidecar + the dashboard JSON it installs.
+
+A sidecar (same image, separate container — sharing the pod's localhost reaches
+the bundled Mongo) handles two self-healing provisioning tasks on a loop, both
+gated on a team existing (HyperDX account setup creates it):
+
+  - appClickHouseConnection: upsert the application's own ClickHouse as a HyperDX
+    connection so the built-in "ClickHouse" preset dashboard can query its
+    system.* tables. Insert-only (never overwrites) so UI edits stick, and it
+    reaches already-provisioned installs that DEFAULT_CONNECTIONS can't reseed.
+  - dashboards: HyperDX's provisioner reads static JSON but does NOT remap the
+    per-install Source ObjectIds the tiles reference, so the sidecar resolves the
+    Traces/Logs source ids by name, substitutes them into the templates, and runs
+    the official `provision-dashboards` task.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-clickstack-dashboards
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "clickstack") | nindent 4 }}
+data:
+  provision.sh: |
+    #!/bin/sh
+    set -u
+    MONGO_URI="${MONGO_URI:-mongodb://127.0.0.1:27017/hyperdx}"
+    TPL_DIR="${DASHBOARD_TEMPLATE_DIR:-/etc/hyperdx/dashboards}"
+    OUT_DIR="${DASHBOARD_PROVISIONER_DIR:-/tmp/dashboards}"
+    INTERVAL="${PROVISION_INTERVAL_SECONDS:-300}"
+    HYPERDX="/app/packages/api/bin/hyperdx"
+    PROVISION_DASHBOARDS="${PROVISION_DASHBOARDS:-true}"
+    APP_CH_CONNECTION_NAME="${APP_CH_CONNECTION_NAME:-}"
+    APP_CH_HOST="${APP_CH_HOST:-}"
+    APP_CH_USERNAME="${APP_CH_USERNAME:-}"
+    APP_CH_PASSWORD="${APP_CH_PASSWORD:-${CLICKHOUSE_PASSWORD:-}}"
+
+    # Echo the source's ObjectId, but ONLY a clean 24-hex id — while Mongo is
+    # still starting the query prints connection-error text (with slashes) that
+    # would otherwise break the sed substitution below.
+    src_id() {
+      mongo "$MONGO_URI" --quiet --eval \
+        "var s=db.sources.findOne({name:'$1'}); print(s?s._id.valueOf():'')" 2>/dev/null \
+        | grep -Eo '^[0-9a-f]{24}$' | head -1
+    }
+
+    # Insert the app ClickHouse as a HyperDX connection on the first team, but
+    # only if one with this name is absent — never overwrites, so operator edits
+    # in the UI stick. Prints CREATED / EXISTS / NOTEAM (NOTEAM = setup pending).
+    ensure_connection() {
+      mongo "$MONGO_URI" --quiet --eval "
+        var t=db.teams.findOne();
+        if(!t){print('NOTEAM');}
+        else if(db.connections.findOne({name:'$1',team:t._id})){print('EXISTS');}
+        else{var n=new Date();db.connections.insertOne({team:t._id,name:'$1',host:'$2',username:'$3',password:'$4',createdAt:n,updatedAt:n,__v:0});print('CREATED');}
+      " 2>/dev/null | grep -Eo 'CREATED|EXISTS|NOTEAM' | head -1
+    }
+
+    echo "[provisioner] starting; interval=${INTERVAL}s dashboards=$PROVISION_DASHBOARDS appCH=${APP_CH_CONNECTION_NAME:-<off>}"
+    while true; do
+      # `ready` flips once a team exists, settling the loop to the full cadence;
+      # until then poll fast so provisioning lands promptly after account setup.
+      ready=0
+
+      if [ -n "$APP_CH_CONNECTION_NAME" ]; then
+        case "$(ensure_connection "$APP_CH_CONNECTION_NAME" "$APP_CH_HOST" "$APP_CH_USERNAME" "$APP_CH_PASSWORD")" in
+          CREATED) echo "[provisioner] created connection '$APP_CH_CONNECTION_NAME' -> $APP_CH_HOST"; ready=1 ;;
+          EXISTS)  ready=1 ;;
+        esac
+      fi
+
+      if [ "$PROVISION_DASHBOARDS" = "true" ]; then
+        TID=$(src_id Traces)
+        LID=$(src_id Logs)
+        MID=$(src_id Metrics)
+        if [ -n "$TID" ]; then
+          mkdir -p "$OUT_DIR"
+          for f in "$TPL_DIR"/*.json; do
+            [ -e "$f" ] || continue
+            sed -e "s/__TRACES_SOURCE_ID__/$TID/g" -e "s/__LOGS_SOURCE_ID__/$LID/g" \
+              -e "s/__METRICS_SOURCE_ID__/$MID/g" \
+              "$f" > "$OUT_DIR/$(basename "$f")"
+          done
+          DASHBOARD_PROVISIONER_DIR="$OUT_DIR" DASHBOARD_PROVISIONER_ALL_TEAMS=true \
+            RUN_SCHEDULED_TASKS_EXTERNALLY=true MONGO_URI="$MONGO_URI" \
+            "$HYPERDX" task provision-dashboards 2>&1 \
+            | grep -iE "provisioned dashboard|invalid|skipping|failed" || true
+          ready=1
+        fi
+      fi
+
+      if [ "$ready" = "1" ]; then
+        sleep "$INTERVAL"
+      else
+        echo "[provisioner] HyperDX not ready (finish account setup); retry in 15s"
+        sleep 15
+      fi
+    done
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

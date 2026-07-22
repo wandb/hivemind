@@ -1,0 +1,82 @@
+{
+  "name": "Hivemind — Worker health",
+  "tags": ["provisioned"],
+  "tiles": [
+    {
+      "id": "worker-jobs-processed", "x": 0, "y": 0, "w": 12, "h": 4,
+      "config": {
+        "name": "Normalization jobs processed",
+        "source": "__TRACES_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "count", "valueExpression": "", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "ServiceName = 'hivemind-worker' AND SpanName = 'job.session_normalization'",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "worker-job-errors", "x": 12, "y": 0, "w": 12, "h": 4,
+      "config": {
+        "name": "Job errors",
+        "source": "__TRACES_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "count", "valueExpression": "", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "ServiceName = 'hivemind-worker' AND SpanName = 'job.session_normalization' AND StatusCode = 'Error'",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "worker-job-latency", "x": 0, "y": 4, "w": 12, "h": 4,
+      "config": {
+        "name": "Job duration p50 / p95 (ms)",
+        "source": "__TRACES_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "quantile", "level": 0.5, "valueExpression": "Duration/1000000", "aggCondition": "", "aggConditionLanguage": "sql"},
+          {"aggFn": "quantile", "level": 0.95, "valueExpression": "Duration/1000000", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "ServiceName = 'hivemind-worker' AND SpanName = 'job.session_normalization'",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "worker-step-latency", "x": 12, "y": 4, "w": 12, "h": 4,
+      "config": {
+        "name": "Slowest worker operations (p95 ms)",
+        "source": "__TRACES_SOURCE_ID__",
+        "displayType": "table",
+        "select": [
+          {"aggFn": "quantile", "level": 0.95, "valueExpression": "Duration/1000000", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "ServiceName = 'hivemind-worker'",
+        "whereLanguage": "sql",
+        "groupBy": "SpanName",
+        "granularity": "auto"
+      }
+    },
+    {
+      "id": "worker-clickhouse-latency", "x": 0, "y": 8, "w": 24, "h": 4,
+      "config": {
+        "name": "ClickHouse query latency p95 (ms)",
+        "source": "__TRACES_SOURCE_ID__",
+        "displayType": "line",
+        "select": [
+          {"aggFn": "quantile", "level": 0.95, "valueExpression": "Duration/1000000", "aggCondition": "", "aggConditionLanguage": "sql"}
+        ],
+        "where": "ServiceName = 'hivemind-worker' AND SpanName LIKE 'clickhouse.%'",
+        "whereLanguage": "sql",
+        "groupBy": "",
+        "granularity": "auto"
+      }
+    }
+  ]
+}

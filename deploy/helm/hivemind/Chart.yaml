@@ -1,0 +1,34 @@
+apiVersion: v2
+name: hivemind
+description: |
+  Self-hosted Hivemind — the API + dashboard, background worker, ClickHouse,
+  and Redis-Streams job queue, deployed the same artifacts as the SaaS and
+  differing only in configuration. Mirrors selfhost/docker-compose.yml as a
+  clean, scalable, Kubernetes-native chart with API/worker autoscaling and an
+  optional ClickStack (OpenTelemetry + HyperDX) observability stack.
+type: application
+# Chart version — bump on chart changes (independent of appVersion).
+version: 0.1.0
+# Default application image tag (ghcr.io/wandb/hivemind-server). Override with
+# image.tag in values. Tracks a published hivemind-server release.
+appVersion: "1.0.5"
+home: https://github.com/wandb/hivemind
+sources:
+  - https://github.com/wandb/hivemind
+keywords:
+  - hivemind
+  - self-hosted
+  - observability
+  - clickhouse
+maintainers:
+  - name: Weights & Biases
+    url: https://github.com/wandb/hivemind
+annotations:
+  # Datastores and the queue are first-party templates in this chart (no
+  # subchart dependencies), so the stack installs with zero external chart
+  # repositories. Point at managed ClickHouse/Redis via values to disable them.
+  category: Analytics
+  # Link the published OCI chart package to the public product repo on GHCR
+  # (same convention as the ghcr.io/wandb/hivemind-server image), not this
+  # source repo.
+  org.opencontainers.image.source: https://github.com/wandb/hivemind

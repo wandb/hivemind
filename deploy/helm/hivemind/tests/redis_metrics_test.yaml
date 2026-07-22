@@ -1,0 +1,101 @@
+suite: redis metrics (standalone otel collector)
+release:
+  name: hivemind
+  namespace: hivemind
+templates:
+  - templates/clickstack/otel-collector.yaml
+tests:
+  - it: renders nothing by default (clickstack off)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: scrapes the bundled Redis by default when clickstack is on
+    set:
+      observability.clickstack.enabled: true
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "redis:\\s+endpoint: hivemind-redis:6379"
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "metrics:\\s+receivers: \\[redis\\]"
+
+  - it: omits the redis receiver when redisMetrics is disabled
+    set:
+      observability.clickstack.enabled: true
+      observability.collector.redisMetrics.enabled: false
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: "receivers: \\[redis\\]"
+
+  - it: omits the redis receiver when no redis is configured
+    set:
+      observability.clickstack.enabled: true
+      redis.enabled: false
+      externalRedis.host: ""
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: "receivers: \\[redis\\]"
+
+  - it: points the receiver at externalRedis when the bundled redis is off
+    set:
+      observability.clickstack.enabled: true
+      redis.enabled: false
+      externalRedis.host: "redis.example.com"
+      externalRedis.port: 6380
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "endpoint: redis.example.com:6380"
+
+  - it: wires REDIS_PASSWORD into the receiver and container when a password is set
+    set:
+      observability.clickstack.enabled: true
+      redis.password: "s3cret"
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "password: \\$\\{env:REDIS_PASSWORD\\}"
+
+  - it: adds the REDIS_PASSWORD env on the collector deployment when a password is set
+    set:
+      observability.clickstack.enabled: true
+      redis.password: "s3cret"
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[0].name
+          value: REDIS_PASSWORD
+      - equal:
+          path: spec.template.spec.containers[0].env[0].valueFrom.secretKeyRef.key
+          value: REDIS_PASSWORD
+
+  - it: omits the REDIS_PASSWORD env when no password is set
+    set:
+      observability.clickstack.enabled: true
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].env

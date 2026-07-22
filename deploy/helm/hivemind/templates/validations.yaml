@@ -1,0 +1,8 @@
+{{- /*
+  Routing is mutually exclusive: a single backend fronted by both an Ingress
+  and a Gateway HTTPRoute is almost always a misconfiguration. Fail fast with a
+  clear message rather than silently creating two routes.
+*/ -}}
+{{- if and .Values.ingress.enabled .Values.gateway.enabled -}}
+{{- fail "Enable only one of `ingress.enabled` or `gateway.enabled`, not both." -}}
+{{- end -}}

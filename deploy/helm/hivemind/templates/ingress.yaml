@@ -1,0 +1,36 @@
+{{- if .Values.ingress.enabled }}
+{{- $fullname := include "hivemind.fullname" . }}
+{{- $host := include "hivemind.ingressHost" . }}
+{{- $svcPort := .Values.api.service.port }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "api") | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName | default (printf "%s-tls" $fullname) }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ $fullname }}-api
+                port:
+                  number: {{ $svcPort }}
+{{- end }}

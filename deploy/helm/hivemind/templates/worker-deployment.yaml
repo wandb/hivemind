@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hivemind.fullname" . }}-worker
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "worker") | nindent 4 }}
+spec:
+  {{- if eq .Values.worker.autoscaling.mode "none" }}
+  replicas: {{ .Values.worker.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "hivemind.componentSelectorLabels" (dict "ctx" . "component" "worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hivemind.componentLabels" (dict "ctx" . "component" "worker") | nindent 8 }}
+        {{- with .Values.worker.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.worker.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "hivemind.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.worker.waitForClickHouse }}
+      initContainers:
+        {{- include "hivemind.waitForClickHouse" . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "hivemind.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command: ["python", "-m", "agentstream_api.worker"]
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            {{- include "hivemind.envFrom" . | nindent 12 }}
+          env:
+            - name: AUTO_MIGRATE
+              value: "false"
+            - name: PORT
+              value: "8080"
+            - name: WORKER_RUN_PERIODIC_TASKS
+              value: {{ .Values.worker.runPeriodicTasks | quote }}
+            - name: WORKER_MAX_IN_FLIGHT
+              value: {{ .Values.worker.maxInFlight | quote }}
+            {{- include "hivemind.datastorePasswordEnv" . | nindent 12 }}
+            {{- include "hivemind.tracingEnv" (dict "ctx" . "component" "worker") | nindent 12 }}
+            {{- with .Values.config.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          {{- if or (and (eq .Values.storage.provider "local") .Values.storage.local.persistence.enabled) (and (eq .Values.storage.provider "gcs") .Values.storage.gcs.existingSecret) }}
+          volumeMounts:
+            {{- if and (eq .Values.storage.provider "local") .Values.storage.local.persistence.enabled }}
+            - name: storage
+              mountPath: {{ .Values.storage.local.mountPath }}
+            {{- end }}
+            {{- if and (eq .Values.storage.provider "gcs") .Values.storage.gcs.existingSecret }}
+            - name: gcs-key
+              mountPath: /var/secrets/gcs
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or (and (eq .Values.storage.provider "local") .Values.storage.local.persistence.enabled) (and (eq .Values.storage.provider "gcs") .Values.storage.gcs.existingSecret) }}
+      volumes:
+        {{- if and (eq .Values.storage.provider "local") .Values.storage.local.persistence.enabled }}
+        - name: storage
+          persistentVolumeClaim:
+            claimName: {{ .Values.storage.local.persistence.existingClaim | default (printf "%s-storage" (include "hivemind.fullname" .)) }}
+        {{- end }}
+        {{- if and (eq .Values.storage.provider "gcs") .Values.storage.gcs.existingSecret }}
+        - name: gcs-key
+          secret:
+            secretName: {{ .Values.storage.gcs.existingSecret }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

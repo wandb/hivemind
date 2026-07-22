@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hivemind.configMapName" . }}
+  labels:
+    {{- include "hivemind.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  ENVIRONMENT: {{ .Values.config.environment | quote }}
+  EXTERNAL_URL: {{ .Values.externalURL | quote }}
+  DASHBOARD_URL: {{ .Values.externalURL | quote }}
+  STATIC_FILES_DIR: "/app/static"
+
+  # --- Queue (Redis Streams) ---
+  QUEUE_PROVIDER: "redis"
+  QUEUE_REDIS_PREFIX: {{ .Values.config.queueRedisPrefix | quote }}
+
+  # --- ClickHouse ---
+  CLICKHOUSE_HOST: {{ include "hivemind.clickhouse.host" . | quote }}
+  CLICKHOUSE_PORT: {{ include "hivemind.clickhouse.httpPort" . | quote }}
+  CLICKHOUSE_DB: {{ include "hivemind.clickhouse.database" . | quote }}
+  CLICKHOUSE_USER: {{ include "hivemind.clickhouse.user" . | quote }}
+  {{- if and (not .Values.clickhouse.enabled) .Values.externalClickHouse.secure }}
+  CLICKHOUSE_SECURE: "true"
+  {{- end }}
+
+  # --- Redis (queue + live pub/sub + cache) ---
+  REDIS_HOST: {{ include "hivemind.redis.host" . | quote }}
+  REDIS_PORT: {{ include "hivemind.redis.port" . | quote }}
+
+  # --- Storage ---
+  STORAGE_PROVIDER: {{ .Values.storage.provider | quote }}
+  {{- if eq .Values.storage.provider "local" }}
+  STORAGE_LOCAL_DIR: {{ .Values.storage.local.mountPath | quote }}
+  {{- else if eq .Values.storage.provider "s3" }}
+  S3_BUCKET_NAME: {{ .Values.storage.s3.bucket | quote }}
+  {{- with .Values.storage.s3.endpointURL }}
+  S3_ENDPOINT_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.storage.s3.region }}
+  AWS_REGION: {{ . | quote }}
+  {{- end }}
+  {{- else if eq .Values.storage.provider "gcs" }}
+  GCS_BUCKET_NAME: {{ .Values.storage.gcs.bucket | quote }}
+  {{- if .Values.storage.gcs.existingSecret }}
+  GOOGLE_APPLICATION_CREDENTIALS: {{ printf "/var/secrets/gcs/%s" .Values.storage.gcs.secretKey | quote }}
+  {{- end }}
+  {{- end }}
+
+  # --- Self-host behavior ---
+  ALLOWED_GITHUB_ORGS: {{ .Values.config.allowedGithubOrgs | quote }}
+  {{- with .Values.config.singleUserGithubLogin }}
+  SINGLE_USER_GITHUB_LOGIN: {{ . | quote }}
+  {{- end }}
+  USAGE_QUOTA_MODE: {{ .Values.config.usageQuotaMode | quote }}
+  RETENTION_SWEEP_MODE: {{ .Values.config.retentionSweepMode | quote }}
+  TERMS_ACCEPTANCE_ENABLED: {{ .Values.config.termsAcceptanceEnabled | quote }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+
+  # --- GitHub App (non-secret identifiers; secrets live in the Secret) ---
+  {{- with .Values.secrets.githubApp.appId }}
+  GITHUB_APP_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.secrets.githubApp.slug }}
+  GITHUB_APP_SLUG: {{ . | quote }}
+  {{- end }}
+
+  # --- LLM provider (non-secret; API keys live in the Secret) ---
+  {{- with .Values.config.llm.provider }}
+  LLM_PROVIDER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.baseURL }}
+  LLM_BASE_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.model }}
+  LLM_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.smallModel }}
+  LLM_SMALL_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.bedrockRegion }}
+  LLM_BEDROCK_REGION: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.extraHeaders }}
+  LLM_EXTRA_HEADERS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.models.enrichment }}
+  ENRICHMENT_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.models.titleExtraction }}
+  TITLE_EXTRACTION_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.models.weeklySummary }}
+  WEEKLY_SUMMARY_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.models.persona }}
+  PERSONA_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.models.forkContext }}
+  FORK_CONTEXT_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.models.insightsMatcher }}
+  INSIGHTS_MATCHER_MODEL: {{ . | quote }}
+  {{- end }}
+
+  # --- Embeddings (non-secret; EMBEDDINGS_API_KEY lives in the Secret) ---
+  {{- with .Values.config.embeddings.provider }}
+  EMBEDDINGS_PROVIDER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.embeddings.baseURL }}
+  EMBEDDINGS_BASE_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.embeddings.model }}
+  EMBEDDINGS_MODEL: {{ . | quote }}
+  {{- end }}
+
+  # --- Licensing + telemetry ---
+  {{- with .Values.config.license.telemetryEndpoint }}
+  LICENSE_TELEMETRY_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- if not .Values.config.telemetry }}
+  HIVEMIND_TELEMETRY: "false"
+  {{- end }}

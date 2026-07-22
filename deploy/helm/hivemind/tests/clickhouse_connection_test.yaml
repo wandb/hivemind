@@ -1,0 +1,36 @@
+suite: clickhouse connection selection
+release:
+  name: hivemind
+  namespace: hivemind
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: points at the bundled ClickHouse service by default
+    asserts:
+      - equal:
+          path: data.CLICKHOUSE_HOST
+          value: hivemind-clickhouse
+      - equal:
+          path: data.CLICKHOUSE_DB
+          value: agentstream
+
+  - it: requires an external host when the bundled ClickHouse is disabled
+    set:
+      clickhouse.enabled: false
+      externalClickHouse.host: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "externalClickHouse.host is required when clickhouse.enabled=false"
+
+  - it: uses the external host when provided
+    set:
+      clickhouse.enabled: false
+      externalClickHouse.host: clickhouse.example.com
+      externalClickHouse.database: telemetry
+    asserts:
+      - equal:
+          path: data.CLICKHOUSE_HOST
+          value: clickhouse.example.com
+      - equal:
+          path: data.CLICKHOUSE_DB
+          value: telemetry

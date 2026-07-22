@@ -1,0 +1,35 @@
+{{- if .Values.api.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "hivemind.fullname" . }}-api
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "api") | nindent 4 }}
+spec:
+  {{- if hasKey .Values.api.podDisruptionBudget "maxUnavailable" }}
+  maxUnavailable: {{ .Values.api.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.api.podDisruptionBudget.minAvailable | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "hivemind.componentSelectorLabels" (dict "ctx" . "component" "api") | nindent 6 }}
+{{- end }}
+{{- if .Values.worker.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "hivemind.fullname" . }}-worker
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "worker") | nindent 4 }}
+spec:
+  {{- if hasKey .Values.worker.podDisruptionBudget "maxUnavailable" }}
+  maxUnavailable: {{ .Values.worker.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.worker.podDisruptionBudget.minAvailable | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "hivemind.componentSelectorLabels" (dict "ctx" . "component" "worker") | nindent 6 }}
+{{- end }}

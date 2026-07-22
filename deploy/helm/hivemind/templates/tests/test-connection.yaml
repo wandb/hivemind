@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "hivemind.fullname" . }}-test-connection
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "test") | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: health
+      image: "{{ .Values.utilityImage.repository }}:{{ .Values.utilityImage.tag }}"
+      imagePullPolicy: {{ .Values.utilityImage.pullPolicy }}
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          url="http://{{ include "hivemind.fullname" . }}-api:{{ .Values.api.service.port }}/health"
+          echo "GET $url"
+          wget -q -T 10 -O - "$url"

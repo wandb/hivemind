@@ -1,0 +1,50 @@
+{{- if eq .Values.worker.autoscaling.mode "keda" }}
+{{- $fullname := include "hivemind.fullname" . }}
+{{- $address := printf "%s:%v" (include "hivemind.redis.host" .) (include "hivemind.redis.port" .) }}
+{{- $prefix := .Values.config.queueRedisPrefix }}
+{{- $passwordSet := eq (include "hivemind.redis.passwordSet" .) "true" }}
+{{- if $passwordSet }}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ $fullname }}-worker-redis
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "worker") | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: {{ if and (not .Values.redis.enabled) .Values.externalRedis.existingSecret }}{{ .Values.externalRedis.existingSecret }}{{ else }}{{ include "hivemind.secretName" . }}{{ end }}
+      key: {{ if and (not .Values.redis.enabled) .Values.externalRedis.existingSecret }}{{ .Values.externalRedis.existingSecretKey }}{{ else }}REDIS_PASSWORD{{ end }}
+---
+{{- end }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ $fullname }}-worker
+  labels:
+    {{- include "hivemind.componentLabels" (dict "ctx" . "component" "worker") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $fullname }}-worker
+  minReplicaCount: {{ .Values.worker.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.worker.autoscaling.maxReplicas }}
+  pollingInterval: {{ .Values.worker.autoscaling.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.worker.autoscaling.keda.cooldownPeriod }}
+  triggers:
+    {{- range .Values.worker.autoscaling.keda.triggers }}
+    - type: redis-streams
+      metadata:
+        address: {{ $address | quote }}
+        stream: {{ printf "%s:%s" $prefix .stream | quote }}
+        consumerGroup: "workers"
+        lagCount: {{ .lagCount | quote }}
+        activationLagCount: {{ .activationLagCount | quote }}
+        enableTLS: "false"
+      {{- if $passwordSet }}
+      authenticationRef:
+        name: {{ $fullname }}-worker-redis
+      {{- end }}
+    {{- end }}
+{{- end }}

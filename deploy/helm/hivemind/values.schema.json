@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Hivemind self-hosted chart values",
+  "description": "Validates the load-bearing values: image, routing, storage/datastore selection, and the enum-typed operational modes. Unmodeled fields are intentionally permitted so extraEnv and ad-hoc overrides keep working.",
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      },
+      "required": ["repository"]
+    },
+    "imagePullSecrets": { "type": "array" },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "externalURL": { "type": "string", "minLength": 1 },
+    "config": {
+      "type": "object",
+      "properties": {
+        "environment": { "type": "string", "minLength": 1 },
+        "allowedGithubOrgs": { "type": "string" },
+        "usageQuotaMode": { "type": "string", "enum": ["off", "shadow", "enforce"] },
+        "retentionSweepMode": { "type": "string", "enum": ["off", "dry_run", "enforce"] },
+        "termsAcceptanceEnabled": { "type": "boolean" },
+        "logLevel": { "type": "string" },
+        "queueRedisPrefix": { "type": "string", "minLength": 1 },
+        "telemetry": { "type": "boolean" },
+        "llm": {
+          "type": "object",
+          "properties": {
+            "provider": { "type": "string", "enum": ["", "anthropic", "openai", "bedrock"] }
+          }
+        },
+        "embeddings": {
+          "type": "object",
+          "properties": {
+            "provider": { "type": "string", "enum": ["", "none"] }
+          }
+        },
+        "extraEnv": { "type": "array" },
+        "extraEnvFrom": { "type": "array" }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "existingSecret": { "type": "string" },
+        "jwtSecret": { "type": "string" }
+      }
+    },
+    "api": {
+      "type": "object",
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 0 },
+        "autoMigrate": { "type": "boolean" },
+        "waitForClickHouse": { "type": "boolean" },
+        "autoscaling": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minReplicas": { "type": "integer", "minimum": 1 },
+            "maxReplicas": { "type": "integer", "minimum": 1 },
+            "targetCPUUtilizationPercentage": { "type": ["integer", "null"] },
+            "targetMemoryUtilizationPercentage": { "type": ["integer", "null"] }
+          }
+        }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 0 },
+        "runPeriodicTasks": { "type": "boolean" },
+        "maxInFlight": { "type": "integer", "minimum": 1 },
+        "autoscaling": {
+          "type": "object",
+          "properties": {
+            "mode": { "type": "string", "enum": ["keda", "hpa", "none"] },
+            "minReplicas": { "type": "integer", "minimum": 1 },
+            "maxReplicas": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "migrations": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "backoffLimit": { "type": "integer", "minimum": 0 },
+        "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "properties": {
+        "provider": { "type": "string", "enum": ["local", "s3", "gcs"] }
+      },
+      "required": ["provider"]
+    },
+    "clickhouse": {
+      "type": "object",
+      "properties": { "enabled": { "type": "boolean" } },
+      "required": ["enabled"]
+    },
+    "externalClickHouse": {
+      "type": "object",
+      "properties": {
+        "host": { "type": "string" },
+        "secure": { "type": "boolean" }
+      }
+    },
+    "redis": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "appendonly": { "type": "boolean" },
+        "appendfsync": { "type": "string", "enum": ["always", "everysec", "no"] }
+      },
+      "required": ["enabled"]
+    },
+    "externalRedis": {
+      "type": "object",
+      "properties": { "host": { "type": "string" } }
+    },
+    "ingress": {
+      "type": "object",
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "gateway": {
+      "type": "object",
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" }
+      }
+    },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" }
+  }
+}

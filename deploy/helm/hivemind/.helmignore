@@ -1,0 +1,15 @@
+# Patterns to ignore when building Helm packages.
+.DS_Store
+.git/
+.gitignore
+*.tmproj
+*.bak
+*.orig
+*.swp
+.idea/
+.vscode/
+# CI / local validation artifacts
+ci/
+*.tgz
+# helm-unittest suites (not shipped in the packaged chart)
+tests/

@@ -41,8 +41,9 @@ quietly no-op and the rest of the product works normally.
 
 Per-feature model overrides (each falls back to `LLM_MODEL`, then to its Claude
 default): `ENRICHMENT_MODEL`, `TITLE_EXTRACTION_MODEL`, `WEEKLY_SUMMARY_MODEL`,
-`PERSONA_MODEL`, `FORK_CONTEXT_MODEL`, `INSIGHTS_MATCHER_MODEL`,
-`ANTHROPIC_MODEL` (insights extraction + PR walkthroughs).
+`PERSONA_MODEL`, `FORK_CONTEXT_MODEL`, `SKILL_EXTRACTION_MODEL`,
+`INSIGHTS_MATCHER_MODEL`, `ANTHROPIC_MODEL` (insights extraction + PR
+walkthroughs).
 
 ### How the provider is chosen
 

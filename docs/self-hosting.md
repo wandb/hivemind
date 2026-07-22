@@ -44,6 +44,27 @@ Other commands: `hivemind serve down` (stop), `hivemind serve restart [svc]`,
 Use `hivemind serve --name smoke up` to run an isolated test instance; its
 state lives under `~/.hivemind/serve/smoke`.
 
+## Kubernetes (Helm)
+
+For a clustered deployment with autoscaling, there is a Helm chart at
+[`deploy/helm/hivemind`](../deploy/helm/hivemind) — the Kubernetes-native
+counterpart to the Compose stack (same image and configuration model). It runs
+the api and worker as separate Deployments, bundles ClickHouse and Redis (or
+points at managed ones), autoscales the api on CPU and the worker on
+**Redis-Streams queue depth** via [KEDA](https://keda.sh), and can deploy an
+optional [ClickStack](https://clickhouse.com/use-cases/observability) (HyperDX +
+OpenTelemetry) observability stack.
+
+```bash
+helm install hivemind deploy/helm/hivemind \
+  --namespace hivemind --create-namespace \
+  --set externalURL=https://hivemind.example.com \
+  --set ingress.host=hivemind.example.com
+```
+
+See the [chart README](../deploy/helm/hivemind/README.md) for autoscaling,
+external datastores, storage, and observability options.
+
 ## Single-player mode (no GitHub App)
 
 For a personal instance, open the setup URL and choose **Skip GitHub App**.

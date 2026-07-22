@@ -1,0 +1,70 @@
+
+  Hivemind self-hosted — release {{ .Release.Name }} (namespace {{ .Release.Namespace }})
+
+  Image: {{ include "hivemind.image" . }}
+
+Components:
+  • api      — FastAPI + dashboard, {{ if .Values.api.autoscaling.enabled }}HPA {{ .Values.api.autoscaling.minReplicas }}–{{ .Values.api.autoscaling.maxReplicas }}{{ else }}{{ .Values.api.replicaCount }} replica(s){{ end }}
+  • worker   — job processor, autoscaling: {{ .Values.worker.autoscaling.mode }}{{ if ne .Values.worker.autoscaling.mode "none" }} ({{ .Values.worker.autoscaling.minReplicas }}–{{ .Values.worker.autoscaling.maxReplicas }}){{ end }}
+  • clickhouse — {{ if .Values.clickhouse.enabled }}bundled StatefulSet{{ else }}external ({{ .Values.externalClickHouse.host }}){{ end }}
+  • redis      — {{ if .Values.redis.enabled }}bundled StatefulSet (queue + cache){{ else }}external ({{ .Values.externalRedis.host }}){{ end }}
+{{- if .Values.observability.clickstack.enabled }}
+  • clickstack — HyperDX observability UI
+{{- end }}
+
+1. Watch the rollout:
+
+     kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "hivemind.fullname" . }}-api
+
+   On first install the api stays NotReady until the schema migration Job
+   finishes:
+
+     kubectl -n {{ .Release.Namespace }} logs job/{{ include "hivemind.fullname" . }}-migrate-{{ .Release.Revision }}
+
+2. Reach the dashboard:
+{{- if .Values.gateway.enabled }}
+
+     {{ .Values.externalURL }}   (HTTPRoute host: {{ if .Values.gateway.hostnames }}{{ first .Values.gateway.hostnames }}{{ else }}{{ include "hivemind.externalHost" . }}{{ end }})
+
+   Ensure that host resolves to your Gateway's address. TLS is terminated on
+   the Gateway listener (owned by your platform team), not by this chart.
+{{- else if .Values.ingress.enabled }}
+
+     {{ .Values.externalURL }}   (Ingress host: {{ include "hivemind.ingressHost" . }})
+
+   Ensure that host resolves to your ingress controller's address.
+{{- else }}
+
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hivemind.fullname" . }}-api {{ .Values.api.service.port }}:{{ .Values.api.service.port }}
+     open {{ .Values.externalURL }}
+{{- end }}
+
+3. Finish setup: visit {{ .Values.externalURL }}/setup to create a GitHub App
+   (or run single-player). See docs/self-hosting.md.
+{{- if not .Values.secrets.existingSecret }}{{ if not .Values.secrets.jwtSecret }}
+
+   A JWT signing secret was auto-generated and stored in the Secret
+   {{ include "hivemind.secretName" . }} (preserved across upgrades).
+{{- end }}{{ end }}
+
+{{- if .Values.observability.clickstack.enabled }}
+
+4. Observability (ClickStack / HyperDX):
+{{- if .Values.observability.clickstack.ingress.enabled }}
+     https://{{ .Values.observability.clickstack.ingress.host }}
+{{- else }}
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hivemind.fullname" . }}-clickstack {{ .Values.observability.clickstack.uiPort }}:{{ .Values.observability.clickstack.uiPort }}
+{{- end }}
+{{- if not .Values.observability.tracing.enabled }}
+   NOTE: observability.tracing.enabled is false, so the api/worker are not yet
+   shipping telemetry. Set it true to populate HyperDX.
+{{- end }}
+{{- end }}
+
+{{- $apiMax := ternary (int .Values.api.autoscaling.maxReplicas) (int .Values.api.replicaCount) .Values.api.autoscaling.enabled }}
+{{- if and (eq .Values.storage.provider "local") .Values.storage.local.persistence.enabled (eq .Values.storage.local.persistence.accessMode "ReadWriteOnce") (gt $apiMax 1) }}
+
+⚠  api can run up to {{ $apiMax }} replicas but storage.local.persistence.accessMode
+   is ReadWriteOnce. Export downloads are served back through the API, so set it
+   to ReadWriteMany (RWX storage class) or use storage.provider=s3 for HA.
+{{- end }}

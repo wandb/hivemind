@@ -1,0 +1,115 @@
+suite: application ClickHouse HyperDX connection
+release:
+  name: hivemind
+  namespace: hivemind
+tests:
+  - it: provisioner sidecar carries the app-CH connection env by default
+    templates:
+      - templates/clickstack/clickstack.yaml
+    set:
+      observability.clickstack.enabled: true
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - contains:
+          path: spec.template.spec.containers
+          count: 1
+          any: true
+          content:
+            name: hyperdx-provisioner
+      - contains:
+          path: spec.template.spec.containers[1].env
+          content:
+            name: APP_CH_HOST
+            value: http://hivemind-clickhouse:8123
+      - contains:
+          path: spec.template.spec.containers[1].env
+          content:
+            name: APP_CH_CONNECTION_NAME
+            value: Application ClickHouse
+
+  - it: app-CH host follows externalClickHouse when the bundle is disabled
+    templates:
+      - templates/clickstack/clickstack.yaml
+    set:
+      observability.clickstack.enabled: true
+      clickhouse.enabled: false
+      externalClickHouse.host: clickhouse.example.com
+      externalClickHouse.httpPort: 8443
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[1].env
+          content:
+            name: APP_CH_HOST
+            value: http://clickhouse.example.com:8443
+
+  - it: sidecar still renders (for the connection) when dashboards are disabled
+    templates:
+      - templates/clickstack/clickstack.yaml
+    set:
+      observability.clickstack.enabled: true
+      observability.clickstack.dashboards.enabled: false
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - contains:
+          path: spec.template.spec.containers
+          count: 1
+          any: true
+          content:
+            name: hyperdx-provisioner
+      - contains:
+          path: spec.template.spec.containers[1].env
+          content:
+            name: PROVISION_DASHBOARDS
+            value: "false"
+
+  - it: no provisioner when both dashboards and the connection are disabled
+    templates:
+      - templates/clickstack/clickstack.yaml
+    set:
+      observability.clickstack.enabled: true
+      observability.clickstack.dashboards.enabled: false
+      observability.clickstack.appClickHouseConnection.enabled: false
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers
+          content:
+            name: hyperdx-provisioner
+
+  - it: provision.sh upserts the connection insert-only (never overwrites)
+    templates:
+      - templates/clickstack/dashboards-configmap.yaml
+    set:
+      observability.clickstack.enabled: true
+    documentSelector:
+      path: metadata.name
+      value: hivemind-clickstack-dashboards
+    asserts:
+      - matchRegex:
+          path: data["provision.sh"]
+          pattern: "ensure_connection"
+      - matchRegex:
+          path: data["provision.sh"]
+          pattern: "db.connections.insertOne"
+
+  - it: configmap renders for the connection even with dashboards off
+    templates:
+      - templates/clickstack/dashboards-configmap.yaml
+    set:
+      observability.clickstack.enabled: true
+      observability.clickstack.dashboards.enabled: false
+    documentSelector:
+      path: metadata.name
+      value: hivemind-clickstack-dashboards
+    asserts:
+      - hasDocuments:
+          count: 1

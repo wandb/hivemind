@@ -1,0 +1,35 @@
+# Copy to terraform.tfvars and edit. Terraform auto-loads that filename; this
+# one is deliberately not auto-loaded, so a fresh clone can't plan against
+# someone else's project by accident.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# Keep the license out of the file — export TF_VAR_license instead. See the
+# note in ../production/terraform.tfvars.example.
+
+# --- Required ---------------------------------------------------------------
+
+project_id = "my-gcp-project"
+
+# The balancer's hostname and the managed certificate's subject.
+domain = "hivemind.example.com"
+
+# Only members of this GitHub org can sign in. Leaving it unset would leave
+# login open to any GitHub account.
+github_org = "my-org"
+
+# An existing Cloud DNS zone authoritative for `domain`, so the A record is
+# published in the same apply. Without it the certificate never issues, because
+# Google validates by resolving the name.
+dns_managed_zone = "example-com"
+
+# --- Optional (defaults shown) ----------------------------------------------
+
+# region = "us-central1"
+
+# Cloud Armor is the access control here — the VM firewall cannot be, since
+# every request arrives from Google's proxy range. Narrow this to your egress
+# ranges for an internal deployment.
+# office_cidrs = ["0.0.0.0/0"]
+
+# license — set via TF_VAR_license. Empty runs unlicensed.

@@ -1,0 +1,45 @@
+# Copy to terraform.tfvars and edit. Terraform auto-loads that filename; this
+# one is deliberately not auto-loaded, so a fresh clone can't plan against
+# someone else's project by accident.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# Keep secrets out of the file. `terraform.tfvars` is a working-directory file
+# that ends up in editors, backups and (one `git add .` later) history, while
+# TF_VAR_ variables stay in the shell:
+#
+#   export TF_VAR_clickhouse_password=...
+#   export TF_VAR_license=...
+#
+# They land in terraform state either way, so keep state in a bucket you treat
+# as sensitive.
+
+# --- Required ---------------------------------------------------------------
+
+project_id = "my-gcp-project"
+
+# Point an A record for this name at the `dns_target` output BEFORE the first
+# boot. Caddy validates over HTTP-01 and cannot get a certificate for a name
+# that does not resolve yet.
+domain = "hivemind.example.com"
+
+# Only members of this GitHub org can sign in. Leaving it unset would leave
+# login open to any GitHub account.
+github_org = "my-org"
+
+# An existing managed ClickHouse (e.g. ClickHouse Cloud). Add this instance's
+# `external_ip` output to that service's IP allowlist — that is why static_ip
+# is on. See ../clickhouse-cloud to provision one in the same apply.
+clickhouse_host = "abc123.us-central1.gcp.clickhouse.cloud"
+
+# clickhouse_password — set via TF_VAR_clickhouse_password (see above).
+
+# --- Optional (defaults shown) ----------------------------------------------
+
+# region = "us-central1"
+
+# license — set via TF_VAR_license. Empty runs unlicensed.
+
+# cursor_api_key — set via TF_VAR_cursor_api_key. Enriches Cursor sessions with
+# the usage and cost Cursor reports (Cursor: Dashboard -> Settings -> Cursor
+# Admin API). Empty leaves Cursor sessions unenriched.

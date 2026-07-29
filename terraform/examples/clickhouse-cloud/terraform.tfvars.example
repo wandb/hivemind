@@ -1,0 +1,40 @@
+# Copy to terraform.tfvars and edit. Terraform auto-loads that filename; this
+# one is deliberately not auto-loaded, so a fresh clone can't plan against
+# someone else's project by accident.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# This example needs ClickHouse Cloud API credentials in the environment as
+# well — they configure the provider, so they are not variables:
+#
+#   export CLICKHOUSE_ORG_ID=...
+#   export CLICKHOUSE_TOKEN_KEY=...
+#   export CLICKHOUSE_TOKEN_SECRET=...
+#
+# The license stays out of the file too — export TF_VAR_license.
+
+# --- Required ---------------------------------------------------------------
+
+project_id = "my-gcp-project"
+
+# Point an A record for this name at the `dns_target` output BEFORE the first
+# boot. Caddy validates over HTTP-01 and cannot get a certificate for a name
+# that does not resolve yet.
+domain = "hivemind.example.com"
+
+# Only members of this GitHub org can sign in. Leaving it unset would leave
+# login open to any GitHub account.
+github_org = "my-org"
+
+# --- Optional (defaults shown) ----------------------------------------------
+
+# region = "us-central1"
+
+# Keep the ClickHouse region next to `region` — every query crosses this gap.
+# clickhouse_region = "us-central1"
+
+# Autoscaling ceiling for the ClickHouse service. This is the knob that decides
+# what a busy day costs.
+# clickhouse_max_replica_memory_gb = 24
+
+# license — set via TF_VAR_license. Empty runs unlicensed.

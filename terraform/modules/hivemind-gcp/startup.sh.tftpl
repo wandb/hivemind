@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Provisions Docker + the pinned hivemind CLI, renders the instance config from
+# Secret Manager, and starts the stack. Runs on every boot; each step is
+# idempotent, so a reboot re-converges the instance onto the current config.
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+PROJECT_ID="${project_id}"
+HIVEMIND_VERSION="${hivemind_version}"
+HIVEMIND_SHA256="${hivemind_sha256}"
+SECRET_IDS='${secret_ids}'
+
+CONFIG_DIR=/etc/hivemind
+
+log() { echo "[hivemind-init] $*"; }
+
+# --- Docker -----------------------------------------------------------------
+
+if ! command -v docker >/dev/null 2>&1; then
+  log "installing docker"
+  apt-get update
+  apt-get install -y ca-certificates curl gnupg jq
+
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  apt-get update
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+fi
+systemctl enable --now docker
+# The update matters: this branch is reached when the image already ships
+# Docker, so the apt-get update above was skipped and the indexes may be old
+# enough that every mirror URL 404s.
+command -v jq >/dev/null 2>&1 || { apt-get update && apt-get install -y jq; }
+
+# --- hivemind CLI -----------------------------------------------------------
+
+# Pinned, not "latest": the CLI and the server image must agree on which
+# features exist, and HIVEMIND_VERSION below pins the image to match.
+RELEASE_URL="https://github.com/wandb/hivemind/releases/download/$${HIVEMIND_VERSION}"
+
+if ! /usr/local/bin/hivemind --version 2>/dev/null | grep -q "$${HIVEMIND_VERSION#v}"; then
+  log "installing hivemind $${HIVEMIND_VERSION}"
+  curl -fsSL --retry 5 --retry-delay 3 -o /tmp/hivemind "$RELEASE_URL/hivemind-linux-x86_64"
+
+  # Verified before it is ever made executable — this binary runs as root on
+  # every boot. A pinned `hivemind_sha256` wins when set, and is the only check
+  # that survives a compromise of the release itself: SHA256SUMS is served from
+  # the same place as the binary, so on its own it proves integrity (no
+  # truncation, no corruption, no silent re-upload under an existing tag) but
+  # not authenticity.
+  expected="$HIVEMIND_SHA256"
+  if [ -z "$expected" ]; then
+    if ! curl -fsSL --retry 5 --retry-delay 3 -o /tmp/hivemind.sums "$RELEASE_URL/SHA256SUMS"; then
+      log "no SHA256SUMS published for $${HIVEMIND_VERSION}"
+      log "releases before v1.0.6rc4 predate it - pin a newer hivemind_version, or set hivemind_sha256"
+      exit 1
+    fi
+    expected=$(awk '$2 == "hivemind-linux-x86_64" { print $1 }' /tmp/hivemind.sums)
+  fi
+
+  actual=$(sha256sum /tmp/hivemind | cut -d' ' -f1)
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    log "checksum mismatch for hivemind-linux-x86_64"
+    log "  expected: $${expected:-<none published>}"
+    log "  actual:   $actual"
+    rm -f /tmp/hivemind
+    exit 1
+  fi
+  log "verified hivemind-linux-x86_64 sha256"
+
+  chmod +x /tmp/hivemind
+  mv /tmp/hivemind /usr/local/bin/hivemind
+fi
+
+# --- Configuration ----------------------------------------------------------
+
+mkdir -p "$CONFIG_DIR"
+chmod 0700 "$CONFIG_DIR"
+
+curl -fsS -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/attributes/hivemind-config" \
+  -o "$CONFIG_DIR/config.json"
+
+access_token() {
+  curl -fsS -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
+  | jq -r .access_token
+}
+
+# Secrets are exported into setup's environment rather than written to disk;
+# config.json references them by name. Read via the REST API so this doesn't
+# depend on the gcloud CLI being present on the image.
+TOKEN="$(access_token)"
+declare -a SECRET_ENV=()
+while IFS=$'\t' read -r env_name secret_id; do
+  [ -n "$env_name" ] || continue
+  value=$(curl -fsS -H "Authorization: Bearer $TOKEN" \
+    "https://secretmanager.googleapis.com/v1/projects/$PROJECT_ID/secrets/$secret_id/versions/latest:access" \
+    | jq -r '.payload.data' | base64 -d)
+  export "$env_name=$value"
+  SECRET_ENV+=("$env_name")
+done < <(printf '%s' "$SECRET_IDS" | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
+log "loaded $${#SECRET_ENV[@]} secret(s) from Secret Manager"
+
+# --force re-renders on every boot so a config change converges after a
+# restart. Instance identity (JWT_SECRET, HIVEMIND_SECRET_KEY) is preserved
+# across re-runs by the CLI — rotating it would invalidate issued tokens and
+# make the encrypted instance secrets unreadable.
+log "writing instance config"
+hivemind serve setup --config "$CONFIG_DIR/config.json" --force
+
+# Pin the server image to the same release as the CLI. Without this the compose
+# stack resolves $${HIVEMIND_VERSION:-latest}, which tracks the last *stable*
+# release and can predate the CLI.
+ENV_FILE="/root/.hivemind/serve/default/.env"
+if ! grep -q '^HIVEMIND_VERSION=' "$ENV_FILE" 2>/dev/null; then
+  printf 'HIVEMIND_VERSION=%s\n' "$${HIVEMIND_VERSION#v}" >> "$ENV_FILE"
+else
+  sed -i "s/^HIVEMIND_VERSION=.*/HIVEMIND_VERSION=$${HIVEMIND_VERSION#v}/" "$ENV_FILE"
+fi
+
+# --- Run --------------------------------------------------------------------
+
+log "starting the stack"
+hivemind serve up
+
+# Survive reboots without re-running this whole script.
+hivemind serve install-service --install >/dev/null 2>&1 || \
+  log "could not install the systemd unit; the stack still restarts with docker"
+
+# OS Login creates accounts on first SSH, so they can't be added to the docker
+# group ahead of time. Self-enroll on first interactive login instead.
+cat > /etc/profile.d/hivemind-docker.sh <<'EOF'
+if [ -n "$PS1" ] && ! id -nG 2>/dev/null | grep -qw docker; then
+  if sudo -n usermod -aG docker "$USER" >/dev/null 2>&1; then
+    echo "Added $USER to the docker group - run 'newgrp docker' or reconnect."
+  fi
+fi
+EOF
+chmod 0644 /etc/profile.d/hivemind-docker.sh
+
+log "done"

@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars and edit. Terraform auto-loads that filename; this
+# one is deliberately not auto-loaded, so a fresh clone can't plan against
+# someone else's project by accident.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+
+# --- Required ---------------------------------------------------------------
+
+project_id = "my-gcp-project"
+
+# --- Optional (defaults shown) ----------------------------------------------
+
+# region = "us-central1"

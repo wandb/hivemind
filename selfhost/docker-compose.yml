@@ -97,6 +97,16 @@ services:
       # Path to the bind-mounted .env, snapshotted (encrypted) to the bucket for
       # `hivemind serve restore`. See the read-only mount below.
       - CONFIG_ENV_FILE=/config/.env
+      # Which GitHub this instance talks to. Default github.com; set to a
+      # GitHub Enterprise host to point login, the App manifest flow, PR
+      # enrichment and org/team sync at the appliance instead. GITHUB_API_BASE
+      # only needs setting when the API isn't at the derived location
+      # (https://<host>/api/v3, or https://api.<host> for *.ghe.com).
+      # GITHUB_CA_BUNDLE is a path *inside the container* — put the PEM under
+      # the data directory, which is mounted at /data.
+      - GITHUB_HOST=${GITHUB_HOST:-}
+      - GITHUB_API_BASE=${GITHUB_API_BASE:-}
+      - GITHUB_CA_BUNDLE=${GITHUB_CA_BUNDLE:-}
       - GITHUB_APP_ID=${GITHUB_APP_ID:-}
       - GITHUB_APP_SLUG=${GITHUB_APP_SLUG:-}
       - GITHUB_APP_CLIENT_ID=${GITHUB_APP_CLIENT_ID:-}
@@ -110,6 +120,11 @@ services:
       # the first GitHub user to log in claims the instance. Set this to pin
       # that owner explicitly. See docs/self-hosting.md.
       - SINGLE_USER_GITHUB_LOGIN=${SINGLE_USER_GITHUB_LOGIN:-}
+      # Trust partner OIDC issuers whose tokens auto-provision personal
+      # credentials, as comma-separated `kind=host` pairs, so developers on
+      # those VMs authenticate as themselves with no setup. See
+      # docs/partner-federation.md.
+      - TRUSTED_OIDC_PAT_ISSUERS=${TRUSTED_OIDC_PAT_ISSUERS:-}
       # Self-host defaults: no quotas, no retention deletion, no autoscaler.
       # USAGE_QUOTA_MODE is a no-op on self-host: quota_mode() reads
       # LICENSE_ENFORCEMENT_MODE instead (warn -> counters advance but never deny).
@@ -134,6 +149,16 @@ services:
       - LLM_MODEL=${LLM_MODEL:-}
       - LLM_EXTRA_HEADERS=${LLM_EXTRA_HEADERS:-}
       - LLM_BEDROCK_REGION=${LLM_BEDROCK_REGION:-}
+      # Google Vertex AI (only when LLM_PROVIDER=vertex). Credentials come from
+      # the attached service account on a GCP VM / GKE, or from a key supplied
+      # inline via LLM_VERTEX_CREDENTIALS (what `hivemind serve setup` writes);
+      # GOOGLE_APPLICATION_CREDENTIALS is for a key you bind-mount yourself.
+      - LLM_VERTEX_PROJECT=${LLM_VERTEX_PROJECT:-}
+      - LLM_VERTEX_LOCATION=${LLM_VERTEX_LOCATION:-}
+      - LLM_VERTEX_CREDENTIALS=${LLM_VERTEX_CREDENTIALS:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+      - LLM_VERTEX_REASONING_EFFORT=${LLM_VERTEX_REASONING_EFFORT:-}
+      - LLM_VERTEX_THINKING_RESERVE=${LLM_VERTEX_THINKING_RESERVE:-}
       # Per-feature overrides — titles and weekly summaries can run a smaller,
       # cheaper model than the main one (LLM_SMALL_MODEL, then the per-feature
       # vars; all fall back to LLM_MODEL).
@@ -143,12 +168,27 @@ services:
       # Embeddings (insight clustering + semantic search). OpenAI-compatible;
       # falls back to OPENAI_API_KEY. Replacement models MUST output 1536-dim
       # vectors to match the ClickHouse index (see docs/llm-providers.md).
+      - EMBEDDINGS_PROVIDER=${EMBEDDINGS_PROVIDER:-}
       - EMBEDDINGS_API_KEY=${EMBEDDINGS_API_KEY:-}
       - EMBEDDINGS_BASE_URL=${EMBEDDINGS_BASE_URL:-}
       - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-}
+      - EMBEDDINGS_DIMENSIONS=${EMBEDDINGS_DIMENSIONS:-}
       # Bedrock auth (only when LLM_PROVIDER=bedrock) reuses the AWS_* set above
       # for object storage; only the optional session token is added here.
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+      # Cursor Admin API key, for enriching Cursor sessions with the team's
+      # usage/cost data. Team-scoped: it only resolves members of the team the
+      # key belongs to. CURSOR_API_ORG_IDS narrows which orgs are attempted;
+      # unset (the default) attempts every Cursor session.
+      - CURSOR_API_KEY=${CURSOR_API_KEY:-}
+      - CURSOR_API_ORG_IDS=${CURSOR_API_ORG_IDS:-}
+    # Escape hatch for settings this file doesn't name. Written by `hivemind
+    # serve setup` from the config's `env` section, and safe to hand-edit when
+    # you don't use setup — but setup rewrites it, so put anything permanent in
+    # the config. Values are literal: unlike .env, compose does not interpolate
+    # them. Anything in `environment:` above wins over this file.
+    env_file:
+      - extra.env
     volumes:
       - ${HIVEMIND_SERVE_DATA_DIR:-./data}:/data
       # Read-only .env so the app can snapshot it (encrypted) to the bucket for
@@ -221,6 +261,16 @@ services:
       # for the Redis queue (see https://hivemind.wandb.tools/docs).
       - WORKER_RUN_PERIODIC_TASKS=true
       - GITHUB_CREDS_FILE=/data/github-app.env
+      # Which GitHub this instance talks to. Default github.com; set to a
+      # GitHub Enterprise host to point login, the App manifest flow, PR
+      # enrichment and org/team sync at the appliance instead. GITHUB_API_BASE
+      # only needs setting when the API isn't at the derived location
+      # (https://<host>/api/v3, or https://api.<host> for *.ghe.com).
+      # GITHUB_CA_BUNDLE is a path *inside the container* — put the PEM under
+      # the data directory, which is mounted at /data.
+      - GITHUB_HOST=${GITHUB_HOST:-}
+      - GITHUB_API_BASE=${GITHUB_API_BASE:-}
+      - GITHUB_CA_BUNDLE=${GITHUB_CA_BUNDLE:-}
       - GITHUB_APP_ID=${GITHUB_APP_ID:-}
       - GITHUB_APP_SLUG=${GITHUB_APP_SLUG:-}
       - GITHUB_APP_CLIENT_ID=${GITHUB_APP_CLIENT_ID:-}
@@ -241,15 +291,31 @@ services:
       - LLM_MODEL=${LLM_MODEL:-}
       - LLM_EXTRA_HEADERS=${LLM_EXTRA_HEADERS:-}
       - LLM_BEDROCK_REGION=${LLM_BEDROCK_REGION:-}
+      - LLM_VERTEX_PROJECT=${LLM_VERTEX_PROJECT:-}
+      - LLM_VERTEX_LOCATION=${LLM_VERTEX_LOCATION:-}
+      - LLM_VERTEX_CREDENTIALS=${LLM_VERTEX_CREDENTIALS:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+      - LLM_VERTEX_REASONING_EFFORT=${LLM_VERTEX_REASONING_EFFORT:-}
+      - LLM_VERTEX_THINKING_RESERVE=${LLM_VERTEX_THINKING_RESERVE:-}
       - LLM_SMALL_MODEL=${LLM_SMALL_MODEL:-}
       - TITLE_EXTRACTION_MODEL=${TITLE_EXTRACTION_MODEL:-}
       - WEEKLY_SUMMARY_MODEL=${WEEKLY_SUMMARY_MODEL:-}
+      - EMBEDDINGS_PROVIDER=${EMBEDDINGS_PROVIDER:-}
       - EMBEDDINGS_API_KEY=${EMBEDDINGS_API_KEY:-}
       - EMBEDDINGS_BASE_URL=${EMBEDDINGS_BASE_URL:-}
       - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-}
+      - EMBEDDINGS_DIMENSIONS=${EMBEDDINGS_DIMENSIONS:-}
       # Bedrock auth reuses the AWS_* set above for object storage; only the
       # optional session token is added here.
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+      # Cursor Admin API enrichment runs here (the cache-warming job and
+      # session enrichment both read the key from the environment).
+      - CURSOR_API_KEY=${CURSOR_API_KEY:-}
+      - CURSOR_API_ORG_IDS=${CURSOR_API_ORG_IDS:-}
+    # See the app service: extra.env is the escape hatch for settings this file
+    # doesn't name, and `environment:` above wins over it.
+    env_file:
+      - extra.env
     volumes:
       - ${HIVEMIND_SERVE_DATA_DIR:-./data}:/data
     depends_on:

@@ -55,10 +55,24 @@ data:
   {{- with .Values.config.singleUserGithubLogin }}
   SINGLE_USER_GITHUB_LOGIN: {{ . | quote }}
   {{- end }}
+  {{- with .Values.config.trustedOidcPatIssuers }}
+  TRUSTED_OIDC_PAT_ISSUERS: {{ . | quote }}
+  {{- end }}
   USAGE_QUOTA_MODE: {{ .Values.config.usageQuotaMode | quote }}
   RETENTION_SWEEP_MODE: {{ .Values.config.retentionSweepMode | quote }}
   TERMS_ACCEPTANCE_ENABLED: {{ .Values.config.termsAcceptanceEnabled | quote }}
   LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+
+  # --- GitHub deployment (github.com or GitHub Enterprise) ---
+  {{- with .Values.config.githubHost }}
+  GITHUB_HOST: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.githubApiBase }}
+  GITHUB_API_BASE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.githubCaBundle }}
+  GITHUB_CA_BUNDLE: {{ . | quote }}
+  {{- end }}
 
   # --- GitHub App (non-secret identifiers; secrets live in the Secret) ---
   {{- with .Values.secrets.githubApp.appId }}
@@ -83,6 +97,12 @@ data:
   {{- end }}
   {{- with .Values.config.llm.bedrockRegion }}
   LLM_BEDROCK_REGION: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.vertexProject }}
+  LLM_VERTEX_PROJECT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.llm.vertexLocation }}
+  LLM_VERTEX_LOCATION: {{ . | quote }}
   {{- end }}
   {{- with .Values.config.llm.extraHeaders }}
   LLM_EXTRA_HEADERS: {{ . | quote }}
@@ -115,6 +135,9 @@ data:
   {{- end }}
   {{- with .Values.config.embeddings.model }}
   EMBEDDINGS_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.embeddings.dimensions }}
+  EMBEDDINGS_DIMENSIONS: {{ . | quote }}
   {{- end }}
 
   # --- Licensing + telemetry ---

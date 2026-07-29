@@ -47,6 +47,23 @@ config:
   # Pin the single-player owner (GitHub login) when no GitHub App is set.
   # Empty = first GitHub user to log in claims the instance.
   singleUserGithubLogin: ""
+  # GitHub Enterprise. The host your developers browse to — e.g.
+  # "github.acme-corp.com", or "acme.ghe.com" for Enterprise Cloud with data
+  # residency. Empty = github.com. Points login, the App manifest flow, PR
+  # enrichment, and org/team sync at your deployment.
+  githubHost: ""
+  # Override the derived REST root. Only needed when the API isn't at
+  # https://<host>/api/v3 (or https://api.<host> for *.ghe.com).
+  githubApiBase: ""
+  # PEM trust bundle for an appliance behind a private certificate authority.
+  # Path *inside the container* — mount the bundle yourself (extraVolumes /
+  # extraVolumeMounts) and point this at the mounted path.
+  githubCaBundle: ""
+  # Trust partner OIDC issuers whose tokens auto-provision personal credentials.
+  # Comma-separated `kind=host` pairs (e.g. "sparkbox=oidc.example.com").
+  # Developers on those VMs then authenticate as themselves with no setup —
+  # see docs/partner-federation.md. Empty = disabled.
+  trustedOidcPatIssuers: ""
   # Self-host defaults: no quotas, no retention deletion, no per-user clickwrap.
   usageQuotaMode: "off"        # off | shadow | enforce
   retentionSweepMode: "off"    # off | dry_run | enforce
@@ -59,8 +76,9 @@ config:
   # feature quietly no-ops when nothing here is set. API keys are secrets and
   # live under `secrets.llm`. Full guide: docs/llm-providers.md.
   llm:
-    # anthropic | openai | bedrock. Empty auto-detects: `openai` once baseURL or
-    # an OpenAI-style key is set, else `anthropic` when an Anthropic key is set.
+    # anthropic | openai | bedrock | vertex. Empty auto-detects: `openai` once
+    # baseURL or an OpenAI-style key is set, else `anthropic` when an Anthropic
+    # key is set.
     provider: ""
     # OpenAI-compatible endpoint (Ollama, vLLM, W&B/CoreWeave, ...). Its presence
     # auto-selects the openai provider. e.g. https://api.inference.wandb.ai/v1
@@ -72,6 +90,14 @@ config:
     smallModel: ""
     # Amazon Bedrock region (provider: bedrock; Anthropic models via AWS creds).
     bedrockRegion: ""
+    # Google Vertex AI (provider: vertex). Credentials come from the pod's
+    # Google identity — Workload Identity is the recommended setup and needs
+    # nothing here. Without it, set secrets.llm.vertexCredentials to a
+    # service-account key with the `Vertex AI User` role.
+    vertexProject: ""
+    # `global` (the default when empty) works for Gemini and Claude; pin a
+    # region only if a data-residency policy requires it.
+    vertexLocation: ""
     # Extra headers for the OpenAI-compatible endpoint, as a JSON string:
     #   extraHeaders: '{"OpenAI-Project": "my-team/my-project"}'
     extraHeaders: ""
@@ -89,9 +115,13 @@ config:
   # embeddingsApiKey is unset. A replacement model MUST emit 1536-dim vectors to
   # match the ClickHouse vector index. Set provider "none" to disable embeddings.
   embeddings:
-    provider: ""          # "" (auto) | none
+    provider: ""          # "" (auto) | none | vertex
     baseURL: ""
     model: ""             # default text-embedding-3-small
+    # Output size to request; only needed for models whose native size isn't
+    # 1536 but which can be asked for it (text-embedding-3-large). The vertex
+    # provider pins this itself.
+    dimensions: ""
 
   # --- Self-host licensing ---
   # Unlicensed instances keep working and show a "get a license" banner. The
@@ -168,6 +198,11 @@ secrets:
     apiKey: ""
     # Embeddings key (EMBEDDINGS_API_KEY). Falls back to openaiApiKey when unset.
     embeddingsApiKey: ""
+    # Vertex AI service-account key (LLM_VERTEX_CREDENTIALS). Leave empty when
+    # the pods have a Google identity already — Workload Identity is the
+    # recommended setup. Otherwise:
+    #   --set-file secrets.llm.vertexCredentials=vertex-sa.json
+    vertexCredentials: ""
 
 # -----------------------------------------------------------------------------
 # API (app): FastAPI + dashboard static, serves on :8080, exposes /health.

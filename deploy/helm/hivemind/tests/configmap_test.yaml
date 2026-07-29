@@ -59,6 +59,39 @@ tests:
           path: data.LLM_BEDROCK_REGION
           value: us-east-1
 
+  - it: wires a Vertex AI LLM provider
+    set:
+      config.llm.provider: vertex
+      config.llm.vertexProject: my-gcp-project
+      config.llm.vertexLocation: us-east5
+      config.llm.model: google/gemini-3-pro
+    asserts:
+      - equal:
+          path: data.LLM_PROVIDER
+          value: vertex
+      - equal:
+          path: data.LLM_VERTEX_PROJECT
+          value: my-gcp-project
+      - equal:
+          path: data.LLM_VERTEX_LOCATION
+          value: us-east5
+
+  - it: leaves the Vertex location to the backend default when unset
+    set:
+      config.llm.provider: vertex
+      config.llm.vertexProject: my-gcp-project
+    asserts:
+      - notExists:
+          path: data.LLM_VERTEX_LOCATION
+
+  - it: routes embeddings through Vertex
+    set:
+      config.embeddings.provider: vertex
+    asserts:
+      - equal:
+          path: data.EMBEDDINGS_PROVIDER
+          value: vertex
+
   - it: disables embeddings when provider is none
     set:
       config.embeddings.provider: none
@@ -102,3 +135,36 @@ tests:
       - equal:
           path: data.CLICKHOUSE_SECURE
           value: "true"
+
+  - it: omits GitHub Enterprise env by default (github.com)
+    asserts:
+      - notExists:
+          path: data.GITHUB_HOST
+      - notExists:
+          path: data.GITHUB_API_BASE
+      - notExists:
+          path: data.GITHUB_CA_BUNDLE
+
+  - it: wires a GitHub Enterprise Server host
+    set:
+      config.githubHost: github.acme-corp.com
+      config.githubCaBundle: /etc/hivemind/github-ca.pem
+    asserts:
+      - equal:
+          path: data.GITHUB_HOST
+          value: github.acme-corp.com
+      - equal:
+          path: data.GITHUB_CA_BUNDLE
+          value: /etc/hivemind/github-ca.pem
+      # The API root is derived server-side; only set this to override it.
+      - notExists:
+          path: data.GITHUB_API_BASE
+
+  - it: allows overriding the derived API base
+    set:
+      config.githubHost: github.acme-corp.com
+      config.githubApiBase: https://ghe-api.acme-corp.com
+    asserts:
+      - equal:
+          path: data.GITHUB_API_BASE
+          value: https://ghe-api.acme-corp.com

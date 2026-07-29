@@ -22,6 +22,9 @@
       "properties": {
         "environment": { "type": "string", "minLength": 1 },
         "allowedGithubOrgs": { "type": "string" },
+        "githubHost": { "type": "string" },
+        "githubApiBase": { "type": "string" },
+        "githubCaBundle": { "type": "string" },
         "usageQuotaMode": { "type": "string", "enum": ["off", "shadow", "enforce"] },
         "retentionSweepMode": { "type": "string", "enum": ["off", "dry_run", "enforce"] },
         "termsAcceptanceEnabled": { "type": "boolean" },
@@ -31,13 +34,13 @@
         "llm": {
           "type": "object",
           "properties": {
-            "provider": { "type": "string", "enum": ["", "anthropic", "openai", "bedrock"] }
+            "provider": { "type": "string", "enum": ["", "anthropic", "openai", "bedrock", "vertex"] }
           }
         },
         "embeddings": {
           "type": "object",
           "properties": {
-            "provider": { "type": "string", "enum": ["", "none"] }
+            "provider": { "type": "string", "enum": ["", "none", "vertex"] }
           }
         },
         "extraEnv": { "type": "array" },

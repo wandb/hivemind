@@ -134,6 +134,64 @@ To restrict who can log in to your instance, set
 `ALLOWED_GITHUB_ORGS=my-org` in `~/.hivemind/serve/<name>/.env`
 (unset = any GitHub user).
 
+### GitHub Enterprise
+
+`hivemind serve setup` asks whether you use GitHub Enterprise and writes
+`GITHUB_HOST` for you. Everything above then targets your deployment instead
+of github.com — dashboard and daemon login, the App manifest flow, org and
+team sync, PR enrichment and walkthrough comments, avatars and repo links.
+
+| Deployment | `GITHUB_HOST` | REST API HiveMind derives |
+|---|---|---|
+| github.com (default) | unset | `https://api.github.com` |
+| Enterprise Server (appliance) | `github.acme-corp.com` | `https://github.acme-corp.com/api/v3` |
+| Enterprise Cloud with data residency | `acme.ghe.com` | `https://api.acme.ghe.com` |
+
+Set `GITHUB_API_BASE` only if your API isn't at the derived location (an
+appliance behind a path-rewriting proxy, or a split API hostname).
+
+**Private certificate authority.** Appliances usually serve TLS from the
+enterprise's own CA, which isn't in the default trust bundle. Put the PEM
+chain in the instance's data directory and point `GITHUB_CA_BUNDLE` at its
+path *inside the container* — the data directory is mounted at `/data`, so
+`~/.hivemind/serve/<name>/data/github-ca.pem` becomes
+`GITHUB_CA_BUNDLE=/data/github-ca.pem`. The setup wizard does this copy for
+you. Without it every GitHub call fails certificate verification.
+
+**Things that differ from github.com:**
+
+- **The App gets created on your appliance**, at
+  `https://<your-host>/settings/apps/new`. The wizard's manifest flow works
+  the same way; the "Enable Device Flow" and install steps above are
+  unchanged, just on your host.
+- **Webhooks work on a private network.** github.com rejects an App manifest
+  whose webhook URL isn't publicly reachable, so the wizard drops the webhook
+  for LAN/VPN instances. Your appliance has no such restriction, so an
+  Enterprise Server instance keeps its webhook even on an internal hostname.
+- **The App asks for the same permissions.** Org membership — "is this user in
+  the org?" — is answered by the organization **Members** (read) permission on
+  Enterprise Server exactly as on github.com, so the manifest is identical on
+  every deployment.
+- **Repos on github.com are not enriched.** An instance holds credentials for
+  one GitHub. Sessions in github.com repos are still recorded, searched and
+  billed normally; they just don't get PR state, walkthroughs, or
+  repo-collaborator access grants. The reverse is true on a github.com
+  instance.
+- **Daemons need no configuration.** `hivemind login` reads the host from your
+  server at `/v1/auth/github/config` before it probes anything.
+  `HIVEMIND_GITHUB_HOST` overrides it if you need to pin one. If your appliance
+  uses a private CA, developers also set `HIVEMIND_GITHUB_CA_BUNDLE` to a PEM
+  path on their own machine — the daemon talks to GitHub directly during login,
+  and unlike `curl` it does not read `SSL_CERT_FILE`.
+- **Credential discovery follows the host.** The daemon probes
+  `git@<your-host>` over SSH, asks the git credential helper for your host,
+  and runs `gh auth token --hostname <your-host>` — so an engineer logged into
+  the appliance authenticates as the right identity.
+- **Don't repoint an instance at a different GitHub.** User identity keys on
+  the numeric GitHub id, and those ids are only unique within one deployment.
+  Switching `GITHUB_HOST` on an instance with existing users can collide two
+  different people onto one account. Start a fresh instance instead.
+
 ### Creating the app manually (no wizard)
 
 If you prefer, create the app yourself at
@@ -256,6 +314,98 @@ this, `upgrade` warns when your CLI is older than the target server release —
 upgrade the CLI first (`brew upgrade hivemind` or
 `uv tool upgrade wandb-hivemind`) so image and layout move together.
 
+## Non-interactive setup (`--config`)
+
+`hivemind serve setup` is interactive by default. To configure an instance from
+Terraform, Ansible, or a golden image, pass the same answers as a JSON file:
+
+```bash
+hivemind serve setup --config config.json
+hivemind serve up
+```
+
+The file states *intent*; the CLI still derives the `.env` from it, so endpoint
+addressing, the rclone provider for the backup sidecar, and URL assembly stay in
+one implementation rather than being reproduced by every config-management tool.
+
+```json
+{
+  "version": 1,
+  "network": { "domain": "hivemind.acme.com", "tls": "caddy" },
+  "access": { "allowed_github_orgs": "acme" },
+  "clickhouse": {
+    "host": "abc.us-central1.gcp.clickhouse.cloud",
+    "secure": true,
+    "password": { "env": "HM_CH_PASSWORD" }
+  },
+  "storage": {
+    "provider": "gcs",
+    "bucket": "acme-hivemind",
+    "access_key_id": "GOOG1E…",
+    "secret_access_key": { "env": "HM_S3_SECRET" },
+    "backup": { "retention_days": 7 }
+  },
+  "llm": { "provider": "vertex", "project": "acme-prod", "location": "global" },
+  "cursor": { "api_key": { "env": "HM_CURSOR_KEY" } },
+  "license": { "env": "HM_LICENSE" },
+  "extra_env": { "WORKER_MAX_IN_FLIGHT": "8" }
+}
+```
+
+| Section | Notes |
+|---|---|
+| `network` | `domain`, `tls`, `http_port`, `https_port`. Omit to get a localhost instance. `tls` is `caddy` (Let's Encrypt), `upstream` (a proxy or load balancer terminates TLS), or `none` — which serves localhost only, and is the required mode when `domain` is `localhost`. |
+| `github` | `host`, `ca_bundle` — for GitHub Enterprise. Omit for github.com. |
+| `access` | `allowed_github_orgs` (comma-separated). Omit to leave login open. |
+| `clickhouse` | `host`, `port`, `secure`, `database`, `username`, `password`. Omit to run the bundled container. |
+| `storage` | `provider` (`local` \| `aws` \| `r2` \| `gcs` \| `custom`), `bucket`, `region`, `account_id` (R2), `endpoint` (custom), `access_key_id`, `secret_access_key`, `backup.retention_days`. Omit to keep data on the instance's disk. |
+| `llm` | `provider` (`wandb` \| `anthropic` \| `openai` \| `vertex` \| `custom`), plus `model`, `small_model`, `api_key`, `base_url`, `project`, `location`, `credentials`. Omit to leave AI features off. |
+| `cursor` | `api_key`, `api_org_ids` — the Cursor Admin API key that enriches Cursor sessions with Cursor's own usage and cost. Omit to leave them unenriched. |
+| `license` | License token. Falls back to `HIVEMIND_LICENSE` in the environment; omit both to run unlicensed. |
+| `extra_env` | Free-form `NAME: value` environment for the app and worker — the escape hatch for a setting with no section of its own. Refused for a name something else already sets (see below). |
+
+**Keeping secrets out of the file.** Any string value may instead be
+`{"env": "VAR_NAME"}` or `{"file": "/path"}`, resolved when setup runs. That
+lets a rendered config live in a working directory while the values come from
+Secret Manager, Vault, or a mounted secret.
+
+Unknown keys are rejected rather than ignored, so a typo fails at setup time
+instead of silently dropping a setting.
+
+**Settings with no section (`extra_env`).** Entries land in `.env` *and* in
+`extra.env` next to it, because they reach the containers by two different
+routes: `.env` is where compose interpolates a name `docker-compose.yml`
+already knows (`WORKER_MAX_IN_FLIGHT`, `EMBEDDINGS_MODEL`, …), while
+`extra.env` is passed to the app and worker wholesale and so carries a name
+compose has never heard of. Values may be secret references like anywhere else.
+
+Setup refuses a name that something else already sets, rather than writing two
+lines and letting the file decide: one a section of your config produces
+(`LLM_API_KEY` when there's an `llm` section), one the stack pins deliberately
+(`USAGE_QUOTA_MODE`, `RETENTION_SWEEP_MODE`, `ENVIRONMENT`, …), or one setup
+owns outright (`JWT_SECRET`, `DOMAIN`). The error names the owner. Values
+containing `$` are refused for the same reason — compose would expand them.
+
+`extra.env` is regenerated on every setup, so hand edits to it are lost;
+put anything permanent in the config. On an instance you configure by hand
+instead, it's yours to edit — `hivemind serve up` only creates it if missing.
+
+**No trial is fetched.** The wizard offers one because it runs as a logged-in
+operator; `--config` runs unattended, on a host that has no such identity. Set
+`license` (or `HIVEMIND_LICENSE`) explicitly, or the instance comes up
+unlicensed — setup says so rather than leaving you to notice the banner later.
+
+**Re-applying is safe.** `--force` re-renders `.env` but *preserves* the
+instance's `JWT_SECRET` and `HIVEMIND_SECRET_KEY`: rotating them would
+invalidate every issued token and make the encrypted `instance_secrets` (your
+GitHub App credentials) unreadable. Pass `--rotate-keys` only when you
+deliberately want new ones.
+
+Terraform modules built on this live in [`terraform/`](../terraform)
+— a complete GCP deployment (VM, GCS over S3-interop, Secret Manager, keyless
+Vertex, and optionally a load balancer with a Google-managed certificate), plus
+a provider-free module that renders this config document for any other target.
+
 ## Configuration reference
 
 `~/.hivemind/serve/<name>/.env` (see `selfhost/.env.example`):
@@ -278,18 +428,25 @@ upgrade the CLI first (`brew upgrade hivemind` or
 | `HIVEMIND_LICENSE` | no | Signed [license](#license) token (verified offline); unset runs unlicensed with a banner |
 | `LICENSE_ENFORCEMENT_MODE` | no | `off` \| `warn` (default) \| `enforce`; `warn` shows banners but never disables anything |
 | `GITHUB_APP_*` | via wizard | GitHub App credentials; the wizard stores them encrypted in ClickHouse (`instance_secrets`). Set here only to override the wizard or bring your own app |
+| `GITHUB_HOST` | no | [GitHub Enterprise](#github-enterprise) host (e.g. `github.acme-corp.com`, or `acme.ghe.com` for Enterprise Cloud with data residency). Unset = github.com |
+| `GITHUB_API_BASE` | no | Override the derived REST root; only needed when the API isn't at `https://<host>/api/v3` (or `https://api.<host>` for `*.ghe.com`) |
+| `GITHUB_CA_BUNDLE` | no | PEM trust bundle for an appliance behind a private CA. Path *inside the container*; the data directory is mounted at `/data` |
 | `SINGLE_USER_GITHUB_LOGIN` | no | Pin the app-less single-player owner by GitHub username |
 | `ALLOWED_GITHUB_ORGS` | no | Comma-separated login allowlist |
 | `WORKER_MAX_IN_FLIGHT` | no | Concurrent jobs per worker container; unset auto-sizes from the host CPU count (see [Scaling the worker](#scaling-the-worker)) |
 | `WORKER_REPLICAS` | no | Number of worker containers (default `1`); they share one Redis Streams consumer group |
 | `ANTHROPIC_API_KEY` | no | Default LLM (Claude) for insights, PR walkthroughs, personas, summaries |
 | `OPENAI_API_KEY` | no | Default provider for embeddings (insight clustering + semantic search) |
-| `LLM_PROVIDER` | no | Point AI features at another provider: `wandb` (W&B Inference), `openai`, `anthropic`, `bedrock`, or any OpenAI-compatible alias (see [LLM provider](#llm-provider)) |
+| `LLM_PROVIDER` | no | Point AI features at another provider: `wandb` (W&B Inference), `openai`, `anthropic`, `bedrock`, `vertex`, or any OpenAI-compatible alias (see [LLM provider](#llm-provider)) |
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | with `LLM_PROVIDER` | Credentials, endpoint, and default model for the chosen provider |
 | `LLM_EXTRA_HEADERS` | no | JSON of extra request headers (W&B Inference uses `{"OpenAI-Project": "entity/project"}`) |
 | `LLM_BEDROCK_REGION` | with `bedrock` | AWS region for Amazon Bedrock |
+| `LLM_VERTEX_PROJECT` / `LLM_VERTEX_LOCATION` | with `vertex` | GCP project and location for Vertex AI (location defaults to `global`) |
+| `LLM_VERTEX_CREDENTIALS` | no | Vertex credential — a service-account key or a `gcloud auth application-default login` file, as a path or inline JSON; unset uses the workload's attached GCP identity |
 | `TITLE_EXTRACTION_MODEL` / `WEEKLY_SUMMARY_MODEL` | no | Smaller per-feature model overrides; each falls back to `LLM_MODEL` |
 | `EMBEDDINGS_BASE_URL` / `EMBEDDINGS_API_KEY` / `EMBEDDINGS_MODEL` | no | Override the embeddings endpoint (must emit 1536-dim vectors); falls back to `OPENAI_API_KEY` |
+| `CURSOR_API_KEY` | no | Cursor Admin API key (Cursor: Dashboard → Settings → Cursor Admin API); enriches Cursor sessions with the usage and cost Cursor reports |
+| `CURSOR_API_ORG_IDS` | no | Comma-separated org ids to attempt Cursor enrichment for. Unset tries every Cursor session — right when the key's Cursor team *is* the instance, since the key can only resolve its own team's members |
 | `STORAGE_PROVIDER` | no | `local` (default), `s3`, or `gcs` — backend for screenshots/exports (see [Object storage](#object-storage)) |
 | `S3_BUCKET_NAME` | with `s3` | Bucket for screenshots and data exports |
 | `S3_ENDPOINT_URL` | no | S3 endpoint for non-AWS stores (R2, GCS-interop, MinIO) |
@@ -308,7 +465,7 @@ upgrade the CLI first (`brew upgrade hivemind` or
 | `TAILSCALE_FUNNEL` | no | `true` exposes the instance on the public internet via Tailscale Funnel |
 
 To run the AI features against your own provider — Ollama, the W&B / CoreWeave
-inference service, a self-hosted vLLM, or Amazon Bedrock — see the dedicated
+inference service, a self-hosted vLLM, Amazon Bedrock, or Google Vertex AI — see the dedicated
 guide: [`docs/llm-providers.md`](llm-providers.md). No external router (LiteLLM)
 is involved; the backend talks to your endpoint through the OpenAI or Anthropic
 SDK directly.
@@ -461,6 +618,7 @@ OpenAI-compatible path:
 | W&B Inference / CoreWeave | `LLM_PROVIDER=wandb`, `LLM_BASE_URL=https://api.inference.wandb.ai/v1`, `LLM_API_KEY`, `LLM_MODEL` |
 | OpenAI | `LLM_PROVIDER=openai`, `LLM_API_KEY`, `LLM_MODEL` |
 | Ollama / vLLM / gateway | `LLM_PROVIDER=openai`, `LLM_BASE_URL`, `LLM_MODEL` (key optional) |
+| Google Vertex AI | `LLM_PROVIDER=vertex`, `LLM_VERTEX_PROJECT`, `LLM_MODEL` (credentials via the attached GCP identity or `LLM_VERTEX_CREDENTIALS`) |
 
 W&B Inference attributes usage to a project via a header — set
 `LLM_EXTRA_HEADERS={"OpenAI-Project": "entity/project"}` (the wizard prompts
@@ -603,12 +761,40 @@ hivemind serve up
 ```
 
 Then point `clickhouse-client` at the instance and restore a chosen backup
-folder (start with `AUTO_MIGRATE=false` — the backup carries the schema):
+folder (start with `AUTO_MIGRATE=false` — the backup carries the schema, and a
+migrated-on-boot database already holds every table the restore wants to
+create):
 
 ```sql
 RESTORE DATABASE <CLICKHOUSE_DB>
-FROM S3('https://<bucket>.s3.<region>.amazonaws.com/clickhouse-backups/<TIMESTAMP>',
-        '<ACCESS_KEY>', '<SECRET_KEY>');
+FROM S3('<ENDPOINT>/clickhouse-backups/<TIMESTAMP>', '<ACCESS_KEY>', '<SECRET_KEY>');
+```
+
+`<ENDPOINT>` is whatever `CLICKHOUSE_BACKUP_S3_ENDPOINT` in your `.env` is set
+to, minus the trailing `clickhouse-backups/` — the addressing differs by
+provider and is **not** always the AWS form:
+
+| Provider | Endpoint |
+|---|---|
+| AWS S3 | `https://<bucket>.s3.<region>.amazonaws.com` |
+| GCS (S3 interop) | `https://storage.googleapis.com/<bucket>` |
+| R2 | `https://<account_id>.r2.cloudflarestorage.com/<bucket>` |
+
+`<TIMESTAMP>` is one of the folders under `clickhouse-backups/`; list them with
+`rclone lsd` or your provider's console. Each is a full backup, so pick any one.
+
+**To check a backup without touching a live instance**, restore it under a
+different name and inspect it — this is also the fastest way to confirm the
+nightly job is producing something real:
+
+```sql
+RESTORE DATABASE <CLICKHOUSE_DB> AS restore_check
+FROM S3('<ENDPOINT>/clickhouse-backups/<TIMESTAMP>', '<ACCESS_KEY>', '<SECRET_KEY>');
+
+SELECT name, total_rows FROM system.tables
+WHERE database = 'restore_check' AND total_rows > 0 ORDER BY total_rows DESC;
+
+DROP DATABASE restore_check;
 ```
 
 Once the data is back, the app re-applies the GitHub App credentials from

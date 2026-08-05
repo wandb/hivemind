@@ -471,17 +471,10 @@ def _verification_signature(turn: MappedTurn) -> str:
 
 
 def _sanitize_turn(turn: MappedTurn) -> MappedTurn:
-    # Presidio's statistical recognizers are intentionally conservative, but
-    # their choices across a multi-megabyte transcript are not a stable content
-    # identity. Hash the complete credential-scrubbed mapped source before ML
-    # redaction. Re-sanitizing an already sanitized turn preserves that identity.
-    existing_source_hash = turn.attributes.get("hivemind.source_payload_sha256")
-    source_payload_sha256 = (
-        existing_source_hash
-        if isinstance(existing_source_hash, str)
-        and re.fullmatch(r"[0-9a-f]{64}", existing_source_hash)
-        else sha256_json(turn.payload_for_hash())
-    )
+    # Build the complete destination-safe semantic payload before deriving any
+    # durable content identity. Hashing raw names or locations would retain a
+    # low-entropy equality oracle even though the transcript itself was later
+    # redacted.
     attributes = redact_upload_data(turn.attributes)
     hash_context = redact_upload_data(turn.hash_context)
     assert isinstance(attributes, dict)
@@ -489,7 +482,6 @@ def _sanitize_turn(turn: MappedTurn) -> MappedTurn:
     for key in _CORRELATION_ATTRIBUTES:
         if key in turn.attributes:
             attributes[key] = turn.attributes[key]
-    attributes["hivemind.source_payload_sha256"] = source_payload_sha256
     for key in _HASH_CORRELATORS:
         if key in turn.hash_context:
             hash_context[key] = turn.hash_context[key]
@@ -553,16 +545,18 @@ def _sanitize_turn(turn: MappedTurn) -> MappedTurn:
         verification_signature="",
     )
     sanitized.verification_signature = _verification_signature(sanitized)
-    # `payload_sha256` is the stable source identity and remote correlator. The
-    # upload representation remains fully Presidio-redacted, but never feeds
-    # back into idempotency because ML output may vary across processes.
+    source_payload_sha256 = sha256_json(sanitized.payload_for_hash())
+    # The source hash covers the complete credential- and PII-redacted semantic
+    # turn. The transport's independent wire hash additionally certifies exact
+    # serialization and externalized-reference planning.
     sanitized.payload_sha256 = source_payload_sha256
+    sanitized.attributes["hivemind.source_payload_sha256"] = source_payload_sha256
     sanitized.attributes["hivemind.payload_sha256"] = source_payload_sha256
     return sanitized
 
 
 def sanitize_mapped_conversation(conversation: MappedConversation) -> MappedConversation:
-    """Return a PII-scrubbed upload with deterministic pre-ML source identity."""
+    """Return a PII-scrubbed upload with no pre-redaction content identity."""
     return replace(
         conversation,
         conversation_name=str(redact_upload_data(conversation.conversation_name)),

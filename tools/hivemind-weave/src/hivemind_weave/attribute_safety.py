@@ -40,8 +40,7 @@ def validate_inline_field(value: Any, *, field: str) -> None:
     """Reject a content-bearing field that would need an opaque side channel."""
     if json_wire_bytes(value) > MAX_INLINE_FIELD_JSON_BYTES:
         raise AttributeSafetyError(
-            f"{field} exceeds the secure inline transport limit; "
-            "the turn was not sent to Weave"
+            f"{field} exceeds the secure inline transport limit; the turn was not sent to Weave"
         )
 
 
@@ -74,6 +73,5 @@ def validate_turn_payload(
     repeated_bytes = json_wire_bytes(repeated_attributes) * max(span_count - 1, 0)
     if json_wire_bytes(payload) + repeated_bytes > MAX_TURN_CONTENT_JSON_BYTES:
         raise AttributeSafetyError(
-            "turn exceeds the secure aggregate transport limit; "
-            "the turn was not sent to Weave"
+            "turn exceeds the secure aggregate transport limit; the turn was not sent to Weave"
         )

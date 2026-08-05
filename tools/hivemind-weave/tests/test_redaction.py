@@ -40,6 +40,35 @@ def test_private_key_and_environment_assignment_redaction() -> None:
     assert result.count(REDACTED) == 2
 
 
+def test_truncated_private_key_is_redacted_to_end_of_field() -> None:
+    text = "prefix\n-----BEGIN OPENSSH PRIVATE KEY-----\nsecret-material-without-end"
+
+    result = redact_string(text)
+
+    assert "secret-material" not in result
+    assert result == f"prefix\n{REDACTED}"
+
+
+def test_database_credentials_and_passphrases_are_redacted() -> None:
+    payload = {
+        "database_url": "postgres://alice:supersecret@db.internal/app",
+        "connectionString": "mongodb://bob:hunter2@db.internal/app",
+        "passphrase": "correct horse battery staple",
+        "ordinary_url": "https://example.com/public/path",
+    }
+
+    redacted = redact_data(payload)
+
+    assert redacted["database_url"] == REDACTED
+    assert redacted["connectionString"] == REDACTED
+    assert redacted["passphrase"] == REDACTED
+    assert redacted["ordinary_url"] == payload["ordinary_url"]
+    embedded = redact_string("connect postgres://alice:supersecret@db.internal/app")
+    assert "alice" not in embedded
+    assert "supersecret" not in embedded
+    assert embedded == f"connect postgres://{REDACTED}@db.internal/app"
+
+
 def test_quoted_environment_and_json_secret_assignments_are_redacted() -> None:
     text = 'OPENAI_API_KEY="secret-value"\n{"access_token": "another-secret"}'
     result = redact_string(text)

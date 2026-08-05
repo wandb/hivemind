@@ -114,9 +114,7 @@ def test_one_session_live_import_is_idempotent(tmp_path: Path) -> None:
             "live test requires HIVEMIND_WEAVE_LIVE_SESSION_ID and HIVEMIND_WEAVE_LIVE_PROJECT"
         )
     if os.environ.get("HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT") != project:
-        pytest.fail(
-            "HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT must exactly match the disposable project"
-        )
+        pytest.fail("HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT must exactly match the disposable project")
     api_key = os.environ.get("WANDB_API_KEY")
     if not api_key:
         pytest.fail("live test requires WANDB_API_KEY")

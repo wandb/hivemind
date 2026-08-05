@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import os
 import weakref
 from collections.abc import Callable
@@ -14,6 +15,7 @@ import pytest
 from hivemind_weave import importer as importer_module
 from hivemind_weave.atif import map_atif
 from hivemind_weave.errors import StateConflictError
+from hivemind_weave.historical_sink import PreparedOutcome
 from hivemind_weave.importer import ImportConfig, run_import
 from hivemind_weave.models import Session
 from hivemind_weave.pii import sanitize_mapped_conversation
@@ -80,6 +82,7 @@ class FakeSink:
             trace_ids=[f"trace-{index}"],
             root_span_ids=[f"root-{index}"],
             span_count=1 + len(turn.llms) + len(turn.tools) + len(turn.subagents),
+            commit_id=f"commit-{index}",
         )
 
     def finish(self) -> None:
@@ -96,6 +99,49 @@ class FakeSink:
             from hivemind_weave.errors import WeaveImportError
 
             raise WeaveImportError("per-session flush failed")
+
+
+class FakeAtomicSink(FakeSink):
+    supports_atomic_replay = True
+
+    def __init__(
+        self,
+        *,
+        fail_preflight: bool = False,
+        reconcile_outcome: LogOutcome | None = None,
+    ) -> None:
+        super().__init__()
+        self.fail_preflight = fail_preflight
+        self.reconcile_outcome = reconcile_outcome
+        self.prepared: list[tuple[Any, Any]] = []
+        self.atomic_reconciliations = 0
+
+    @staticmethod
+    def outcome_for(conversation: Any, turn: Any) -> PreparedOutcome:
+        identity = f"{conversation.conversation_id}\0{turn.key}\0{turn.payload_sha256}"
+        return PreparedOutcome(
+            logical_key=hashlib.sha256(f"logical\0{identity}".encode()).hexdigest(),
+            wire_sha256=hashlib.sha256(f"wire\0{identity}".encode()).hexdigest(),
+            span_count=1 + len(turn.llms) + len(turn.tools) + len(turn.subagents),
+            compressed_bytes=123,
+            uncompressed_bytes=456,
+            reference_count=0,
+            capability_version="historical-turn-test-v1",
+            sdk_prepared=object(),
+        )
+
+    def prepare_turn(self, conversation: Any, turn: Any) -> PreparedOutcome:
+        self.prepared.append((conversation, turn))
+        if self.fail_preflight:
+            from hivemind_weave.errors import WeaveImportError
+
+            raise WeaveImportError("deterministic atomic preflight rejection")
+        return self.outcome_for(conversation, turn)
+
+    def reconcile_prepared(self, prepared: PreparedOutcome) -> LogOutcome | None:
+        del prepared
+        self.atomic_reconciliations += 1
+        return self.reconcile_outcome
 
 
 class FakeVerifier:
@@ -599,6 +645,210 @@ def test_pending_turn_is_reemitted_only_after_remote_absence_is_confirmed(
     assert len(sink.logged) == 1
 
 
+def test_pending_atomic_turn_checks_exact_status_before_safe_replay(
+    tmp_path: Path,
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    monkeypatch.setenv("WANDB_API_KEY", "test-key")
+    raw_session = session_payload()
+    session = Session.from_api(raw_session)
+    wrapper = atif_wrapper()
+    conversation = sanitize_mapped_conversation(map_atif(session, wrapper))
+    turn = conversation.turns[0]
+    config = _config(tmp_path)
+    sink = FakeAtomicSink()
+    prepared = sink.outcome_for(conversation, turn)
+    with StateStore(config.state_path) as state:
+        run = _seed_certified_run(state, config, session, conversation)
+        state.begin_pending(
+            run_id=run.run_id,
+            project=config.project,
+            session_id=session.id,
+            turn_key=turn.key,
+            payload_sha256=turn.payload_sha256,
+            verification_signature=turn.verification_signature,
+            source_last_activity_at=session.last_activity_at,
+            atif_schema_version=conversation.schema_version,
+        )
+        attempt = state.plan_atomic_turn(
+            project=config.project,
+            session_id=session.id,
+            turn_key=turn.key,
+            source_payload_sha256=turn.payload_sha256,
+        )
+        attempt = state.record_atomic_turn_prepared(
+            attempt,
+            wire_sha256=prepared.wire_sha256,
+            logical_key=prepared.logical_key,
+            capability_version=prepared.capability_version,
+            reference_count=prepared.reference_count,
+            span_count=prepared.span_count,
+        )
+        attempt = state.begin_atomic_turn_submit(attempt)
+        state.mark_atomic_turn_uncertain(attempt)
+    verifier = FakeVerifier()
+
+    report = run_import(
+        config,
+        hivemind=FakeHiveMind([raw_session], {session.id: wrapper}),
+        sink=sink,
+        verifier=verifier,
+    )
+
+    assert report.ok
+    assert report.imported == 1
+    assert len(sink.logged) == 1
+    assert sink.atomic_reconciliations == 1
+    assert verifier.reconciled == []
+    with StateStore(config.state_path) as state:
+        attempt = state.get_atomic_turn(config.project, session.id, turn.key)
+    assert attempt is not None and attempt.status == "committed"
+
+
+def test_pending_atomic_turn_uses_exact_remote_commit_without_second_put(
+    tmp_path: Path,
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    monkeypatch.setenv("WANDB_API_KEY", "test-key")
+    raw_session = session_payload()
+    session = Session.from_api(raw_session)
+    wrapper = atif_wrapper()
+    conversation = sanitize_mapped_conversation(map_atif(session, wrapper))
+    turn = conversation.turns[0]
+    config = _config(tmp_path)
+    prepared = FakeAtomicSink.outcome_for(conversation, turn)
+    remote = LogOutcome(
+        trace_ids=["trace-existing"],
+        root_span_ids=["root-existing"],
+        span_count=prepared.span_count,
+        logical_key=prepared.logical_key,
+        wire_sha256=prepared.wire_sha256,
+        commit_id="commit-existing",
+        capability_version=prepared.capability_version,
+    )
+    sink = FakeAtomicSink(reconcile_outcome=remote)
+    with StateStore(config.state_path) as state:
+        run = _seed_certified_run(state, config, session, conversation)
+        state.begin_pending(
+            run_id=run.run_id,
+            project=config.project,
+            session_id=session.id,
+            turn_key=turn.key,
+            payload_sha256=turn.payload_sha256,
+            verification_signature=turn.verification_signature,
+            source_last_activity_at=session.last_activity_at,
+            atif_schema_version=conversation.schema_version,
+        )
+        attempt = state.plan_atomic_turn(
+            project=config.project,
+            session_id=session.id,
+            turn_key=turn.key,
+            source_payload_sha256=turn.payload_sha256,
+        )
+        attempt = state.record_atomic_turn_prepared(
+            attempt,
+            wire_sha256=prepared.wire_sha256,
+            logical_key=prepared.logical_key,
+            capability_version=prepared.capability_version,
+            reference_count=prepared.reference_count,
+            span_count=prepared.span_count,
+        )
+        attempt = state.begin_atomic_turn_submit(attempt)
+        state.mark_atomic_turn_uncertain(attempt)
+
+    report = run_import(
+        config,
+        hivemind=FakeHiveMind([raw_session], {session.id: wrapper}),
+        sink=sink,
+        verifier=FakeVerifier(),
+    )
+
+    assert report.ok
+    assert report.imported == 1
+    assert report.emitted_spans == 0
+    assert sink.logged == []
+    assert sink.atomic_reconciliations == 1
+    with StateStore(config.state_path) as state:
+        attempt = state.get_atomic_turn(config.project, session.id, turn.key)
+    assert attempt is not None and attempt.status == "committed"
+    assert attempt.commit_id == "commit-existing"
+
+
+def test_pre_v6_pending_turn_is_not_replayed_into_atomic_endpoint(
+    tmp_path: Path,
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    monkeypatch.setenv("WANDB_API_KEY", "test-key")
+    raw_session = session_payload()
+    session = Session.from_api(raw_session)
+    wrapper = atif_wrapper()
+    conversation = sanitize_mapped_conversation(map_atif(session, wrapper))
+    turn = conversation.turns[0]
+    config = _config(tmp_path)
+    with StateStore(config.state_path) as state:
+        run = _seed_certified_run(state, config, session, conversation)
+        state.begin_pending(
+            run_id=run.run_id,
+            project=config.project,
+            session_id=session.id,
+            turn_key=turn.key,
+            payload_sha256=turn.payload_sha256,
+            verification_signature=turn.verification_signature,
+            source_last_activity_at=session.last_activity_at,
+            atif_schema_version=conversation.schema_version,
+        )
+    sink = FakeAtomicSink()
+
+    report = run_import(
+        config,
+        hivemind=FakeHiveMind([raw_session], {session.id: wrapper}),
+        sink=sink,
+        verifier=FakeVerifier(),
+    )
+
+    assert not report.ok
+    assert report.conflicted == 1
+    assert sink.logged == []
+    with StateStore(config.state_path) as state:
+        row = state.get(config.project, session.id, turn.key)
+    assert row is not None and row.status == "conflict"
+
+
+def test_atomic_session_preflight_fails_before_any_turn_is_uploaded(
+    tmp_path: Path,
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    monkeypatch.setenv("WANDB_API_KEY", "test-key")
+    raw_session = session_payload()
+    sink = FakeAtomicSink(fail_preflight=True)
+
+    report = run_import(
+        _config(tmp_path),
+        hivemind=FakeHiveMind(
+            [raw_session],
+            {str(raw_session["id"]): atif_wrapper()},
+        ),
+        sink=sink,
+        verifier=FakeVerifier(),
+    )
+
+    assert not report.ok
+    assert report.failed == 1
+    assert len(sink.prepared) == 1
+    assert sink.logged == []
+    with StateStore(_config(tmp_path).state_path) as state:
+        entry = state.connection.execute("SELECT status FROM import_run_sessions").fetchone()
+        assert entry is not None and entry["status"] == "failed"
+
+
 def test_changed_unemitted_conflict_is_repaired_only_after_both_hashes_are_absent(
     tmp_path: Path,
     monkeypatch: Any,
@@ -808,7 +1058,8 @@ def test_unknown_schema_is_reported_without_upload(
     )
     assert not report.ok
     assert report.failed == 1
-    assert "unsupported ATIF major" in report.errors[0]
+    assert "ATIFSchemaError" in report.errors[0]
+    assert session["id"] not in report.render()
 
 
 def test_cutoff_boundaries_and_unknown_activity(

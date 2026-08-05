@@ -202,6 +202,5 @@ class RunReport:
             f"  emitted spans:        {self.emitted_spans}",
         ]
         if self.errors:
-            lines.append("Errors:")
-            lines.extend(f"  - {error}" for error in self.errors)
+            lines.append(f"  withheld error details: {len(self.errors)}")
         return "\n".join(lines)

@@ -116,14 +116,14 @@ def verification_signature(
     )
 
 
-def _turn_key_component(step_id: str) -> str:
-    stripped = step_id.strip()
+def _turn_key_component(step: _Step) -> str:
+    stripped = step.step_id.strip()
     if re.fullmatch(r"\d{1,20}", stripped) and redact_string(stripped) == stripped:
         return stripped
-    # ATIF step IDs are source-controlled and may contain paths or names. Keep
-    # the journal/search key deterministic without exempting that raw value
-    # from PII redaction as a correlation attribute.
-    return f"sha256:{sha256_json({'step_id': step_id})}"
+    # ATIF step IDs are source-controlled and may contain paths, credentials,
+    # or low-entropy PII. Hashing those values would create a durable guessing
+    # oracle, so non-technical IDs use their stable transcript position instead.
+    return f"index:{step.index}"
 
 
 def _validate_schema_version(value: Any) -> str:
@@ -779,7 +779,7 @@ def _map_group(
         (step for step in group.steps if step.source != "system"), group.steps[0]
     )
     key_prefix = "synthetic" if group.synthetic else "step"
-    turn_key = f"atif:{key_prefix}:{_turn_key_component(first_non_system.step_id)}"
+    turn_key = f"atif:{key_prefix}:{_turn_key_component(first_non_system)}"
     turn_started_at = min(step.timestamp for step in group.steps)
     end_candidates = [step.timestamp for step in group.steps]
     end_candidates.extend(

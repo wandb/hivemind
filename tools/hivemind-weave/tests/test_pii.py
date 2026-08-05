@@ -8,7 +8,7 @@ from typing import Any
 import hivemind_weave.pii as pii_module
 from hivemind_weave.atif import map_atif
 from hivemind_weave.attribute_safety import MAX_ATTRIBUTE_VALUE_CHARS
-from hivemind_weave.models import Session
+from hivemind_weave.models import ChatMessage, Session
 from hivemind_weave.pii import (
     configure_weave_pii,
     redact_agent_name,
@@ -274,11 +274,13 @@ def test_sanitization_keeps_large_attributes_inline_for_fail_closed_preflight(
     assert attributes["hivemind.preserved_step_data"] == source
 
 
-def test_source_payload_hash_is_stable_across_different_ml_redactions(
+def test_source_payload_hash_tracks_the_complete_pii_redacted_semantics(
     monkeypatch: Any,
     session_payload: Callable[..., dict[str, Any]],
     atif_wrapper: Callable[..., dict[str, Any]],
 ) -> None:
+    configure_weave_pii()
+
     def redactor(marker: str) -> Callable[[Any], Any]:
         def walk(value: Any) -> Any:
             if isinstance(value, str):
@@ -303,7 +305,6 @@ def test_source_payload_hash_is_stable_across_different_ml_redactions(
 
     monkeypatch.setattr(pii_module, "redact_upload_data", redactor("<PERSON>"))
     first_mapped = mapped()
-    stable_source_hash = first_mapped.turns[0].payload_sha256
     first = sanitize_mapped_conversation(first_mapped).turns[0]
     monkeypatch.setattr(
         pii_module,
@@ -312,10 +313,77 @@ def test_source_payload_hash_is_stable_across_different_ml_redactions(
     )
     second = sanitize_mapped_conversation(mapped()).turns[0]
 
-    assert first.payload_sha256 == second.payload_sha256 == stable_source_hash
+    assert first.payload_sha256 != second.payload_sha256
     assert first.attributes["hivemind.source_payload_sha256"] == first.payload_sha256
     assert second.attributes["hivemind.source_payload_sha256"] == second.payload_sha256
     assert (
         first.attributes["hivemind.preserved_step_data"]
         != second.attributes["hivemind.preserved_step_data"]
     )
+
+
+def test_source_payload_hash_never_depends_on_raw_credentials(
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    configure_weave_pii()
+
+    def sanitize_with(secret: str, ordinary_text: str) -> Any:
+        conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
+        conversation.turns[0].messages[0] = ChatMessage(
+            role="user",
+            content=(f'{ordinary_text}\nAuthorization: Bearer {secret}\nOPENAI_API_KEY="{secret}"'),
+        )
+        conversation.turns[0].finalize_hash()
+        return sanitize_mapped_conversation(conversation).turns[0]
+
+    # Use the deterministic scrubber as the complete redaction pass. Raw
+    # secrets must collapse to the same safe semantic representation while
+    # ordinary source changes remain meaningful.
+    monkeypatch.setattr(pii_module, "redact_upload_data", pii_module.redact_data)
+    first_secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    second_secret = "sk-zyxwvutsrqponmlkjihgfedcba654321"
+    first = sanitize_with(first_secret, "ordinary source")
+    changed_secret = sanitize_with(second_secret, "ordinary source")
+    changed_content = sanitize_with(first_secret, "different source")
+
+    assert first.payload_sha256 == changed_secret.payload_sha256
+    assert first.payload_sha256 != changed_content.payload_sha256
+    assert first_secret not in str(first.payload_for_hash())
+    assert second_secret not in str(changed_secret.payload_for_hash())
+
+
+def test_source_payload_hash_never_becomes_a_raw_pii_equality_oracle(
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    configure_weave_pii()
+
+    def redact_people(value: Any) -> Any:
+        if isinstance(value, str):
+            return value.replace("Alice Johnson", "[PERSON]").replace("Bob Williams", "[PERSON]")
+        if isinstance(value, dict):
+            return {key: redact_people(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redact_people(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(redact_people(item) for item in value)
+        return value
+
+    def sanitize_with(name: str) -> Any:
+        conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
+        conversation.turns[0].messages[0] = ChatMessage(
+            role="user",
+            content=f"Please help {name} with the same task",
+        )
+        return sanitize_mapped_conversation(conversation).turns[0]
+
+    monkeypatch.setattr(pii_module, "redact_upload_data", redact_people)
+    first = sanitize_with("Alice Johnson")
+    second = sanitize_with("Bob Williams")
+
+    assert first.payload_sha256 == second.payload_sha256
+    assert "Alice Johnson" not in str(first.payload_for_hash())
+    assert "Bob Williams" not in str(second.payload_for_hash())

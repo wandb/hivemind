@@ -27,9 +27,10 @@ except ImportError:  # pragma: no cover - the importer targets macOS/Linux.
 
 
 DB_APPLICATION_ID = 0x484D5756
-DB_SCHEMA_VERSION = 2
+DB_SCHEMA_VERSION = 6
 RUN_SCHEMA_VERSION = "2"
 _HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_ATOMIC_EVIDENCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _RUN_SUCCESS_STATUSES = frozenset({"empty", "imported", "skipped"})
 _SESSION_PROCESSABLE_STATUSES = frozenset({"certified", "failed", "conflict"})
 
@@ -93,6 +94,180 @@ class ImportRunTurn:
     ordinal: int
     turn_key: str
     source_payload_sha256: str
+
+
+@dataclass(frozen=True)
+class BackfillPlan:
+    plan_id: str
+    project: str
+    source_principal_sha256: str
+    since_utc: datetime
+    until_utc: datetime
+    timezone_name: str
+    selector: str
+    universe_sha256: str
+    status: str
+    discovered_count: int
+    eligible_count: int
+    deferred_count: int
+    invalid_count: int
+    selected_count: int
+    attempts: int
+    last_error_code: str
+
+
+@dataclass(frozen=True)
+class BackfillPlanSession:
+    plan_id: str
+    ordinal: int
+    session_id: str
+    started_at: datetime
+    last_activity_at: datetime
+    status: str
+
+
+@dataclass(frozen=True)
+class BackfillPlanTurn:
+    plan_id: str
+    session_id: str
+    ordinal: int
+    turn_key: str
+    source_payload_sha256: str
+    wire_sha256: str
+    logical_key: str
+    span_count: int
+    compressed_bytes: int
+    uncompressed_bytes: int
+    reference_count: int
+    capability_version: str
+    atif_schema_version: str
+
+
+@dataclass(frozen=True)
+class BackfillPlanStats:
+    plan_id: str
+    turn_count: int
+    total_compressed_bytes: int
+    max_compressed_bytes: int
+    total_uncompressed_bytes: int
+    max_uncompressed_bytes: int
+    total_reference_count: int
+    max_reference_count: int
+    max_span_count: int
+    compressed_le_64k: int
+    compressed_le_256k: int
+    compressed_le_1m: int
+    compressed_gt_1m: int
+    uncompressed_le_256k: int
+    uncompressed_le_1m: int
+    uncompressed_le_5m: int
+    uncompressed_gt_5m: int
+
+
+@dataclass(frozen=True)
+class BackfillCohort:
+    cohort_id: str
+    plan_id: str
+    ordinal: int
+    status: str
+    session_count: int
+    attempts: int
+    imported_turns: int
+    skipped_turns: int
+    conflicted_turns: int
+    failed_items: int
+    emitted_spans: int
+    last_error_code: str
+
+
+@dataclass(frozen=True)
+class SyncFeed:
+    project: str
+    config_sha256: str
+    since_utc: datetime
+    successful_scan_watermark: datetime | None
+    last_scan_started_at: datetime | None
+    last_scan_succeeded_at: datetime | None
+    candidate_universe_sha256: str
+
+
+@dataclass(frozen=True)
+class SyncDiscoveryRecord:
+    session_id: str
+    started_at: datetime
+    last_activity_at: datetime
+    activity_known: bool
+    eligible_after: datetime
+    status: str
+
+
+@dataclass(frozen=True)
+class SyncLedgerSession:
+    project: str
+    session_id: str
+    started_at: datetime
+    last_activity_at: datetime
+    activity_known: bool
+    eligible_after: datetime
+    status: str
+    plan_id: str
+    completed_activity_at: datetime | None
+    attempts: int
+
+
+@dataclass(frozen=True)
+class SyncReconcileResult:
+    resolved_attempts: int
+    unresolved_attempts: int
+    evidence_available: bool
+
+
+@dataclass(frozen=True)
+class AtomicTurnAttempt:
+    project: str
+    session_id: str
+    turn_key: str
+    source_payload_sha256: str
+    status: str
+    wire_sha256: str
+    logical_key: str
+    capability_version: str
+    reference_count: int
+    span_count: int
+    commit_id: str
+    trace_ids: tuple[str, ...]
+    root_span_ids: tuple[str, ...]
+    error_code: str
+    revision: int
+
+
+def _certified_backfill_stats(
+    plan_id: str,
+    turns: list[BackfillPlanTurn],
+) -> BackfillPlanStats:
+    compressed = [turn.compressed_bytes for turn in turns]
+    uncompressed = [turn.uncompressed_bytes for turn in turns]
+    references = [turn.reference_count for turn in turns]
+    spans = [turn.span_count for turn in turns]
+    return BackfillPlanStats(
+        plan_id=plan_id,
+        turn_count=len(turns),
+        total_compressed_bytes=sum(compressed),
+        max_compressed_bytes=max(compressed, default=0),
+        total_uncompressed_bytes=sum(uncompressed),
+        max_uncompressed_bytes=max(uncompressed, default=0),
+        total_reference_count=sum(references),
+        max_reference_count=max(references, default=0),
+        max_span_count=max(spans, default=0),
+        compressed_le_64k=sum(value <= 64 * 1024 for value in compressed),
+        compressed_le_256k=sum(64 * 1024 < value <= 256 * 1024 for value in compressed),
+        compressed_le_1m=sum(256 * 1024 < value <= 1024 * 1024 for value in compressed),
+        compressed_gt_1m=sum(value > 1024 * 1024 for value in compressed),
+        uncompressed_le_256k=sum(value <= 256 * 1024 for value in uncompressed),
+        uncompressed_le_1m=sum(256 * 1024 < value <= 1024 * 1024 for value in uncompressed),
+        uncompressed_le_5m=sum(1024 * 1024 < value <= 5 * 1024 * 1024 for value in uncompressed),
+        uncompressed_gt_5m=sum(value > 5 * 1024 * 1024 for value in uncompressed),
+    )
 
 
 _IMPORTED_TURNS_SQL = """
@@ -189,6 +364,638 @@ CREATE TABLE import_run_turns (
     FOREIGN KEY (run_id, session_id)
         REFERENCES import_run_sessions(run_id, session_id)
 )
+"""
+
+_BACKFILL_PLANS_SQL = """
+CREATE TABLE backfill_plans (
+    plan_id TEXT PRIMARY KEY CHECK(length(plan_id) = 64),
+    project TEXT NOT NULL,
+    source_principal_sha256 TEXT NOT NULL CHECK(length(source_principal_sha256) = 64),
+    since_utc TEXT NOT NULL,
+    until_utc TEXT NOT NULL,
+    timezone_name TEXT NOT NULL,
+    selector TEXT NOT NULL CHECK(selector IN ('backlog', 'canary')),
+    universe_sha256 TEXT NOT NULL CHECK(length(universe_sha256) = 64),
+    status TEXT NOT NULL CHECK(status IN ('planned', 'applying', 'completed', 'blocked')),
+    discovered_count INTEGER NOT NULL CHECK(discovered_count >= 0),
+    eligible_count INTEGER NOT NULL CHECK(eligible_count >= 0),
+    deferred_count INTEGER NOT NULL CHECK(deferred_count >= 0),
+    invalid_count INTEGER NOT NULL CHECK(invalid_count >= 0),
+    selected_count INTEGER NOT NULL CHECK(selected_count >= 0),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    last_error_code TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    CHECK(
+        (status = 'completed' AND completed_at IS NOT NULL)
+        OR (status != 'completed' AND completed_at IS NULL)
+    )
+)
+"""
+
+_BACKFILL_PLAN_SESSIONS_SQL = """
+CREATE TABLE backfill_plan_sessions (
+    plan_id TEXT NOT NULL REFERENCES backfill_plans(plan_id),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    session_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    last_activity_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'completed')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (plan_id, session_id),
+    UNIQUE (plan_id, ordinal)
+)
+"""
+
+_BACKFILL_PLAN_FILTERS_SQL = """
+CREATE TABLE backfill_plan_filters (
+    plan_id TEXT NOT NULL REFERENCES backfill_plans(plan_id),
+    filter_kind TEXT NOT NULL CHECK(
+        filter_kind IN ('agent', 'repository', 'session', 'exclude_subagents')
+    ),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    filter_value TEXT NOT NULL,
+    PRIMARY KEY (plan_id, filter_kind, ordinal),
+    UNIQUE (plan_id, filter_kind, filter_value)
+)
+"""
+
+_BACKFILL_PLAN_TURNS_SQL = """
+CREATE TABLE backfill_plan_turns (
+    plan_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    turn_key TEXT NOT NULL,
+    source_payload_sha256 TEXT NOT NULL CHECK(length(source_payload_sha256) = 64),
+    wire_sha256 TEXT NOT NULL CHECK(length(wire_sha256) = 64),
+    logical_key TEXT NOT NULL CHECK(length(logical_key) = 64),
+    span_count INTEGER NOT NULL CHECK(span_count > 0),
+    compressed_bytes INTEGER NOT NULL CHECK(compressed_bytes > 0),
+    uncompressed_bytes INTEGER NOT NULL CHECK(uncompressed_bytes > 0),
+    reference_count INTEGER NOT NULL CHECK(reference_count >= 0),
+    capability_version TEXT NOT NULL,
+    atif_schema_version TEXT NOT NULL,
+    PRIMARY KEY (plan_id, session_id, turn_key),
+    UNIQUE (plan_id, session_id, ordinal),
+    FOREIGN KEY (plan_id, session_id)
+        REFERENCES backfill_plan_sessions(plan_id, session_id)
+)
+"""
+
+_BACKFILL_PLAN_STATS_SQL = """
+CREATE TABLE backfill_plan_stats (
+    plan_id TEXT PRIMARY KEY REFERENCES backfill_plans(plan_id),
+    turn_count INTEGER NOT NULL CHECK(turn_count >= 0),
+    total_compressed_bytes INTEGER NOT NULL CHECK(total_compressed_bytes >= 0),
+    max_compressed_bytes INTEGER NOT NULL CHECK(max_compressed_bytes >= 0),
+    total_uncompressed_bytes INTEGER NOT NULL CHECK(total_uncompressed_bytes >= 0),
+    max_uncompressed_bytes INTEGER NOT NULL CHECK(max_uncompressed_bytes >= 0),
+    total_reference_count INTEGER NOT NULL CHECK(total_reference_count >= 0),
+    max_reference_count INTEGER NOT NULL CHECK(max_reference_count >= 0),
+    max_span_count INTEGER NOT NULL CHECK(max_span_count >= 0),
+    compressed_le_64k INTEGER NOT NULL CHECK(compressed_le_64k >= 0),
+    compressed_le_256k INTEGER NOT NULL CHECK(compressed_le_256k >= 0),
+    compressed_le_1m INTEGER NOT NULL CHECK(compressed_le_1m >= 0),
+    compressed_gt_1m INTEGER NOT NULL CHECK(compressed_gt_1m >= 0),
+    uncompressed_le_256k INTEGER NOT NULL CHECK(uncompressed_le_256k >= 0),
+    uncompressed_le_1m INTEGER NOT NULL CHECK(uncompressed_le_1m >= 0),
+    uncompressed_le_5m INTEGER NOT NULL CHECK(uncompressed_le_5m >= 0),
+    uncompressed_gt_5m INTEGER NOT NULL CHECK(uncompressed_gt_5m >= 0),
+    CHECK(
+        compressed_le_64k + compressed_le_256k + compressed_le_1m + compressed_gt_1m
+        = turn_count
+    ),
+    CHECK(
+        uncompressed_le_256k + uncompressed_le_1m
+        + uncompressed_le_5m + uncompressed_gt_5m = turn_count
+    )
+)
+"""
+
+_SYNC_FEEDS_SQL = """
+CREATE TABLE sync_feeds (
+    project TEXT PRIMARY KEY,
+    config_sha256 TEXT NOT NULL CHECK(length(config_sha256) = 64),
+    since_utc TEXT NOT NULL,
+    successful_scan_watermark TEXT NOT NULL DEFAULT '',
+    last_scan_started_at TEXT NOT NULL DEFAULT '',
+    last_scan_succeeded_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+, candidate_universe_sha256 TEXT NOT NULL DEFAULT ''
+    CHECK(length(candidate_universe_sha256) IN (0, 64)))
+"""
+
+_SYNC_SESSIONS_SQL = """
+CREATE TABLE sync_sessions (
+    project TEXT NOT NULL REFERENCES sync_feeds(project),
+    session_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    last_activity_at TEXT NOT NULL,
+    activity_known INTEGER NOT NULL CHECK(activity_known IN (0, 1)),
+    eligible_after TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(
+        status IN ('deferred', 'queued', 'processing', 'completed', 'blocked')
+    ),
+    plan_id TEXT NOT NULL DEFAULT '' CHECK(length(plan_id) IN (0, 64)),
+    completed_activity_at TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    observed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+    PRIMARY KEY (project, session_id)
+)
+"""
+
+_SYNC_ATTEMPTS_SQL = """
+CREATE TABLE sync_attempts (
+    project TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL REFERENCES backfill_plans(plan_id) CHECK(length(plan_id) = 64),
+    source_last_activity_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('processing', 'blocked', 'completed')),
+    error_code TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY (project, session_id, plan_id),
+    FOREIGN KEY (project, session_id) REFERENCES sync_sessions(project, session_id),
+    CHECK(
+        (status = 'completed' AND completed_at IS NOT NULL)
+        OR (status != 'completed' AND completed_at IS NULL)
+    )
+)
+"""
+
+_SYNC_SESSION_QUEUE_INDEX_SQL = """
+CREATE INDEX sync_sessions_queue
+ON sync_sessions(project, status, last_activity_at, session_id)
+"""
+
+_SYNC_ATTEMPT_STATUS_INDEX_SQL = """
+CREATE INDEX sync_attempts_status
+ON sync_attempts(project, status)
+"""
+
+_SYNC_FEED_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER sync_feeds_immutable
+BEFORE UPDATE OF project, config_sha256, since_utc ON sync_feeds
+BEGIN
+    SELECT RAISE(ABORT, 'sync feed identity is immutable');
+END
+"""
+
+_SYNC_FEED_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER sync_feeds_no_delete
+BEFORE DELETE ON sync_feeds
+BEGIN
+    SELECT RAISE(ABORT, 'sync feeds cannot be deleted');
+END
+"""
+
+_SYNC_SESSION_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER sync_sessions_immutable
+BEFORE UPDATE OF project, session_id, started_at ON sync_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'sync session identity is immutable');
+END
+"""
+
+_SYNC_SESSION_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER sync_sessions_no_delete
+BEFORE DELETE ON sync_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'sync sessions cannot be deleted');
+END
+"""
+
+_SYNC_ATTEMPT_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER sync_attempts_immutable
+BEFORE UPDATE OF project, session_id, plan_id, source_last_activity_at ON sync_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'sync attempt identity is immutable');
+END
+"""
+
+_SYNC_ATTEMPT_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER sync_attempts_no_delete
+BEFORE DELETE ON sync_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'sync attempts cannot be deleted');
+END
+"""
+
+_SYNC_SCHEMA_SQL = (
+    _SYNC_FEEDS_SQL,
+    _SYNC_SESSIONS_SQL,
+    _SYNC_ATTEMPTS_SQL,
+    _SYNC_SESSION_QUEUE_INDEX_SQL,
+    _SYNC_ATTEMPT_STATUS_INDEX_SQL,
+    _SYNC_FEED_IMMUTABLE_TRIGGER_SQL,
+    _SYNC_FEED_NO_DELETE_TRIGGER_SQL,
+    _SYNC_SESSION_IMMUTABLE_TRIGGER_SQL,
+    _SYNC_SESSION_NO_DELETE_TRIGGER_SQL,
+    _SYNC_ATTEMPT_IMMUTABLE_TRIGGER_SQL,
+    _SYNC_ATTEMPT_NO_DELETE_TRIGGER_SQL,
+)
+
+_ATOMIC_TURN_ATTEMPTS_SQL = """
+CREATE TABLE atomic_turn_attempts (
+    project TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_key TEXT NOT NULL,
+    source_payload_sha256 TEXT NOT NULL CHECK(length(source_payload_sha256) = 64),
+    status TEXT NOT NULL CHECK(
+        status IN (
+            'planned', 'prepared', 'submitting', 'acknowledged', 'committed',
+            'rejected', 'uncertain', 'conflict'
+        )
+    ),
+    error_code TEXT NOT NULL DEFAULT '' CHECK(length(error_code) <= 64),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+    PRIMARY KEY (project, session_id, turn_key)
+)
+"""
+
+_ATOMIC_TURN_CERTIFICATES_SQL = """
+CREATE TABLE atomic_turn_certificates (
+    project TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_key TEXT NOT NULL,
+    wire_sha256 TEXT NOT NULL CHECK(length(wire_sha256) = 64),
+    logical_key TEXT NOT NULL CHECK(length(logical_key) = 64),
+    capability_version TEXT NOT NULL CHECK(length(capability_version) BETWEEN 1 AND 128),
+    reference_count INTEGER NOT NULL CHECK(reference_count >= 0),
+    span_count INTEGER NOT NULL CHECK(span_count > 0),
+    prepared_at TEXT NOT NULL,
+    PRIMARY KEY (project, session_id, turn_key),
+    FOREIGN KEY (project, session_id, turn_key)
+        REFERENCES atomic_turn_attempts(project, session_id, turn_key)
+)
+"""
+
+_ATOMIC_TURN_RECEIPTS_SQL = """
+CREATE TABLE atomic_turn_receipts (
+    project TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_key TEXT NOT NULL,
+    commit_id TEXT NOT NULL CHECK(length(commit_id) BETWEEN 1 AND 256),
+    trace_ids_json TEXT NOT NULL,
+    root_span_ids_json TEXT NOT NULL,
+    acknowledged_at TEXT NOT NULL,
+    PRIMARY KEY (project, session_id, turn_key),
+    FOREIGN KEY (project, session_id, turn_key)
+        REFERENCES atomic_turn_attempts(project, session_id, turn_key)
+)
+"""
+
+_ATOMIC_TURN_STATUS_INDEX_SQL = """
+CREATE INDEX atomic_turn_attempts_status
+ON atomic_turn_attempts(project, status)
+"""
+
+_ATOMIC_TURN_IDENTITY_TRIGGER_SQL = """
+CREATE TRIGGER atomic_turn_attempts_identity_immutable
+BEFORE UPDATE OF project, session_id, turn_key, source_payload_sha256
+ON atomic_turn_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'atomic turn identity is immutable');
+END
+"""
+
+_ATOMIC_TURN_REVISION_TRIGGER_SQL = """
+CREATE TRIGGER atomic_turn_attempts_revision_guard
+BEFORE UPDATE ON atomic_turn_attempts
+WHEN NEW.revision != OLD.revision + 1
+BEGIN
+    SELECT RAISE(ABORT, 'atomic turn revision was not advanced');
+END
+"""
+
+_ATOMIC_TURN_TRANSITION_TRIGGER_SQL = """
+CREATE TRIGGER atomic_turn_attempts_transition_guard
+BEFORE UPDATE OF status ON atomic_turn_attempts
+WHEN NOT (
+    (OLD.status = 'planned' AND NEW.status IN ('prepared', 'conflict'))
+    OR (OLD.status = 'prepared' AND NEW.status IN ('submitting', 'rejected', 'conflict'))
+    OR (
+        OLD.status = 'submitting'
+        AND NEW.status IN ('acknowledged', 'rejected', 'uncertain', 'conflict')
+    )
+    OR (
+        OLD.status = 'uncertain'
+        AND NEW.status IN ('submitting', 'acknowledged', 'rejected', 'conflict')
+    )
+    OR (OLD.status = 'acknowledged' AND NEW.status IN ('committed', 'conflict'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid atomic turn lifecycle transition');
+END
+"""
+
+_ATOMIC_TURN_PREPARED_GUARD_SQL = """
+CREATE TRIGGER atomic_turn_attempts_prepared_guard
+BEFORE UPDATE OF status ON atomic_turn_attempts
+WHEN NEW.status = 'prepared' AND NOT EXISTS (
+    SELECT 1 FROM atomic_turn_certificates AS certificate
+    WHERE certificate.project = NEW.project
+      AND certificate.session_id = NEW.session_id
+      AND certificate.turn_key = NEW.turn_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'prepared atomic turn lacks an immutable certificate');
+END
+"""
+
+_ATOMIC_TURN_ACKNOWLEDGED_GUARD_SQL = """
+CREATE TRIGGER atomic_turn_attempts_acknowledged_guard
+BEFORE UPDATE OF status ON atomic_turn_attempts
+WHEN NEW.status = 'acknowledged' AND NOT EXISTS (
+    SELECT 1 FROM atomic_turn_receipts AS receipt
+    WHERE receipt.project = NEW.project
+      AND receipt.session_id = NEW.session_id
+      AND receipt.turn_key = NEW.turn_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'acknowledged atomic turn lacks immutable returned evidence');
+END
+"""
+
+_ATOMIC_TURN_COMMITTED_GUARD_SQL = """
+CREATE TRIGGER atomic_turn_attempts_committed_guard
+BEFORE UPDATE OF status ON atomic_turn_attempts
+WHEN NEW.status = 'committed' AND (
+    NOT EXISTS (
+        SELECT 1 FROM atomic_turn_certificates AS certificate
+        WHERE certificate.project = NEW.project
+          AND certificate.session_id = NEW.session_id
+          AND certificate.turn_key = NEW.turn_key
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM atomic_turn_receipts AS receipt
+        WHERE receipt.project = NEW.project
+          AND receipt.session_id = NEW.session_id
+          AND receipt.turn_key = NEW.turn_key
+          AND json_array_length(receipt.trace_ids_json) > 0
+          AND json_array_length(receipt.root_span_ids_json) > 0
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'committed atomic turn lacks complete private evidence');
+END
+"""
+
+_ATOMIC_TURN_CERTIFICATE_INSERT_GUARD_SQL = """
+CREATE TRIGGER atomic_turn_certificates_insert_guard
+BEFORE INSERT ON atomic_turn_certificates
+WHEN NOT EXISTS (
+    SELECT 1 FROM atomic_turn_attempts AS attempt
+    WHERE attempt.project = NEW.project
+      AND attempt.session_id = NEW.session_id
+      AND attempt.turn_key = NEW.turn_key
+      AND attempt.status = 'planned'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'atomic turn certificate can only be inserted while planned');
+END
+"""
+
+_ATOMIC_TURN_RECEIPT_INSERT_GUARD_SQL = """
+CREATE TRIGGER atomic_turn_receipts_insert_guard
+BEFORE INSERT ON atomic_turn_receipts
+WHEN NOT EXISTS (
+    SELECT 1 FROM atomic_turn_attempts AS attempt
+    WHERE attempt.project = NEW.project
+      AND attempt.session_id = NEW.session_id
+      AND attempt.turn_key = NEW.turn_key
+      AND attempt.status IN ('submitting', 'uncertain')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'atomic returned evidence has no active submission');
+END
+"""
+
+_ATOMIC_TURN_CERTIFICATE_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER atomic_turn_certificates_immutable
+BEFORE UPDATE ON atomic_turn_certificates
+BEGIN
+    SELECT RAISE(ABORT, 'atomic turn certificates are immutable');
+END
+"""
+
+_ATOMIC_TURN_CERTIFICATE_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER atomic_turn_certificates_no_delete
+BEFORE DELETE ON atomic_turn_certificates
+BEGIN
+    SELECT RAISE(ABORT, 'atomic turn certificates cannot be deleted');
+END
+"""
+
+_ATOMIC_TURN_RECEIPT_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER atomic_turn_receipts_immutable
+BEFORE UPDATE ON atomic_turn_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'atomic returned evidence is immutable');
+END
+"""
+
+_ATOMIC_TURN_RECEIPT_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER atomic_turn_receipts_no_delete
+BEFORE DELETE ON atomic_turn_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'atomic returned evidence cannot be deleted');
+END
+"""
+
+_ATOMIC_TURN_ATTEMPT_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER atomic_turn_attempts_no_delete
+BEFORE DELETE ON atomic_turn_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'atomic turn attempts cannot be deleted');
+END
+"""
+
+_ATOMIC_TURN_SCHEMA_SQL = (
+    _ATOMIC_TURN_ATTEMPTS_SQL,
+    _ATOMIC_TURN_CERTIFICATES_SQL,
+    _ATOMIC_TURN_RECEIPTS_SQL,
+    _ATOMIC_TURN_STATUS_INDEX_SQL,
+    _ATOMIC_TURN_IDENTITY_TRIGGER_SQL,
+    _ATOMIC_TURN_REVISION_TRIGGER_SQL,
+    _ATOMIC_TURN_TRANSITION_TRIGGER_SQL,
+    _ATOMIC_TURN_PREPARED_GUARD_SQL,
+    _ATOMIC_TURN_ACKNOWLEDGED_GUARD_SQL,
+    _ATOMIC_TURN_COMMITTED_GUARD_SQL,
+    _ATOMIC_TURN_CERTIFICATE_INSERT_GUARD_SQL,
+    _ATOMIC_TURN_RECEIPT_INSERT_GUARD_SQL,
+    _ATOMIC_TURN_CERTIFICATE_IMMUTABLE_TRIGGER_SQL,
+    _ATOMIC_TURN_CERTIFICATE_NO_DELETE_TRIGGER_SQL,
+    _ATOMIC_TURN_RECEIPT_IMMUTABLE_TRIGGER_SQL,
+    _ATOMIC_TURN_RECEIPT_NO_DELETE_TRIGGER_SQL,
+    _ATOMIC_TURN_ATTEMPT_NO_DELETE_TRIGGER_SQL,
+)
+
+_BACKFILL_COHORTS_SQL = """
+CREATE TABLE backfill_cohorts (
+    cohort_id TEXT PRIMARY KEY CHECK(length(cohort_id) = 64),
+    plan_id TEXT NOT NULL REFERENCES backfill_plans(plan_id),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    status TEXT NOT NULL CHECK(status IN ('planned', 'applying', 'completed', 'blocked')),
+    session_count INTEGER NOT NULL CHECK(session_count > 0),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    imported_turns INTEGER NOT NULL DEFAULT 0 CHECK(imported_turns >= 0),
+    skipped_turns INTEGER NOT NULL DEFAULT 0 CHECK(skipped_turns >= 0),
+    conflicted_turns INTEGER NOT NULL DEFAULT 0 CHECK(conflicted_turns >= 0),
+    failed_items INTEGER NOT NULL DEFAULT 0 CHECK(failed_items >= 0),
+    emitted_spans INTEGER NOT NULL DEFAULT 0 CHECK(emitted_spans >= 0),
+    last_error_code TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE (plan_id, ordinal),
+    CHECK(
+        (status = 'completed' AND completed_at IS NOT NULL)
+        OR (status != 'completed' AND completed_at IS NULL)
+    )
+)
+"""
+
+_BACKFILL_COHORT_SESSIONS_SQL = """
+CREATE TABLE backfill_cohort_sessions (
+    cohort_id TEXT NOT NULL REFERENCES backfill_cohorts(cohort_id),
+    plan_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (cohort_id, session_id),
+    UNIQUE (cohort_id, ordinal),
+    FOREIGN KEY (plan_id, session_id)
+        REFERENCES backfill_plan_sessions(plan_id, session_id)
+)
+"""
+
+_BACKFILL_PLAN_INDEX_SQL = """
+CREATE INDEX backfill_plans_project_status ON backfill_plans(project, status)
+"""
+
+_BACKFILL_PLAN_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_plans_immutable
+BEFORE UPDATE OF
+    plan_id, project, source_principal_sha256, since_utc, until_utc,
+    timezone_name, selector, universe_sha256, discovered_count,
+    eligible_count, deferred_count, invalid_count, selected_count, created_at
+ON backfill_plans
+BEGIN
+    SELECT RAISE(ABORT, 'backfill plan is immutable');
+END
+"""
+
+_BACKFILL_PLAN_SESSION_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_plan_sessions_immutable
+BEFORE UPDATE OF plan_id, ordinal, session_id, started_at, last_activity_at
+ON backfill_plan_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'backfill plan session is immutable');
+END
+"""
+
+_BACKFILL_PLAN_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_plans_no_delete
+BEFORE DELETE ON backfill_plans
+BEGIN
+    SELECT RAISE(ABORT, 'backfill plan is immutable');
+END
+"""
+
+_BACKFILL_PLAN_SESSION_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_plan_sessions_no_delete
+BEFORE DELETE ON backfill_plan_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'backfill plan session is immutable');
+END
+"""
+
+_BACKFILL_PLAN_FILTER_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_plan_filters_immutable
+BEFORE UPDATE ON backfill_plan_filters
+BEGIN
+    SELECT RAISE(ABORT, 'backfill plan filters are immutable');
+END
+"""
+
+_BACKFILL_PLAN_FILTER_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_plan_filters_no_delete
+BEFORE DELETE ON backfill_plan_filters
+BEGIN
+    SELECT RAISE(ABORT, 'backfill plan filters are immutable');
+END
+"""
+
+_BACKFILL_PLAN_TURN_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_plan_turns_immutable
+BEFORE UPDATE ON backfill_plan_turns
+BEGIN
+    SELECT RAISE(ABORT, 'backfill plan turn certificates are immutable');
+END
+"""
+
+_BACKFILL_PLAN_TURN_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_plan_turns_no_delete
+BEFORE DELETE ON backfill_plan_turns
+BEGIN
+    SELECT RAISE(ABORT, 'backfill plan turn certificates are immutable');
+END
+"""
+
+_BACKFILL_PLAN_STATS_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_plan_stats_immutable
+BEFORE UPDATE ON backfill_plan_stats
+BEGIN
+    SELECT RAISE(ABORT, 'backfill plan size statistics are immutable');
+END
+"""
+
+_BACKFILL_PLAN_STATS_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_plan_stats_no_delete
+BEFORE DELETE ON backfill_plan_stats
+BEGIN
+    SELECT RAISE(ABORT, 'backfill plan size statistics are immutable');
+END
+"""
+
+_BACKFILL_COHORT_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_cohorts_immutable
+BEFORE UPDATE OF cohort_id, plan_id, ordinal, session_count, created_at
+ON backfill_cohorts
+BEGIN
+    SELECT RAISE(ABORT, 'backfill cohort is immutable');
+END
+"""
+
+_BACKFILL_COHORT_SESSION_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_cohort_sessions_immutable
+BEFORE UPDATE ON backfill_cohort_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'backfill cohort membership is immutable');
+END
+"""
+
+_BACKFILL_COHORT_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_cohorts_no_delete
+BEFORE DELETE ON backfill_cohorts
+BEGIN
+    SELECT RAISE(ABORT, 'backfill cohort is immutable');
+END
+"""
+
+_BACKFILL_COHORT_SESSION_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER backfill_cohort_sessions_no_delete
+BEFORE DELETE ON backfill_cohort_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'backfill cohort membership is immutable');
+END
 """
 
 _RUN_INDEX_SQL = """
@@ -339,6 +1146,34 @@ BEGIN
 END
 """
 
+_BACKFILL_SCHEMA_SQL = (
+    _BACKFILL_PLANS_SQL,
+    _BACKFILL_PLAN_SESSIONS_SQL,
+    _BACKFILL_COHORTS_SQL,
+    _BACKFILL_COHORT_SESSIONS_SQL,
+    _BACKFILL_PLAN_INDEX_SQL,
+    _BACKFILL_PLAN_IMMUTABLE_TRIGGER_SQL,
+    _BACKFILL_PLAN_SESSION_IMMUTABLE_TRIGGER_SQL,
+    _BACKFILL_PLAN_NO_DELETE_TRIGGER_SQL,
+    _BACKFILL_PLAN_SESSION_NO_DELETE_TRIGGER_SQL,
+    _BACKFILL_COHORT_IMMUTABLE_TRIGGER_SQL,
+    _BACKFILL_COHORT_SESSION_IMMUTABLE_TRIGGER_SQL,
+    _BACKFILL_COHORT_NO_DELETE_TRIGGER_SQL,
+    _BACKFILL_COHORT_SESSION_NO_DELETE_TRIGGER_SQL,
+)
+
+_BACKFILL_CERTIFICATE_SCHEMA_SQL = (
+    _BACKFILL_PLAN_FILTERS_SQL,
+    _BACKFILL_PLAN_TURNS_SQL,
+    _BACKFILL_PLAN_STATS_SQL,
+    _BACKFILL_PLAN_FILTER_IMMUTABLE_TRIGGER_SQL,
+    _BACKFILL_PLAN_FILTER_NO_DELETE_TRIGGER_SQL,
+    _BACKFILL_PLAN_TURN_IMMUTABLE_TRIGGER_SQL,
+    _BACKFILL_PLAN_TURN_NO_DELETE_TRIGGER_SQL,
+    _BACKFILL_PLAN_STATS_IMMUTABLE_TRIGGER_SQL,
+    _BACKFILL_PLAN_STATS_NO_DELETE_TRIGGER_SQL,
+)
+
 _SCHEMA_SQL = (
     _IMPORTED_TURNS_SQL,
     _IMPORT_RUNS_SQL,
@@ -357,6 +1192,10 @@ _SCHEMA_SQL = (
     _RUN_TURNS_INSERT_TRIGGER_SQL,
     _RUN_TURNS_NO_DELETE_TRIGGER_SQL,
     _TURN_REVISION_TRIGGER_SQL,
+    *_BACKFILL_SCHEMA_SQL,
+    *_BACKFILL_CERTIFICATE_SCHEMA_SQL,
+    *_SYNC_SCHEMA_SQL,
+    *_ATOMIC_TURN_SCHEMA_SQL,
 )
 
 _EXPECTED_SCHEMA_SQL = {
@@ -377,6 +1216,56 @@ _EXPECTED_SCHEMA_SQL = {
     "import_run_turns_insert_guard": _RUN_TURNS_INSERT_TRIGGER_SQL,
     "import_run_turns_no_delete": _RUN_TURNS_NO_DELETE_TRIGGER_SQL,
     "imported_turns_revision_guard": _TURN_REVISION_TRIGGER_SQL,
+    "backfill_plans": _BACKFILL_PLANS_SQL,
+    "backfill_plan_sessions": _BACKFILL_PLAN_SESSIONS_SQL,
+    "backfill_cohorts": _BACKFILL_COHORTS_SQL,
+    "backfill_cohort_sessions": _BACKFILL_COHORT_SESSIONS_SQL,
+    "backfill_plans_project_status": _BACKFILL_PLAN_INDEX_SQL,
+    "backfill_plans_immutable": _BACKFILL_PLAN_IMMUTABLE_TRIGGER_SQL,
+    "backfill_plan_sessions_immutable": _BACKFILL_PLAN_SESSION_IMMUTABLE_TRIGGER_SQL,
+    "backfill_plans_no_delete": _BACKFILL_PLAN_NO_DELETE_TRIGGER_SQL,
+    "backfill_plan_sessions_no_delete": _BACKFILL_PLAN_SESSION_NO_DELETE_TRIGGER_SQL,
+    "backfill_cohorts_immutable": _BACKFILL_COHORT_IMMUTABLE_TRIGGER_SQL,
+    "backfill_cohort_sessions_immutable": _BACKFILL_COHORT_SESSION_IMMUTABLE_TRIGGER_SQL,
+    "backfill_cohorts_no_delete": _BACKFILL_COHORT_NO_DELETE_TRIGGER_SQL,
+    "backfill_cohort_sessions_no_delete": _BACKFILL_COHORT_SESSION_NO_DELETE_TRIGGER_SQL,
+    "backfill_plan_filters": _BACKFILL_PLAN_FILTERS_SQL,
+    "backfill_plan_turns": _BACKFILL_PLAN_TURNS_SQL,
+    "backfill_plan_stats": _BACKFILL_PLAN_STATS_SQL,
+    "backfill_plan_filters_immutable": _BACKFILL_PLAN_FILTER_IMMUTABLE_TRIGGER_SQL,
+    "backfill_plan_filters_no_delete": _BACKFILL_PLAN_FILTER_NO_DELETE_TRIGGER_SQL,
+    "backfill_plan_turns_immutable": _BACKFILL_PLAN_TURN_IMMUTABLE_TRIGGER_SQL,
+    "backfill_plan_turns_no_delete": _BACKFILL_PLAN_TURN_NO_DELETE_TRIGGER_SQL,
+    "backfill_plan_stats_immutable": _BACKFILL_PLAN_STATS_IMMUTABLE_TRIGGER_SQL,
+    "backfill_plan_stats_no_delete": _BACKFILL_PLAN_STATS_NO_DELETE_TRIGGER_SQL,
+    "sync_feeds": _SYNC_FEEDS_SQL,
+    "sync_sessions": _SYNC_SESSIONS_SQL,
+    "sync_attempts": _SYNC_ATTEMPTS_SQL,
+    "sync_sessions_queue": _SYNC_SESSION_QUEUE_INDEX_SQL,
+    "sync_attempts_status": _SYNC_ATTEMPT_STATUS_INDEX_SQL,
+    "sync_feeds_immutable": _SYNC_FEED_IMMUTABLE_TRIGGER_SQL,
+    "sync_feeds_no_delete": _SYNC_FEED_NO_DELETE_TRIGGER_SQL,
+    "sync_sessions_immutable": _SYNC_SESSION_IMMUTABLE_TRIGGER_SQL,
+    "sync_sessions_no_delete": _SYNC_SESSION_NO_DELETE_TRIGGER_SQL,
+    "sync_attempts_immutable": _SYNC_ATTEMPT_IMMUTABLE_TRIGGER_SQL,
+    "sync_attempts_no_delete": _SYNC_ATTEMPT_NO_DELETE_TRIGGER_SQL,
+    "atomic_turn_attempts": _ATOMIC_TURN_ATTEMPTS_SQL,
+    "atomic_turn_certificates": _ATOMIC_TURN_CERTIFICATES_SQL,
+    "atomic_turn_receipts": _ATOMIC_TURN_RECEIPTS_SQL,
+    "atomic_turn_attempts_status": _ATOMIC_TURN_STATUS_INDEX_SQL,
+    "atomic_turn_attempts_identity_immutable": _ATOMIC_TURN_IDENTITY_TRIGGER_SQL,
+    "atomic_turn_attempts_revision_guard": _ATOMIC_TURN_REVISION_TRIGGER_SQL,
+    "atomic_turn_attempts_transition_guard": _ATOMIC_TURN_TRANSITION_TRIGGER_SQL,
+    "atomic_turn_attempts_prepared_guard": _ATOMIC_TURN_PREPARED_GUARD_SQL,
+    "atomic_turn_attempts_acknowledged_guard": _ATOMIC_TURN_ACKNOWLEDGED_GUARD_SQL,
+    "atomic_turn_attempts_committed_guard": _ATOMIC_TURN_COMMITTED_GUARD_SQL,
+    "atomic_turn_certificates_insert_guard": _ATOMIC_TURN_CERTIFICATE_INSERT_GUARD_SQL,
+    "atomic_turn_receipts_insert_guard": _ATOMIC_TURN_RECEIPT_INSERT_GUARD_SQL,
+    "atomic_turn_certificates_immutable": _ATOMIC_TURN_CERTIFICATE_IMMUTABLE_TRIGGER_SQL,
+    "atomic_turn_certificates_no_delete": _ATOMIC_TURN_CERTIFICATE_NO_DELETE_TRIGGER_SQL,
+    "atomic_turn_receipts_immutable": _ATOMIC_TURN_RECEIPT_IMMUTABLE_TRIGGER_SQL,
+    "atomic_turn_receipts_no_delete": _ATOMIC_TURN_RECEIPT_NO_DELETE_TRIGGER_SQL,
+    "atomic_turn_attempts_no_delete": _ATOMIC_TURN_ATTEMPT_NO_DELETE_TRIGGER_SQL,
 }
 
 
@@ -533,9 +1422,7 @@ class StateStore:
                 raise StateConflictError(
                     "state directory ancestry identity could not be validated"
                 ) from error
-            if not stat.S_ISDIR(parent_details.st_mode) or not stat.S_ISDIR(
-                child_details.st_mode
-            ):
+            if not stat.S_ISDIR(parent_details.st_mode) or not stat.S_ISDIR(child_details.st_mode):
                 raise StateConflictError("state directory ancestry has an unsafe file type")
             if (
                 parent_details.st_uid not in allowed_owners
@@ -716,6 +1603,38 @@ class StateStore:
             if user_version == DB_SCHEMA_VERSION:
                 if application_id != DB_APPLICATION_ID:
                     raise StateConflictError("state database application identity is missing")
+            elif user_version == 2 and application_id == DB_APPLICATION_ID:
+                for statement in (
+                    *_BACKFILL_SCHEMA_SQL,
+                    *_BACKFILL_CERTIFICATE_SCHEMA_SQL,
+                    *_SYNC_SCHEMA_SQL,
+                    *_ATOMIC_TURN_SCHEMA_SQL,
+                ):
+                    self._db.execute(statement)
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
+            elif user_version == 3 and application_id == DB_APPLICATION_ID:
+                for statement in (
+                    *_BACKFILL_CERTIFICATE_SCHEMA_SQL,
+                    *_SYNC_SCHEMA_SQL,
+                    *_ATOMIC_TURN_SCHEMA_SQL,
+                ):
+                    self._db.execute(statement)
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
+            elif user_version == 4 and application_id == DB_APPLICATION_ID:
+                for statement in (*_SYNC_SCHEMA_SQL, *_ATOMIC_TURN_SCHEMA_SQL):
+                    self._db.execute(statement)
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
+            elif user_version == 5 and application_id == DB_APPLICATION_ID:
+                self._db.execute(
+                    """
+                    ALTER TABLE sync_feeds
+                    ADD COLUMN candidate_universe_sha256 TEXT NOT NULL DEFAULT ''
+                        CHECK(length(candidate_universe_sha256) IN (0, 64))
+                    """
+                )
+                for statement in _ATOMIC_TURN_SCHEMA_SQL:
+                    self._db.execute(statement)
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 0 and application_id == 0:
                 self._migrate_unversioned()
                 self._db.execute(f"PRAGMA application_id={DB_APPLICATION_ID}")
@@ -1859,3 +2778,1673 @@ class StateStore:
         if row.status != "pending":
             raise StateConflictError("only a pending turn can receive a remote conflict")
         return self.mark_conflict(row=row, new_payload_sha256=row.payload_sha256, error=error)
+
+    def _backfill_plan_row(self, row: sqlite3.Row) -> BackfillPlan:
+        since_utc = parse_datetime(row["since_utc"])
+        until_utc = parse_datetime(row["until_utc"])
+        if since_utc is None or until_utc is None or since_utc >= until_utc:
+            raise StateConflictError("saved backfill plan window is malformed")
+        return BackfillPlan(
+            plan_id=str(row["plan_id"]),
+            project=str(row["project"]),
+            source_principal_sha256=str(row["source_principal_sha256"]),
+            since_utc=since_utc,
+            until_utc=until_utc,
+            timezone_name=str(row["timezone_name"]),
+            selector=str(row["selector"]),
+            universe_sha256=str(row["universe_sha256"]),
+            status=str(row["status"]),
+            discovered_count=int(row["discovered_count"]),
+            eligible_count=int(row["eligible_count"]),
+            deferred_count=int(row["deferred_count"]),
+            invalid_count=int(row["invalid_count"]),
+            selected_count=int(row["selected_count"]),
+            attempts=int(row["attempts"]),
+            last_error_code=str(row["last_error_code"]),
+        )
+
+    def _backfill_plan_session_row(self, row: sqlite3.Row) -> BackfillPlanSession:
+        started_at = parse_datetime(row["started_at"])
+        last_activity_at = parse_datetime(row["last_activity_at"])
+        if started_at is None or last_activity_at is None:
+            raise StateConflictError("saved backfill plan session is malformed")
+        return BackfillPlanSession(
+            plan_id=str(row["plan_id"]),
+            ordinal=int(row["ordinal"]),
+            session_id=str(row["session_id"]),
+            started_at=started_at,
+            last_activity_at=last_activity_at,
+            status=str(row["status"]),
+        )
+
+    def _backfill_plan_turn_row(self, row: sqlite3.Row) -> BackfillPlanTurn:
+        return BackfillPlanTurn(
+            plan_id=str(row["plan_id"]),
+            session_id=str(row["session_id"]),
+            ordinal=int(row["ordinal"]),
+            turn_key=str(row["turn_key"]),
+            source_payload_sha256=str(row["source_payload_sha256"]),
+            wire_sha256=str(row["wire_sha256"]),
+            logical_key=str(row["logical_key"]),
+            span_count=int(row["span_count"]),
+            compressed_bytes=int(row["compressed_bytes"]),
+            uncompressed_bytes=int(row["uncompressed_bytes"]),
+            reference_count=int(row["reference_count"]),
+            capability_version=str(row["capability_version"]),
+            atif_schema_version=str(row["atif_schema_version"]),
+        )
+
+    def _backfill_plan_stats_row(self, row: sqlite3.Row) -> BackfillPlanStats:
+        return BackfillPlanStats(
+            plan_id=str(row["plan_id"]),
+            turn_count=int(row["turn_count"]),
+            total_compressed_bytes=int(row["total_compressed_bytes"]),
+            max_compressed_bytes=int(row["max_compressed_bytes"]),
+            total_uncompressed_bytes=int(row["total_uncompressed_bytes"]),
+            max_uncompressed_bytes=int(row["max_uncompressed_bytes"]),
+            total_reference_count=int(row["total_reference_count"]),
+            max_reference_count=int(row["max_reference_count"]),
+            max_span_count=int(row["max_span_count"]),
+            compressed_le_64k=int(row["compressed_le_64k"]),
+            compressed_le_256k=int(row["compressed_le_256k"]),
+            compressed_le_1m=int(row["compressed_le_1m"]),
+            compressed_gt_1m=int(row["compressed_gt_1m"]),
+            uncompressed_le_256k=int(row["uncompressed_le_256k"]),
+            uncompressed_le_1m=int(row["uncompressed_le_1m"]),
+            uncompressed_le_5m=int(row["uncompressed_le_5m"]),
+            uncompressed_gt_5m=int(row["uncompressed_gt_5m"]),
+        )
+
+    def _backfill_cohort_row(self, row: sqlite3.Row) -> BackfillCohort:
+        return BackfillCohort(
+            cohort_id=str(row["cohort_id"]),
+            plan_id=str(row["plan_id"]),
+            ordinal=int(row["ordinal"]),
+            status=str(row["status"]),
+            session_count=int(row["session_count"]),
+            attempts=int(row["attempts"]),
+            imported_turns=int(row["imported_turns"]),
+            skipped_turns=int(row["skipped_turns"]),
+            conflicted_turns=int(row["conflicted_turns"]),
+            failed_items=int(row["failed_items"]),
+            emitted_spans=int(row["emitted_spans"]),
+            last_error_code=str(row["last_error_code"]),
+        )
+
+    def get_backfill_plan(self, plan_id: str) -> BackfillPlan | None:
+        row = self._db.execute(
+            "SELECT * FROM backfill_plans WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        return None if row is None else self._backfill_plan_row(row)
+
+    def resolve_backfill_plan(self, reference: str) -> BackfillPlan | None:
+        """Resolve a full plan hash or an unambiguous content-free 12+ hex alias."""
+        if not re.fullmatch(r"[0-9a-f]{12,64}", reference):
+            raise StateConflictError("backfill plan reference is malformed")
+        rows = self._db.execute(
+            """
+            SELECT * FROM backfill_plans
+            WHERE substr(plan_id, 1, length(?)) = ?
+            ORDER BY plan_id ASC LIMIT 2
+            """,
+            (reference, reference),
+        ).fetchall()
+        if len(rows) > 1:
+            raise StateConflictError(
+                "backfill plan alias is ambiguous; use a longer alias from private state"
+            )
+        return None if not rows else self._backfill_plan_row(rows[0])
+
+    def get_backfill_plan_sessions(self, plan_id: str) -> list[BackfillPlanSession]:
+        rows = self._db.execute(
+            """
+            SELECT * FROM backfill_plan_sessions
+            WHERE plan_id = ? ORDER BY ordinal ASC
+            """,
+            (plan_id,),
+        ).fetchall()
+        sessions = [self._backfill_plan_session_row(row) for row in rows]
+        if any(item.ordinal != ordinal for ordinal, item in enumerate(sessions)):
+            raise StateConflictError("saved backfill plan session ordering is malformed")
+        return sessions
+
+    def get_backfill_plan_filters(self, plan_id: str) -> list[tuple[str, str]]:
+        rows = self._db.execute(
+            """
+            SELECT filter_kind, filter_value FROM backfill_plan_filters
+            WHERE plan_id = ? ORDER BY filter_kind ASC, ordinal ASC
+            """,
+            (plan_id,),
+        ).fetchall()
+        return [(str(row["filter_kind"]), str(row["filter_value"])) for row in rows]
+
+    def get_backfill_plan_turns(
+        self,
+        plan_id: str,
+        *,
+        session_ids: set[str] | None = None,
+    ) -> list[BackfillPlanTurn]:
+        rows = self._db.execute(
+            """
+            SELECT turn.*
+            FROM backfill_plan_turns AS turn
+            JOIN backfill_plan_sessions AS session
+              ON session.plan_id = turn.plan_id AND session.session_id = turn.session_id
+            WHERE turn.plan_id = ?
+            ORDER BY session.ordinal ASC, turn.ordinal ASC
+            """,
+            (plan_id,),
+        ).fetchall()
+        turns = [self._backfill_plan_turn_row(row) for row in rows]
+        if session_ids is not None:
+            turns = [turn for turn in turns if turn.session_id in session_ids]
+        return turns
+
+    def get_backfill_plan_stats(self, plan_id: str) -> BackfillPlanStats:
+        row = self._db.execute(
+            "SELECT * FROM backfill_plan_stats WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        if row is None:
+            raise StateConflictError("backfill plan is missing its size certificate")
+        return self._backfill_plan_stats_row(row)
+
+    def create_backfill_plan(
+        self,
+        *,
+        plan_id: str,
+        project: str,
+        source_principal_sha256: str,
+        since_utc: datetime,
+        until_utc: datetime,
+        timezone_name: str,
+        selector: str,
+        universe_sha256: str,
+        sessions: list[tuple[str, datetime, datetime]],
+        filters: list[tuple[str, str]],
+        turns: list[BackfillPlanTurn],
+        stats: BackfillPlanStats,
+        discovered_count: int,
+        eligible_count: int,
+        deferred_count: int,
+        invalid_count: int,
+    ) -> BackfillPlan:
+        if not _HEX_SHA256.fullmatch(plan_id):
+            raise StateConflictError("backfill plan ID is malformed")
+        if not _HEX_SHA256.fullmatch(source_principal_sha256) or not _HEX_SHA256.fullmatch(
+            universe_sha256
+        ):
+            raise StateConflictError("backfill plan identity is malformed")
+        if selector not in {"backlog", "canary"}:
+            raise StateConflictError("backfill plan selector is unsupported")
+        if since_utc >= until_utc:
+            raise StateConflictError("backfill plan window is empty")
+        if len({session_id for session_id, _started, _activity in sessions}) != len(sessions):
+            raise StateConflictError("backfill plan requires unique session IDs")
+        allowed_filter_kinds = {"agent", "repository", "session", "exclude_subagents"}
+        if any(kind not in allowed_filter_kinds or not value for kind, value in filters):
+            raise StateConflictError("backfill plan contains an invalid exact filter")
+        if filters != sorted(filters) or any(
+            kind == "exclude_subagents" and value != "true" for kind, value in filters
+        ):
+            raise StateConflictError("backfill plan exact filters are not canonical")
+        if len(filters) != len(set(filters)):
+            raise StateConflictError("backfill plan contains duplicate exact filters")
+        session_ids = {session_id for session_id, _started, _activity in sessions}
+        if stats != _certified_backfill_stats(plan_id, turns):
+            raise StateConflictError("backfill plan size certificate is inconsistent")
+        if any(
+            turn.plan_id != plan_id
+            or turn.session_id not in session_ids
+            or not _HEX_SHA256.fullmatch(turn.source_payload_sha256)
+            or not _HEX_SHA256.fullmatch(turn.wire_sha256)
+            or not _HEX_SHA256.fullmatch(turn.logical_key)
+            or turn.span_count <= 0
+            or turn.compressed_bytes <= 0
+            or turn.uncompressed_bytes <= 0
+            or turn.reference_count < 0
+            or not turn.capability_version
+            or not turn.atif_schema_version
+            for turn in turns
+        ):
+            raise StateConflictError("backfill plan contains an invalid turn certificate")
+        turn_identities = [(turn.session_id, turn.ordinal, turn.turn_key) for turn in turns]
+        if len(turn_identities) != len(set(turn_identities)):
+            raise StateConflictError("backfill plan contains duplicate turn certificates")
+        expected_turn_order = [
+            turn
+            for session_id, _started, _activity in sessions
+            for turn in sorted(
+                (item for item in turns if item.session_id == session_id),
+                key=lambda item: item.ordinal,
+            )
+        ]
+        if turns != expected_turn_order or any(
+            turn.ordinal != ordinal
+            for session_id, _started, _activity in sessions
+            for ordinal, turn in enumerate(item for item in turns if item.session_id == session_id)
+        ):
+            raise StateConflictError("backfill plan turn ordering is not canonical")
+        existing = self.get_backfill_plan(plan_id)
+        if existing is not None:
+            saved = self.get_backfill_plan_sessions(plan_id)
+            saved_filters = self.get_backfill_plan_filters(plan_id)
+            saved_turns = self.get_backfill_plan_turns(plan_id)
+            saved_stats = self.get_backfill_plan_stats(plan_id)
+            expected_sessions = [
+                (session_id, isoformat_z(started_at), isoformat_z(activity))
+                for session_id, started_at, activity in sessions
+            ]
+            actual_sessions = [
+                (item.session_id, isoformat_z(item.started_at), isoformat_z(item.last_activity_at))
+                for item in saved
+            ]
+            expected_identity = (
+                project,
+                source_principal_sha256,
+                isoformat_z(since_utc),
+                isoformat_z(until_utc),
+                timezone_name,
+                selector,
+                universe_sha256,
+                discovered_count,
+                eligible_count,
+                deferred_count,
+                invalid_count,
+                len(sessions),
+            )
+            actual_identity = (
+                existing.project,
+                existing.source_principal_sha256,
+                isoformat_z(existing.since_utc),
+                isoformat_z(existing.until_utc),
+                existing.timezone_name,
+                existing.selector,
+                existing.universe_sha256,
+                existing.discovered_count,
+                existing.eligible_count,
+                existing.deferred_count,
+                existing.invalid_count,
+                existing.selected_count,
+            )
+            if (
+                actual_identity != expected_identity
+                or actual_sessions != expected_sessions
+                or saved_filters != filters
+                or saved_turns != turns
+                or saved_stats != stats
+            ):
+                raise StateConflictError("backfill plan ID collided with different source evidence")
+            return existing
+
+        now = isoformat_z(datetime.now(UTC))
+        initial_status = "completed" if not sessions else "planned"
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute(
+                """
+                INSERT INTO backfill_plans (
+                    plan_id, project, source_principal_sha256, since_utc, until_utc,
+                    timezone_name, selector, universe_sha256, status,
+                    discovered_count, eligible_count, deferred_count, invalid_count,
+                    selected_count, created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan_id,
+                    project,
+                    source_principal_sha256,
+                    isoformat_z(since_utc),
+                    isoformat_z(until_utc),
+                    timezone_name,
+                    selector,
+                    universe_sha256,
+                    initial_status,
+                    discovered_count,
+                    eligible_count,
+                    deferred_count,
+                    invalid_count,
+                    len(sessions),
+                    now,
+                    now,
+                    now if not sessions else None,
+                ),
+            )
+            self._db.executemany(
+                """
+                INSERT INTO backfill_plan_sessions (
+                    plan_id, ordinal, session_id, started_at, last_activity_at,
+                    status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                [
+                    (
+                        plan_id,
+                        ordinal,
+                        session_id,
+                        isoformat_z(started_at),
+                        isoformat_z(activity),
+                        now,
+                    )
+                    for ordinal, (session_id, started_at, activity) in enumerate(sessions)
+                ],
+            )
+            filter_ordinals: dict[str, int] = {}
+            filter_rows: list[tuple[str, str, int, str]] = []
+            for kind, value in filters:
+                ordinal = filter_ordinals.get(kind, 0)
+                filter_rows.append((plan_id, kind, ordinal, value))
+                filter_ordinals[kind] = ordinal + 1
+            self._db.executemany(
+                """
+                INSERT INTO backfill_plan_filters (
+                    plan_id, filter_kind, ordinal, filter_value
+                ) VALUES (?, ?, ?, ?)
+                """,
+                filter_rows,
+            )
+            self._db.executemany(
+                """
+                INSERT INTO backfill_plan_turns (
+                    plan_id, session_id, ordinal, turn_key, source_payload_sha256,
+                    wire_sha256, logical_key, span_count, compressed_bytes,
+                    uncompressed_bytes, reference_count, capability_version,
+                    atif_schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        turn.plan_id,
+                        turn.session_id,
+                        turn.ordinal,
+                        turn.turn_key,
+                        turn.source_payload_sha256,
+                        turn.wire_sha256,
+                        turn.logical_key,
+                        turn.span_count,
+                        turn.compressed_bytes,
+                        turn.uncompressed_bytes,
+                        turn.reference_count,
+                        turn.capability_version,
+                        turn.atif_schema_version,
+                    )
+                    for turn in turns
+                ],
+            )
+            self._db.execute(
+                """
+                INSERT INTO backfill_plan_stats (
+                    plan_id, turn_count, total_compressed_bytes, max_compressed_bytes,
+                    total_uncompressed_bytes, max_uncompressed_bytes,
+                    total_reference_count, max_reference_count, max_span_count,
+                    compressed_le_64k, compressed_le_256k, compressed_le_1m,
+                    compressed_gt_1m, uncompressed_le_256k, uncompressed_le_1m,
+                    uncompressed_le_5m, uncompressed_gt_5m
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    stats.plan_id,
+                    stats.turn_count,
+                    stats.total_compressed_bytes,
+                    stats.max_compressed_bytes,
+                    stats.total_uncompressed_bytes,
+                    stats.max_uncompressed_bytes,
+                    stats.total_reference_count,
+                    stats.max_reference_count,
+                    stats.max_span_count,
+                    stats.compressed_le_64k,
+                    stats.compressed_le_256k,
+                    stats.compressed_le_1m,
+                    stats.compressed_gt_1m,
+                    stats.uncompressed_le_256k,
+                    stats.uncompressed_le_1m,
+                    stats.uncompressed_le_5m,
+                    stats.uncompressed_gt_5m,
+                ),
+            )
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        created = self.get_backfill_plan(plan_id)
+        assert created is not None
+        return created
+
+    def get_or_create_backfill_cohort(
+        self,
+        *,
+        plan_id: str,
+        max_sessions: int,
+    ) -> BackfillCohort | None:
+        if not 1 <= max_sessions <= 10_000:
+            raise ValueError("max_sessions must be between 1 and 10000")
+        plan = self.get_backfill_plan(plan_id)
+        if plan is None:
+            raise StateConflictError("backfill plan was not found in the private state database")
+        active_rows = self._db.execute(
+            """
+            SELECT * FROM backfill_cohorts
+            WHERE plan_id = ? AND status != 'completed'
+            ORDER BY ordinal ASC
+            """,
+            (plan_id,),
+        ).fetchall()
+        if len(active_rows) > 1:
+            raise StateConflictError("backfill plan has multiple unfinished cohorts")
+        if active_rows:
+            return self._backfill_cohort_row(active_rows[0])
+        pending = self._db.execute(
+            """
+            SELECT * FROM backfill_plan_sessions
+            WHERE plan_id = ? AND status = 'pending'
+            ORDER BY ordinal ASC LIMIT ?
+            """,
+            (plan_id, max_sessions),
+        ).fetchall()
+        if not pending:
+            return None
+        cohort_ordinal = int(
+            self._db.execute(
+                "SELECT COUNT(*) FROM backfill_cohorts WHERE plan_id = ?", (plan_id,)
+            ).fetchone()[0]
+        )
+        membership = [
+            {
+                "ordinal": int(row["ordinal"]),
+                "session_id": str(row["session_id"]),
+                "last_activity_at": str(row["last_activity_at"]),
+            }
+            for row in pending
+        ]
+        cohort_id = sha256_json(
+            {
+                "schema": "hivemind-weave-backfill-cohort-v1",
+                "plan_id": plan_id,
+                "cohort_ordinal": cohort_ordinal,
+                "sessions": membership,
+            }
+        )
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute(
+                """
+                INSERT INTO backfill_cohorts (
+                    cohort_id, plan_id, ordinal, status, session_count, created_at, updated_at
+                ) VALUES (?, ?, ?, 'planned', ?, ?, ?)
+                """,
+                (cohort_id, plan_id, cohort_ordinal, len(pending), now, now),
+            )
+            self._db.executemany(
+                """
+                INSERT INTO backfill_cohort_sessions (
+                    cohort_id, plan_id, ordinal, session_id
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (cohort_id, plan_id, ordinal, str(row["session_id"]))
+                    for ordinal, row in enumerate(pending)
+                ],
+            )
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        row = self._db.execute(
+            "SELECT * FROM backfill_cohorts WHERE cohort_id = ?", (cohort_id,)
+        ).fetchone()
+        assert row is not None
+        return self._backfill_cohort_row(row)
+
+    def get_backfill_cohort_sessions(self, cohort_id: str) -> list[BackfillPlanSession]:
+        rows = self._db.execute(
+            """
+            SELECT plan_session.*
+            FROM backfill_cohort_sessions AS cohort_session
+            JOIN backfill_plan_sessions AS plan_session
+              ON plan_session.plan_id = cohort_session.plan_id
+             AND plan_session.session_id = cohort_session.session_id
+            WHERE cohort_session.cohort_id = ?
+            ORDER BY cohort_session.ordinal ASC
+            """,
+            (cohort_id,),
+        ).fetchall()
+        return [self._backfill_plan_session_row(row) for row in rows]
+
+    def begin_backfill_cohort(self, cohort: BackfillCohort) -> BackfillCohort:
+        if cohort.status == "completed":
+            return cohort
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            cursor = self._db.execute(
+                """
+                UPDATE backfill_cohorts
+                SET status = 'applying', attempts = attempts + 1,
+                    last_error_code = '', updated_at = ?
+                WHERE cohort_id = ? AND status IN ('planned', 'applying', 'blocked')
+                  AND attempts = ?
+                """,
+                (now, cohort.cohort_id, cohort.attempts),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflictError("backfill cohort changed before apply")
+            self._db.execute(
+                """
+                UPDATE backfill_plans
+                SET status = 'applying', attempts = attempts + 1,
+                    last_error_code = '', updated_at = ?
+                WHERE plan_id = ? AND status IN ('planned', 'applying', 'blocked')
+                """,
+                (now, cohort.plan_id),
+            )
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        row = self._db.execute(
+            "SELECT * FROM backfill_cohorts WHERE cohort_id = ?", (cohort.cohort_id,)
+        ).fetchone()
+        assert row is not None
+        return self._backfill_cohort_row(row)
+
+    def finish_backfill_cohort(
+        self,
+        *,
+        cohort: BackfillCohort,
+        success: bool,
+        imported_turns: int,
+        skipped_turns: int,
+        conflicted_turns: int,
+        failed_items: int,
+        emitted_spans: int,
+        error_code: str = "",
+    ) -> BackfillPlan:
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            status = "completed" if success else "blocked"
+            cursor = self._db.execute(
+                """
+                UPDATE backfill_cohorts
+                SET status = ?, imported_turns = ?, skipped_turns = ?,
+                    conflicted_turns = ?, failed_items = ?, emitted_spans = ?,
+                    last_error_code = ?, updated_at = ?, completed_at = ?
+                WHERE cohort_id = ? AND status = 'applying' AND attempts = ?
+                """,
+                (
+                    status,
+                    imported_turns,
+                    skipped_turns,
+                    conflicted_turns,
+                    failed_items,
+                    emitted_spans,
+                    "" if success else error_code[:64],
+                    now,
+                    now if success else None,
+                    cohort.cohort_id,
+                    cohort.attempts,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflictError("backfill cohort changed before completion")
+            if success:
+                self._db.execute(
+                    """
+                    UPDATE backfill_plan_sessions
+                    SET status = 'completed', updated_at = ?
+                    WHERE plan_id = ? AND session_id IN (
+                        SELECT session_id FROM backfill_cohort_sessions WHERE cohort_id = ?
+                    )
+                    """,
+                    (now, cohort.plan_id, cohort.cohort_id),
+                )
+                remaining = int(
+                    self._db.execute(
+                        """
+                        SELECT COUNT(*) FROM backfill_plan_sessions
+                        WHERE plan_id = ? AND status = 'pending'
+                        """,
+                        (cohort.plan_id,),
+                    ).fetchone()[0]
+                )
+                plan_status = "completed" if remaining == 0 else "planned"
+                self._db.execute(
+                    """
+                    UPDATE backfill_plans
+                    SET status = ?, last_error_code = '', updated_at = ?, completed_at = ?
+                    WHERE plan_id = ? AND status = 'applying'
+                    """,
+                    (
+                        plan_status,
+                        now,
+                        now if plan_status == "completed" else None,
+                        cohort.plan_id,
+                    ),
+                )
+            else:
+                self._db.execute(
+                    """
+                    UPDATE backfill_plans
+                    SET status = 'blocked', last_error_code = ?, updated_at = ?
+                    WHERE plan_id = ? AND status = 'applying'
+                    """,
+                    (error_code[:64], now, cohort.plan_id),
+                )
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        plan = self.get_backfill_plan(cohort.plan_id)
+        assert plan is not None
+        return plan
+
+    def backfill_progress(self, plan_id: str) -> tuple[int, int]:
+        rows = self._db.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM backfill_plan_sessions WHERE plan_id = ? GROUP BY status
+            """,
+            (plan_id,),
+        ).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        return counts.get("completed", 0), counts.get("pending", 0)
+
+    def _sync_feed_row(self, row: sqlite3.Row) -> SyncFeed:
+        since = parse_datetime(row["since_utc"])
+        watermark = parse_datetime(row["successful_scan_watermark"])
+        scan_started = parse_datetime(row["last_scan_started_at"])
+        scan_succeeded = parse_datetime(row["last_scan_succeeded_at"])
+        if since is None:
+            raise StateConflictError("saved sync feed has an invalid start timestamp")
+        return SyncFeed(
+            project=str(row["project"]),
+            config_sha256=str(row["config_sha256"]),
+            since_utc=since,
+            successful_scan_watermark=watermark,
+            last_scan_started_at=scan_started,
+            last_scan_succeeded_at=scan_succeeded,
+            candidate_universe_sha256=str(row["candidate_universe_sha256"]),
+        )
+
+    def _sync_session_row(self, row: sqlite3.Row) -> SyncLedgerSession:
+        started = parse_datetime(row["started_at"])
+        activity = parse_datetime(row["last_activity_at"])
+        eligible_after = parse_datetime(row["eligible_after"])
+        completed_activity = parse_datetime(row["completed_activity_at"])
+        if started is None or activity is None or eligible_after is None:
+            raise StateConflictError("saved sync session has invalid timestamps")
+        return SyncLedgerSession(
+            project=str(row["project"]),
+            session_id=str(row["session_id"]),
+            started_at=started,
+            last_activity_at=activity,
+            activity_known=bool(row["activity_known"]),
+            eligible_after=eligible_after,
+            status=str(row["status"]),
+            plan_id=str(row["plan_id"]),
+            completed_activity_at=completed_activity,
+            attempts=int(row["attempts"]),
+        )
+
+    def get_sync_feed(self, project: str) -> SyncFeed | None:
+        row = self._db.execute("SELECT * FROM sync_feeds WHERE project = ?", (project,)).fetchone()
+        return None if row is None else self._sync_feed_row(row)
+
+    def ensure_sync_feed(
+        self,
+        *,
+        project: str,
+        config_sha256: str,
+        since_utc: datetime,
+    ) -> SyncFeed:
+        if not project or not _HEX_SHA256.fullmatch(config_sha256):
+            raise StateConflictError("sync feed identity is malformed")
+        existing = self.get_sync_feed(project)
+        if existing is not None:
+            if (
+                existing.config_sha256 != config_sha256
+                or existing.since_utc != since_utc.astimezone(UTC)
+            ):
+                raise StateConflictError(
+                    "saved sync discovery policy differs from the configured policy"
+                )
+            return existing
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute(
+                """
+                INSERT INTO sync_feeds (
+                    project, config_sha256, since_utc, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (project, config_sha256, isoformat_z(since_utc), now, now),
+            )
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        created = self.get_sync_feed(project)
+        assert created is not None
+        return created
+
+    def record_sync_scan(
+        self,
+        *,
+        project: str,
+        config_sha256: str,
+        since_utc: datetime,
+        scan_started_at: datetime,
+        cutoff: datetime,
+        records: list[SyncDiscoveryRecord],
+    ) -> SyncFeed:
+        feed = self.ensure_sync_feed(
+            project=project,
+            config_sha256=config_sha256,
+            since_utc=since_utc,
+        )
+        cutoff = cutoff.astimezone(UTC)
+        scan_started_at = scan_started_at.astimezone(UTC)
+        if feed.successful_scan_watermark is not None and cutoff < feed.successful_scan_watermark:
+            raise StateConflictError("sync scan watermark cannot move backwards")
+        if len({record.session_id for record in records}) != len(records):
+            raise StateConflictError("sync discovery contains duplicate session IDs")
+        if any(
+            record.status not in {"deferred", "queued"}
+            or record.started_at.tzinfo is None
+            or record.last_activity_at.tzinfo is None
+            or record.eligible_after.tzinfo is None
+            for record in records
+        ):
+            raise StateConflictError("sync discovery record is malformed")
+
+        observed_at = isoformat_z(cutoff)
+        candidate_universe_sha256 = sha256_json(
+            [
+                {
+                    "session_id": record.session_id,
+                    "last_activity_at": isoformat_z(record.last_activity_at),
+                }
+                for record in sorted(records, key=lambda item: item.session_id)
+            ]
+        )
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            for record in records:
+                row = self._db.execute(
+                    "SELECT * FROM sync_sessions WHERE project = ? AND session_id = ?",
+                    (project, record.session_id),
+                ).fetchone()
+                if row is None:
+                    self._db.execute(
+                        """
+                        INSERT INTO sync_sessions (
+                            project, session_id, started_at, last_activity_at,
+                            activity_known, eligible_after, status, observed_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project,
+                            record.session_id,
+                            isoformat_z(record.started_at),
+                            isoformat_z(record.last_activity_at),
+                            int(record.activity_known),
+                            isoformat_z(record.eligible_after),
+                            record.status,
+                            observed_at,
+                            observed_at,
+                        ),
+                    )
+                    continue
+
+                current = self._sync_session_row(row)
+                if current.started_at != record.started_at.astimezone(UTC):
+                    raise StateConflictError("a discovered sync session changed its start time")
+                if (
+                    current.activity_known
+                    and record.activity_known
+                    and record.last_activity_at.astimezone(UTC) < current.last_activity_at
+                ):
+                    raise StateConflictError("a discovered sync session activity regressed")
+                accept_activity = record.activity_known or not current.activity_known
+                new_activity = (
+                    record.last_activity_at.astimezone(UTC)
+                    if accept_activity
+                    else current.last_activity_at
+                )
+                new_known = current.activity_known or record.activity_known
+                advanced = record.activity_known and (
+                    not current.activity_known or new_activity > current.last_activity_at
+                )
+                status = current.status
+                plan_id = current.plan_id
+                completed_activity = current.completed_activity_at
+                if advanced:
+                    status = record.status
+                    plan_id = ""
+                    completed_activity = None
+                elif current.status == "deferred" and record.status == "queued":
+                    status = "queued"
+                self._db.execute(
+                    """
+                    UPDATE sync_sessions
+                    SET last_activity_at = ?, activity_known = ?, eligible_after = ?,
+                        status = ?, plan_id = ?, completed_activity_at = ?,
+                        observed_at = ?, updated_at = ?, revision = revision + 1
+                    WHERE project = ? AND session_id = ? AND revision = ?
+                    """,
+                    (
+                        isoformat_z(new_activity),
+                        int(new_known),
+                        isoformat_z(record.eligible_after),
+                        status,
+                        plan_id,
+                        "" if completed_activity is None else isoformat_z(completed_activity),
+                        observed_at,
+                        observed_at,
+                        project,
+                        record.session_id,
+                        int(row["revision"]),
+                    ),
+                )
+            self._db.execute(
+                """
+                UPDATE sync_feeds
+                SET successful_scan_watermark = ?, last_scan_started_at = ?,
+                    last_scan_succeeded_at = ?, updated_at = ?,
+                    candidate_universe_sha256 = ?
+                WHERE project = ? AND config_sha256 = ?
+                """,
+                (
+                    isoformat_z(cutoff),
+                    isoformat_z(scan_started_at),
+                    observed_at,
+                    observed_at,
+                    candidate_universe_sha256,
+                    project,
+                    config_sha256,
+                ),
+            )
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        updated = self.get_sync_feed(project)
+        assert updated is not None
+        return updated
+
+    def get_next_sync_session(self, project: str) -> SyncLedgerSession | None:
+        row = self._db.execute(
+            """
+            SELECT * FROM sync_sessions
+            WHERE project = ? AND status = 'queued'
+            ORDER BY last_activity_at ASC, session_id ASC LIMIT 1
+            """,
+            (project,),
+        ).fetchone()
+        return None if row is None else self._sync_session_row(row)
+
+    def get_deferred_sync_sessions(self, project: str) -> list[SyncLedgerSession]:
+        """Return the durable deferred worklist in a stable content-free order."""
+        rows = self._db.execute(
+            """
+            SELECT * FROM sync_sessions
+            WHERE project = ? AND status = 'deferred'
+            ORDER BY eligible_after ASC, last_activity_at ASC, session_id ASC
+            """,
+            (project,),
+        ).fetchall()
+        return [self._sync_session_row(row) for row in rows]
+
+    def sync_backlog_counts(self, project: str) -> tuple[int, int]:
+        rows = self._db.execute(
+            """
+            SELECT status, COUNT(*) AS count FROM sync_sessions
+            WHERE project = ? GROUP BY status
+            """,
+            (project,),
+        ).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        queued = counts.get("queued", 0)
+        deferred = counts.get("deferred", 0)
+        return queued, deferred
+
+    def begin_sync_attempt(
+        self,
+        *,
+        session: SyncLedgerSession,
+        plan_id: str,
+    ) -> None:
+        if not _HEX_SHA256.fullmatch(plan_id) or session.status != "queued":
+            raise StateConflictError("sync attempt identity is malformed")
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute(
+                """
+                INSERT INTO sync_attempts (
+                    project, session_id, plan_id, source_last_activity_at,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'processing', ?, ?)
+                """,
+                (
+                    session.project,
+                    session.session_id,
+                    plan_id,
+                    isoformat_z(session.last_activity_at),
+                    now,
+                    now,
+                ),
+            )
+            cursor = self._db.execute(
+                """
+                UPDATE sync_sessions
+                SET status = 'processing', plan_id = ?, attempts = attempts + 1,
+                    updated_at = ?, revision = revision + 1
+                WHERE project = ? AND session_id = ? AND status = 'queued'
+                  AND last_activity_at = ?
+                """,
+                (
+                    plan_id,
+                    now,
+                    session.project,
+                    session.session_id,
+                    isoformat_z(session.last_activity_at),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflictError("sync session changed before its attempt began")
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def finish_sync_attempt(
+        self,
+        *,
+        project: str,
+        session_id: str,
+        plan_id: str,
+        success: bool,
+        error_code: str = "",
+    ) -> None:
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            cursor = self._db.execute(
+                """
+                UPDATE sync_attempts
+                SET status = ?, error_code = ?, updated_at = ?, completed_at = ?
+                WHERE project = ? AND session_id = ? AND plan_id = ?
+                  AND status = 'processing'
+                """,
+                (
+                    "completed" if success else "blocked",
+                    "" if success else error_code[:64],
+                    now,
+                    now if success else None,
+                    project,
+                    session_id,
+                    plan_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflictError("sync attempt changed before completion")
+            self._db.execute(
+                """
+                UPDATE sync_sessions
+                SET status = ?, completed_activity_at = ?, updated_at = ?,
+                    revision = revision + 1
+                WHERE project = ? AND session_id = ? AND plan_id = ?
+                """,
+                (
+                    "completed" if success else "blocked",
+                    (
+                        isoformat_z(
+                            self._sync_session_row(
+                                self._db.execute(
+                                    """
+                                    SELECT * FROM sync_sessions
+                                    WHERE project = ? AND session_id = ?
+                                    """,
+                                    (project, session_id),
+                                ).fetchone()
+                            ).last_activity_at
+                        )
+                        if success
+                        else ""
+                    ),
+                    now,
+                    project,
+                    session_id,
+                    plan_id,
+                ),
+            )
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def has_unresolved_sync_attempts(self, project: str) -> bool:
+        row = self._db.execute(
+            """
+            SELECT 1 FROM sync_attempts
+            WHERE project = ? AND status IN ('processing', 'blocked') LIMIT 1
+            """,
+            (project,),
+        ).fetchone()
+        return row is not None
+
+    def has_completed_sync_attempt_since(
+        self,
+        project: str,
+        started_at: datetime,
+    ) -> bool:
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            raise StateConflictError("sync recovery timestamp must be timezone-aware")
+        row = self._db.execute(
+            """
+            SELECT 1 FROM sync_attempts
+            WHERE project = ? AND status = 'completed'
+              AND completed_at IS NOT NULL
+              AND julianday(completed_at) >= julianday(?)
+            LIMIT 1
+            """,
+            (project, isoformat_z(started_at.astimezone(UTC))),
+        ).fetchone()
+        return row is not None
+
+    def get_unresolved_sync_plan_ids(self, project: str) -> list[str]:
+        rows = self._db.execute(
+            """
+            SELECT plan_id FROM sync_attempts
+            WHERE project = ? AND status IN ('processing', 'blocked')
+            ORDER BY created_at ASC, session_id ASC, plan_id ASC
+            """,
+            (project,),
+        ).fetchall()
+        plan_ids = [str(row["plan_id"]) for row in rows]
+        if any(not _HEX_SHA256.fullmatch(value) for value in plan_ids):
+            raise StateConflictError("saved sync attempt has a malformed plan identity")
+        return plan_ids
+
+    def reconcile_sync_attempts(self, project: str) -> SyncReconcileResult:
+        attempts = self._db.execute(
+            """
+            SELECT * FROM sync_attempts
+            WHERE project = ? AND status IN ('processing', 'blocked')
+            ORDER BY created_at ASC, session_id ASC
+            """,
+            (project,),
+        ).fetchall()
+        if not attempts:
+            return SyncReconcileResult(0, 0, False)
+
+        resolvable: list[sqlite3.Row] = []
+        evidence_available = True
+        unresolved = 0
+        for attempt in attempts:
+            turns = self.get_backfill_plan_turns(
+                str(attempt["plan_id"]),
+                session_ids={str(attempt["session_id"])},
+            )
+            if not turns:
+                evidence_available = False
+                unresolved += 1
+                continue
+            valid = True
+            for turn in turns:
+                row = self.get(project, turn.session_id, turn.turn_key)
+                if row is None:
+                    evidence_available = False
+                    valid = False
+                    break
+                if (
+                    row.status != "committed"
+                    or row.source_payload_sha256 != turn.source_payload_sha256
+                    or row.span_count != turn.span_count
+                    or not row.trace_ids
+                    or not row.root_span_ids
+                ):
+                    valid = False
+                    break
+            if valid:
+                resolvable.append(attempt)
+            else:
+                unresolved += 1
+
+        global_unresolved = self._db.execute(
+            """
+            SELECT 1 FROM imported_turns
+            WHERE project = ? AND status != 'committed' LIMIT 1
+            """,
+            (project,),
+        ).fetchone()
+        if global_unresolved is not None:
+            unresolved = max(1, unresolved)
+        if unresolved:
+            return SyncReconcileResult(0, unresolved, evidence_available)
+
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            for attempt in resolvable:
+                self._db.execute(
+                    """
+                    UPDATE sync_attempts
+                    SET status = 'completed', error_code = '', updated_at = ?, completed_at = ?
+                    WHERE project = ? AND session_id = ? AND plan_id = ?
+                      AND status IN ('processing', 'blocked')
+                    """,
+                    (
+                        now,
+                        now,
+                        project,
+                        str(attempt["session_id"]),
+                        str(attempt["plan_id"]),
+                    ),
+                )
+                self._db.execute(
+                    """
+                    UPDATE sync_sessions
+                    SET status = 'completed', completed_activity_at = last_activity_at,
+                        updated_at = ?, revision = revision + 1
+                    WHERE project = ? AND session_id = ? AND plan_id = ?
+                      AND last_activity_at = ? AND status IN ('processing', 'blocked')
+                    """,
+                    (
+                        now,
+                        project,
+                        str(attempt["session_id"]),
+                        str(attempt["plan_id"]),
+                        str(attempt["source_last_activity_at"]),
+                    ),
+                )
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        return SyncReconcileResult(len(resolvable), 0, True)
+
+    @staticmethod
+    def _validate_atomic_coordinate(value: str, *, label: str) -> None:
+        if not value or len(value) > 512 or any(ord(character) < 0x20 for character in value):
+            raise StateConflictError(f"atomic turn {label} is malformed")
+
+    @staticmethod
+    def _validate_atomic_error_code(error_code: str) -> str:
+        if error_code and (
+            len(error_code) > 64 or _ATOMIC_EVIDENCE_ID.fullmatch(error_code) is None
+        ):
+            raise StateConflictError("atomic turn error code is malformed")
+        return error_code
+
+    def _atomic_turn_row(self, row: sqlite3.Row) -> AtomicTurnAttempt:
+        try:
+            trace_ids_raw = json.loads(str(row["trace_ids_json"] or "[]"))
+            root_ids_raw = json.loads(str(row["root_span_ids_json"] or "[]"))
+        except json.JSONDecodeError as error:
+            raise StateConflictError("saved atomic returned evidence is malformed") from error
+        if not isinstance(trace_ids_raw, list) or not isinstance(root_ids_raw, list):
+            raise StateConflictError("saved atomic returned evidence is malformed")
+        trace_ids = tuple(str(value) for value in trace_ids_raw)
+        root_ids = tuple(str(value) for value in root_ids_raw)
+        if any(_ATOMIC_EVIDENCE_ID.fullmatch(value) is None for value in (*trace_ids, *root_ids)):
+            raise StateConflictError("saved atomic returned evidence has invalid identifiers")
+        return AtomicTurnAttempt(
+            project=str(row["project"]),
+            session_id=str(row["session_id"]),
+            turn_key=str(row["turn_key"]),
+            source_payload_sha256=str(row["source_payload_sha256"]),
+            status=str(row["status"]),
+            wire_sha256=str(row["wire_sha256"] or ""),
+            logical_key=str(row["logical_key"] or ""),
+            capability_version=str(row["capability_version"] or ""),
+            reference_count=int(row["reference_count"] or 0),
+            span_count=int(row["span_count"] or 0),
+            commit_id=str(row["commit_id"] or ""),
+            trace_ids=trace_ids,
+            root_span_ids=root_ids,
+            error_code=str(row["error_code"]),
+            revision=int(row["revision"]),
+        )
+
+    def get_atomic_turn(
+        self,
+        project: str,
+        session_id: str,
+        turn_key: str,
+    ) -> AtomicTurnAttempt | None:
+        row = self._db.execute(
+            """
+            SELECT attempt.*,
+                   certificate.wire_sha256, certificate.logical_key,
+                   certificate.capability_version, certificate.reference_count,
+                   certificate.span_count,
+                   receipt.commit_id, receipt.trace_ids_json, receipt.root_span_ids_json
+            FROM atomic_turn_attempts AS attempt
+            LEFT JOIN atomic_turn_certificates AS certificate
+              ON certificate.project = attempt.project
+             AND certificate.session_id = attempt.session_id
+             AND certificate.turn_key = attempt.turn_key
+            LEFT JOIN atomic_turn_receipts AS receipt
+              ON receipt.project = attempt.project
+             AND receipt.session_id = attempt.session_id
+             AND receipt.turn_key = attempt.turn_key
+            WHERE attempt.project = ? AND attempt.session_id = ? AND attempt.turn_key = ?
+            """,
+            (project, session_id, turn_key),
+        ).fetchone()
+        return None if row is None else self._atomic_turn_row(row)
+
+    def get_unresolved_atomic_turns(self, project: str) -> list[AtomicTurnAttempt]:
+        rows = self._db.execute(
+            """
+            SELECT attempt.*,
+                   certificate.wire_sha256, certificate.logical_key,
+                   certificate.capability_version, certificate.reference_count,
+                   certificate.span_count,
+                   receipt.commit_id, receipt.trace_ids_json, receipt.root_span_ids_json
+            FROM atomic_turn_attempts AS attempt
+            LEFT JOIN atomic_turn_certificates AS certificate
+              ON certificate.project = attempt.project
+             AND certificate.session_id = attempt.session_id
+             AND certificate.turn_key = attempt.turn_key
+            LEFT JOIN atomic_turn_receipts AS receipt
+              ON receipt.project = attempt.project
+             AND receipt.session_id = attempt.session_id
+             AND receipt.turn_key = attempt.turn_key
+            WHERE attempt.project = ? AND attempt.status != 'committed'
+            ORDER BY attempt.created_at ASC, attempt.session_id ASC, attempt.turn_key ASC
+            """,
+            (project,),
+        ).fetchall()
+        return [self._atomic_turn_row(row) for row in rows]
+
+    def sync_diagnostic_counts(self, project: str) -> dict[str, int]:
+        atomic_rows = self._db.execute(
+            """
+            SELECT status, COUNT(*) AS count FROM atomic_turn_attempts
+            WHERE project = ? GROUP BY status
+            """,
+            (project,),
+        ).fetchall()
+        atomic = {str(row["status"]): int(row["count"]) for row in atomic_rows}
+        preflighted = int(
+            self._db.execute(
+                "SELECT COUNT(*) FROM atomic_turn_certificates WHERE project = ?",
+                (project,),
+            ).fetchone()[0]
+        )
+        blocked_attempts = int(
+            self._db.execute(
+                """
+                SELECT COUNT(*) FROM sync_attempts
+                WHERE project = ? AND status = 'blocked'
+                """,
+                (project,),
+            ).fetchone()[0]
+        )
+        return {
+            "preflighted": preflighted,
+            "committed": atomic.get("committed", 0),
+            "blocked": blocked_attempts + atomic.get("rejected", 0),
+            "uncertain": (
+                atomic.get("submitting", 0)
+                + atomic.get("uncertain", 0)
+                + atomic.get("acknowledged", 0)
+            ),
+            "conflicted": atomic.get("conflict", 0),
+        }
+
+    def plan_atomic_turn(
+        self,
+        *,
+        project: str,
+        session_id: str,
+        turn_key: str,
+        source_payload_sha256: str,
+    ) -> AtomicTurnAttempt:
+        self._validate_atomic_coordinate(project, label="project")
+        self._validate_atomic_coordinate(session_id, label="session ID")
+        self._validate_atomic_coordinate(turn_key, label="key")
+        if not _HEX_SHA256.fullmatch(source_payload_sha256):
+            raise StateConflictError("atomic turn source certificate is malformed")
+        existing = self.get_atomic_turn(project, session_id, turn_key)
+        if existing is not None:
+            if existing.source_payload_sha256 != source_payload_sha256:
+                if existing.status != "committed":
+                    self.mark_atomic_turn_conflict(
+                        existing,
+                        error_code="source_certificate_changed",
+                    )
+                raise StateConflictError("atomic turn source certificate changed")
+            return existing
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute(
+                """
+                INSERT INTO atomic_turn_attempts (
+                    project, session_id, turn_key, source_payload_sha256,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'planned', ?, ?)
+                """,
+                (project, session_id, turn_key, source_payload_sha256, now, now),
+            )
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        created = self.get_atomic_turn(project, session_id, turn_key)
+        assert created is not None
+        return created
+
+    def record_atomic_turn_prepared(
+        self,
+        attempt: AtomicTurnAttempt,
+        *,
+        wire_sha256: str,
+        logical_key: str,
+        capability_version: str,
+        reference_count: int,
+        span_count: int,
+    ) -> AtomicTurnAttempt:
+        if (
+            not _HEX_SHA256.fullmatch(wire_sha256)
+            or not _HEX_SHA256.fullmatch(logical_key)
+            or not capability_version
+            or len(capability_version) > 128
+            or any(ord(character) < 0x20 for character in capability_version)
+            or type(reference_count) is not int
+            or reference_count < 0
+            or type(span_count) is not int
+            or span_count <= 0
+        ):
+            raise StateConflictError("atomic turn prepared certificate is malformed")
+        current = self.get_atomic_turn(attempt.project, attempt.session_id, attempt.turn_key)
+        if current is None or current.source_payload_sha256 != attempt.source_payload_sha256:
+            raise StateConflictError("atomic turn changed before preparation")
+        expected = (
+            wire_sha256,
+            logical_key,
+            capability_version,
+            reference_count,
+            span_count,
+        )
+        actual = (
+            current.wire_sha256,
+            current.logical_key,
+            current.capability_version,
+            current.reference_count,
+            current.span_count,
+        )
+        if current.wire_sha256:
+            if actual != expected:
+                if current.status not in {"committed", "rejected", "conflict"}:
+                    self.mark_atomic_turn_conflict(
+                        current,
+                        error_code="prepared_certificate_changed",
+                    )
+                raise StateConflictError("atomic turn prepared certificate changed")
+            return current
+        if current.status != "planned" or current.revision != attempt.revision:
+            raise StateConflictError("atomic turn is not in its planned state")
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute(
+                """
+                INSERT INTO atomic_turn_certificates (
+                    project, session_id, turn_key, wire_sha256, logical_key,
+                    capability_version, reference_count, span_count, prepared_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt.project,
+                    attempt.session_id,
+                    attempt.turn_key,
+                    wire_sha256,
+                    logical_key,
+                    capability_version,
+                    reference_count,
+                    span_count,
+                    now,
+                ),
+            )
+            cursor = self._db.execute(
+                """
+                UPDATE atomic_turn_attempts
+                SET status = 'prepared', error_code = '', updated_at = ?,
+                    revision = revision + 1
+                WHERE project = ? AND session_id = ? AND turn_key = ?
+                  AND status = 'planned' AND revision = ?
+                """,
+                (
+                    now,
+                    attempt.project,
+                    attempt.session_id,
+                    attempt.turn_key,
+                    attempt.revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflictError("atomic turn changed during preparation")
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        prepared = self.get_atomic_turn(attempt.project, attempt.session_id, attempt.turn_key)
+        assert prepared is not None
+        return prepared
+
+    def begin_atomic_turn_submit(self, attempt: AtomicTurnAttempt) -> AtomicTurnAttempt:
+        if attempt.status not in {"prepared", "uncertain"}:
+            raise StateConflictError(
+                "atomic turn must be prepared or proven absent before submission"
+            )
+        return self._transition_atomic_turn(
+            attempt,
+            from_status=attempt.status,
+            to_status="submitting",
+            error_code="",
+        )
+
+    def mark_atomic_turn_uncertain(
+        self,
+        attempt: AtomicTurnAttempt,
+        *,
+        error_code: str = "transport_uncertain",
+    ) -> AtomicTurnAttempt:
+        return self._transition_atomic_turn(
+            attempt,
+            from_status="submitting",
+            to_status="uncertain",
+            error_code=self._validate_atomic_error_code(error_code),
+        )
+
+    def mark_atomic_turn_rejected(
+        self,
+        attempt: AtomicTurnAttempt,
+        *,
+        error_code: str = "remote_rejected",
+    ) -> AtomicTurnAttempt:
+        if attempt.status not in {"prepared", "submitting", "uncertain"}:
+            raise StateConflictError("atomic turn cannot be rejected from its current state")
+        return self._transition_atomic_turn(
+            attempt,
+            from_status=attempt.status,
+            to_status="rejected",
+            error_code=self._validate_atomic_error_code(error_code),
+        )
+
+    def mark_atomic_turn_conflict(
+        self,
+        attempt: AtomicTurnAttempt,
+        *,
+        error_code: str = "evidence_conflict",
+    ) -> AtomicTurnAttempt:
+        if attempt.status not in {
+            "planned",
+            "prepared",
+            "submitting",
+            "uncertain",
+            "acknowledged",
+        }:
+            raise StateConflictError("atomic turn conflict cannot replace a terminal state")
+        return self._transition_atomic_turn(
+            attempt,
+            from_status=attempt.status,
+            to_status="conflict",
+            error_code=self._validate_atomic_error_code(error_code),
+        )
+
+    def _transition_atomic_turn(
+        self,
+        attempt: AtomicTurnAttempt,
+        *,
+        from_status: str,
+        to_status: str,
+        error_code: str,
+    ) -> AtomicTurnAttempt:
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            cursor = self._db.execute(
+                """
+                UPDATE atomic_turn_attempts
+                SET status = ?, error_code = ?, updated_at = ?, revision = revision + 1
+                WHERE project = ? AND session_id = ? AND turn_key = ?
+                  AND status = ? AND revision = ? AND source_payload_sha256 = ?
+                """,
+                (
+                    to_status,
+                    error_code,
+                    now,
+                    attempt.project,
+                    attempt.session_id,
+                    attempt.turn_key,
+                    from_status,
+                    attempt.revision,
+                    attempt.source_payload_sha256,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflictError("atomic turn lifecycle changed unexpectedly")
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        updated = self.get_atomic_turn(attempt.project, attempt.session_id, attempt.turn_key)
+        assert updated is not None
+        return updated
+
+    @staticmethod
+    def _validate_atomic_returned_ids(values: list[str], *, label: str) -> tuple[str, ...]:
+        if (
+            not values
+            or len(values) > 10_000
+            or len(values) != len(set(values))
+            or any(_ATOMIC_EVIDENCE_ID.fullmatch(value) is None for value in values)
+        ):
+            raise StateConflictError(f"atomic turn {label} are malformed")
+        return tuple(values)
+
+    def record_atomic_turn_acknowledged(
+        self,
+        attempt: AtomicTurnAttempt,
+        *,
+        commit_id: str,
+        trace_ids: list[str],
+        root_span_ids: list[str],
+    ) -> AtomicTurnAttempt:
+        if _ATOMIC_EVIDENCE_ID.fullmatch(commit_id) is None:
+            raise StateConflictError("atomic turn commit ID is malformed")
+        traces = self._validate_atomic_returned_ids(trace_ids, label="trace IDs")
+        roots = self._validate_atomic_returned_ids(root_span_ids, label="root span IDs")
+        current = self.get_atomic_turn(attempt.project, attempt.session_id, attempt.turn_key)
+        if current is None:
+            raise StateConflictError("atomic turn disappeared before acknowledgement")
+        expected = (commit_id, traces, roots)
+        actual = (current.commit_id, current.trace_ids, current.root_span_ids)
+        if current.commit_id:
+            if actual != expected:
+                if current.status == "acknowledged":
+                    self.mark_atomic_turn_conflict(
+                        current,
+                        error_code="returned_evidence_changed",
+                    )
+                raise StateConflictError("atomic returned evidence changed")
+            return current
+        if (
+            current.status not in {"submitting", "uncertain"}
+            or current.revision != attempt.revision
+        ):
+            raise StateConflictError("atomic turn is not awaiting acknowledgement")
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute(
+                """
+                INSERT INTO atomic_turn_receipts (
+                    project, session_id, turn_key, commit_id,
+                    trace_ids_json, root_span_ids_json, acknowledged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt.project,
+                    attempt.session_id,
+                    attempt.turn_key,
+                    commit_id,
+                    json.dumps(traces, separators=(",", ":")),
+                    json.dumps(roots, separators=(",", ":")),
+                    now,
+                ),
+            )
+            cursor = self._db.execute(
+                """
+                UPDATE atomic_turn_attempts
+                SET status = 'acknowledged', error_code = '', updated_at = ?,
+                    revision = revision + 1
+                WHERE project = ? AND session_id = ? AND turn_key = ?
+                  AND status = ? AND revision = ?
+                """,
+                (
+                    now,
+                    attempt.project,
+                    attempt.session_id,
+                    attempt.turn_key,
+                    attempt.status,
+                    attempt.revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflictError("atomic turn changed during acknowledgement")
+            self._after_write()
+        except Exception:
+            self._db.rollback()
+            raise
+        acknowledged = self.get_atomic_turn(
+            attempt.project,
+            attempt.session_id,
+            attempt.turn_key,
+        )
+        assert acknowledged is not None
+        return acknowledged
+
+    def commit_atomic_turn(self, attempt: AtomicTurnAttempt) -> AtomicTurnAttempt:
+        if (
+            attempt.status != "acknowledged"
+            or not attempt.commit_id
+            or not attempt.trace_ids
+            or not attempt.root_span_ids
+        ):
+            raise StateConflictError(
+                "atomic turn requires acknowledged server and UI evidence before commit"
+            )
+        return self._transition_atomic_turn(
+            attempt,
+            from_status="acknowledged",
+            to_status="committed",
+            error_code="",
+        )

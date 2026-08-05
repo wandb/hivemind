@@ -4,11 +4,32 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from . import __version__
-from .errors import ImporterError
+from .backfill import (
+    BackfillApplyConfig,
+    BackfillPreviewConfig,
+    apply_backfill,
+    preview_backfill,
+    resolve_backfill_window,
+)
+from .errors import BackfillError, ImporterError
 from .importer import ImportConfig, run_import
+from .scheduled_sync import (
+    ScheduledSyncError,
+    SyncConfig,
+    SyncPaths,
+    configure_scheduled_sync,
+    inspect_scheduled_sync,
+    install_scheduled_sync,
+    load_sync_config,
+    reconcile_scheduled_sync,
+    run_sync_once_from_file,
+    set_project_keychain_secret,
+)
+from .utils import isoformat_z
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -20,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     import_parser = subparsers.add_parser(
         "import",
-        help="import sessions active within the latest N days",
+        help="legacy discovery/mapping diagnostics (live writes disabled)",
     )
     import_parser.add_argument("--days", type=int, required=True, help="activity window (1-365)")
     import_parser.add_argument(
@@ -51,29 +72,346 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ENTITY/PROJECT",
         help="required for live import and must exactly match --project",
     )
+    backfill_parser = subparsers.add_parser(
+        "backfill",
+        help="preview or apply a sealed date-based micro-cohort plan",
+    )
+    backfill_parser.add_argument(
+        "--project",
+        default="",
+        help="explicit destination for preview; optional on apply when --confirm-project is set",
+    )
+    backfill_parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="save a content-free plan without uploading",
+    )
+    backfill_parser.add_argument(
+        "--plan",
+        dest="plan_id",
+        default="",
+        help="apply an exact previously previewed plan by its printed alias or full ID",
+    )
+    backfill_parser.add_argument(
+        "--plan-id",
+        dest="plan_id",
+        help=argparse.SUPPRESS,
+    )
+    backfill_parser.add_argument(
+        "--since",
+        help="inclusive ISO date or offset timestamp; mutually exclusive with --days",
+    )
+    backfill_parser.add_argument(
+        "--until",
+        help="exclusive ISO date or offset timestamp (default: captured current UTC time)",
+    )
+    backfill_parser.add_argument(
+        "--days",
+        type=int,
+        help="deprecated calendar/UTC-day alias for --since (1-365)",
+    )
+    backfill_parser.add_argument(
+        "--timezone",
+        default=None,
+        help="IANA timezone for date-only bounds (default: detected machine-local zone)",
+    )
+    backfill_parser.add_argument(
+        "--canary",
+        action="store_true",
+        help="seal the first conservative whole-session canary instead of the full backlog",
+    )
+    backfill_parser.add_argument(
+        "--agent",
+        action="append",
+        default=[],
+        metavar="AGENT",
+        help="exact source agent filter; repeat to match any listed agent",
+    )
+    backfill_parser.add_argument(
+        "--repo",
+        action="append",
+        default=[],
+        metavar="REPOSITORY",
+        help="exact source repository filter; repeat to match any listed repository",
+    )
+    backfill_parser.add_argument(
+        "--session-id",
+        action="append",
+        default=[],
+        metavar="SESSION_ID",
+        help="exact source session filter; repeat to select multiple sessions",
+    )
+    backfill_parser.add_argument(
+        "--exclude-subagents",
+        action="store_true",
+        help="exclude sessions that have a parent HiveMind session",
+    )
+    backfill_parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=None,
+        help="maximum ordered plan sessions to apply this invocation (default: 1)",
+    )
+    backfill_parser.add_argument(
+        "--state-path",
+        type=Path,
+        default=Path("~/.hivemind/weave-importer/state.sqlite3"),
+        help="private SQLite plan/import state path (default: %(default)s)",
+    )
+    backfill_parser.add_argument(
+        "--confirm-project",
+        default="",
+        metavar="ENTITY/PROJECT",
+        help="required for apply and must exactly match --project",
+    )
+
+    auth_parser = subparsers.add_parser("auth", help="manage scheduler authentication")
+    auth_subparsers = auth_parser.add_subparsers(dest="auth_backend", required=True)
+    keychain_parser = auth_subparsers.add_parser(
+        "keychain", help="manage the project-scoped macOS Keychain item"
+    )
+    keychain_subparsers = keychain_parser.add_subparsers(dest="keychain_command", required=True)
+    keychain_set = keychain_subparsers.add_parser("set", help="interactively store the W&B API key")
+    keychain_set.add_argument("--project", required=True)
+
+    default_sync_paths = SyncPaths.defaults()
+    sync_parser = subparsers.add_parser("sync", help="configure and run incremental sync")
+    sync_subparsers = sync_parser.add_subparsers(dest="sync_command", required=True)
+    sync_configure = sync_subparsers.add_parser(
+        "configure", help="save a secret-free incremental discovery policy"
+    )
+    sync_configure.add_argument("--since", required=True, help="inclusive date or timestamp")
+    sync_configure.add_argument("--project", required=True)
+    sync_configure.add_argument("--settle-minutes", type=int, default=60)
+    sync_configure.add_argument("--timezone", default=None)
+    sync_configure.add_argument(
+        "--state-path",
+        type=Path,
+        default=Path("~/.hivemind/weave-importer/state.sqlite3"),
+    )
+    sync_configure.add_argument("--agent", action="append", default=[])
+    sync_configure.add_argument("--repo", action="append", default=[])
+    sync_configure.add_argument("--session-id", action="append", default=[])
+    sync_configure.add_argument("--exclude-subagents", action="store_true")
+    sync_configure.add_argument(
+        "--config",
+        type=Path,
+        default=default_sync_paths.config_path,
+        help=argparse.SUPPRESS,
+    )
+
+    sync_once = sync_subparsers.add_parser("once", help="run one bounded sync cycle")
+    sync_once.add_argument(
+        "--config",
+        type=Path,
+        default=default_sync_paths.config_path,
+        help=argparse.SUPPRESS,
+    )
+    sync_install = sync_subparsers.add_parser(
+        "install", help="install or update the macOS LaunchAgent"
+    )
+    sync_install.add_argument("--every-minutes", type=int, default=15)
+    sync_install.add_argument(
+        "--config",
+        type=Path,
+        default=default_sync_paths.config_path,
+        help=argparse.SUPPRESS,
+    )
+    sync_status = sync_subparsers.add_parser("status", help="show content-free sync status")
+    sync_status.add_argument(
+        "--config",
+        type=Path,
+        default=default_sync_paths.config_path,
+        help=argparse.SUPPRESS,
+    )
+
+    reconcile_parser = subparsers.add_parser(
+        "reconcile", help="clear attention only from committed private turn evidence"
+    )
+    reconcile_parser.add_argument(
+        "--config",
+        type=Path,
+        default=default_sync_paths.config_path,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command != "import":
-        parser.error("a command is required")
     try:
-        config = ImportConfig(
-            days=args.days,
-            project=args.project,
-            idle_minutes=args.idle_minutes,
-            state_path=args.state_path,
-            dry_run=args.dry_run,
-            confirm_project=args.confirm_project,
-        )
-        config.validate()
-        mode = "dry run" if config.dry_run else "live import"
-        print(f"Weave destination ({mode}): {config.project}", flush=True)
-        report = run_import(config)
+        if args.command == "import":
+            config = ImportConfig(
+                days=args.days,
+                project=args.project,
+                idle_minutes=args.idle_minutes,
+                state_path=args.state_path,
+                dry_run=args.dry_run,
+                confirm_project=args.confirm_project,
+            )
+            config.validate()
+            if not config.dry_run:
+                raise ValueError(
+                    "legacy live import is disabled; use backfill --preview and a sealed "
+                    "--plan cohort"
+                )
+            mode = "dry run" if config.dry_run else "live import"
+            print(f"Weave destination ({mode}): {config.project}", flush=True)
+            report = run_import(config)
+            rendered = report.render(dry_run=args.dry_run)
+        elif args.command == "backfill":
+            if args.preview == bool(args.plan_id):
+                raise ValueError("backfill requires exactly one of --preview or --plan")
+            if args.preview:
+                if not args.project:
+                    raise ValueError("backfill preview requires --project")
+                if args.max_sessions is not None or args.confirm_project:
+                    raise ValueError(
+                        "backfill preview does not accept apply-only --max-sessions or "
+                        "--confirm-project"
+                    )
+                ImportConfig(days=1, project=args.project, dry_run=True).validate()
+                if args.days is not None:
+                    print(
+                        "Warning: backfill --days is deprecated; use --since instead.",
+                        file=sys.stderr,
+                    )
+                print(f"Weave destination (backfill preview): {args.project}", flush=True)
+                report = preview_backfill(
+                    BackfillPreviewConfig(
+                        project=args.project,
+                        state_path=args.state_path,
+                        since=args.since,
+                        until=args.until,
+                        days=args.days,
+                        timezone_name=args.timezone,
+                        canary=args.canary,
+                        agents=tuple(args.agent),
+                        repositories=tuple(args.repo),
+                        session_ids=tuple(args.session_id),
+                        exclude_subagents=args.exclude_subagents,
+                    )
+                )
+            else:
+                if args.since is not None or args.until is not None or args.days is not None:
+                    raise ValueError("--plan apply cannot override the sealed date window")
+                if args.timezone is not None:
+                    raise ValueError("--plan apply cannot override the sealed timezone")
+                if args.canary:
+                    raise ValueError("--canary is a preview-time membership selector")
+                if args.agent or args.repo or args.session_id or args.exclude_subagents:
+                    raise ValueError("--plan apply cannot override the sealed exact filters")
+                project = args.project or args.confirm_project
+                if not project:
+                    raise ValueError("backfill apply requires --confirm-project")
+                if args.project and args.project != args.confirm_project:
+                    raise ValueError("--project and --confirm-project must exactly match")
+                ImportConfig(days=1, project=project, dry_run=True).validate()
+                print(f"Weave destination (backfill apply): {project}", flush=True)
+                report = apply_backfill(
+                    BackfillApplyConfig(
+                        project=project,
+                        confirm_project=args.confirm_project,
+                        plan_id=args.plan_id,
+                        state_path=args.state_path,
+                        max_sessions=args.max_sessions if args.max_sessions is not None else 1,
+                    )
+                )
+            rendered = report.render()
+        elif args.command == "auth":
+            if args.auth_backend != "keychain" or args.keychain_command != "set":
+                parser.error("an auth keychain command is required")
+            set_project_keychain_secret(args.project)
+            print(f"Keychain credential stored for project: {args.project}")
+            return 0
+        elif args.command == "sync":
+            default_paths = SyncPaths.defaults()
+            paths = replace(default_paths, config_path=args.config.expanduser())
+            if args.sync_command == "configure":
+                window = resolve_backfill_window(
+                    since=args.since,
+                    until=None,
+                    days=None,
+                    timezone_name=args.timezone,
+                )
+                config = SyncConfig(
+                    project=args.project,
+                    since=isoformat_z(window.since_utc),
+                    timezone=window.timezone_name,
+                    state_path=args.state_path,
+                    settle_minutes=args.settle_minutes,
+                    agents=tuple(args.agent),
+                    repositories=tuple(args.repo),
+                    session_ids=tuple(args.session_id),
+                    include_subagents=not args.exclude_subagents,
+                )
+                configure_scheduled_sync(config, paths=paths)
+                print(f"Incremental sync configured for project: {config.project}")
+                return 0
+            if args.sync_command == "once":
+                config = load_sync_config(paths.config_path)
+                print(f"Weave destination (incremental sync): {config.project}", flush=True)
+                outcome = run_sync_once_from_file(paths.config_path, paths=paths)
+                status = outcome.status
+                if status is not None:
+                    print(
+                        f"Sync {status.state}: queued={status.eligible} "
+                        f"deferred={status.deferred} imported={status.imported} "
+                        f"attention={'yes' if status.requires_attention else 'no'}"
+                    )
+                return outcome.exit_code
+            if args.sync_command == "install":
+                if not 5 <= args.every_minutes <= 1_440:
+                    raise ValueError("--every-minutes must be between 5 and 1440")
+                config = replace(
+                    load_sync_config(paths.config_path),
+                    interval_seconds=args.every_minutes * 60,
+                )
+                inspection = install_scheduled_sync(config, paths=paths)
+                print(
+                    f"Incremental sync installed: every {args.every_minutes} minutes; "
+                    f"loaded={'yes' if inspection.loaded else 'no'}"
+                )
+                return 0
+            if args.sync_command == "status":
+                config = load_sync_config(paths.config_path)
+                inspection = inspect_scheduled_sync(paths=paths)
+                print(f"Sync project: {config.project}")
+                print(f"  state: {inspection.status.state}")
+                print(f"  attention: {'yes' if inspection.status.requires_attention else 'no'}")
+                print(f"  queued sessions: {inspection.queued_sessions}")
+                print(f"  deferred sessions: {inspection.deferred_sessions}")
+                print(f"  preflighted turns: {inspection.preflighted_turns}")
+                print(f"  committed turns: {inspection.committed_turns}")
+                print(f"  blocked items: {inspection.blocked_items}")
+                print(f"  uncertain turns: {inspection.uncertain_turns}")
+                print(f"  conflicted turns: {inspection.conflicted_turns}")
+                print(f"  successful watermark: {inspection.successful_scan_watermark or '-'}")
+                print(f"  next invocation: {inspection.next_scheduled_at or '-'}")
+                print(f"  installed: {'yes' if inspection.installed else 'no'}")
+                print(f"  loaded: {'yes' if inspection.loaded else 'no'}")
+                print(f"  keychain available: {'yes' if inspection.keychain_available else 'no'}")
+                return 0
+            parser.error("a sync command is required")
+        elif args.command == "reconcile":
+            default_paths = SyncPaths.defaults()
+            paths = replace(default_paths, config_path=args.config.expanduser())
+            config = load_sync_config(paths.config_path)
+            status = reconcile_scheduled_sync(config, paths=paths)
+            print(
+                "Sync reconciliation complete: "
+                f"attention={'yes' if status.requires_attention else 'no'}"
+            )
+            return 0
+        else:  # pragma: no cover - guarded by argparse's required subparser.
+            parser.error("a command is required")
     except (ImporterError, ValueError) as error:
-        print(f"Import failed: {error}", file=sys.stderr)
+        if isinstance(error, (ValueError, BackfillError, ScheduledSyncError)):
+            message = str(error)
+        else:
+            message = "private failure details were withheld; inspect the private state/status"
+        print(f"Import failed: {message}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print(
@@ -82,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 130
-    print(report.render(dry_run=args.dry_run))
+    print(rendered)
     return 0 if report.ok else 1
 
 

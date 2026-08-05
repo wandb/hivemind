@@ -222,10 +222,7 @@ def _pinned_weave_environment(
         "WANDB_BASE_URL": wandb_base_url,
         "WANDB_ERROR_REPORTING": "false",
     }
-    originals = {
-        key: (key in os.environ, os.environ.get(key))
-        for key in pinned
-    }
+    originals = {key: (key in os.environ, os.environ.get(key)) for key in pinned}
     os.environ.update(pinned)
     try:
         yield
@@ -243,6 +240,11 @@ class LogOutcome:
     trace_ids: list[str]
     root_span_ids: list[str]
     span_count: int
+    logical_key: str = ""
+    wire_sha256: str = ""
+    commit_id: str = ""
+    reference_count: int = 0
+    capability_version: str = ""
 
 
 def expected_turn_span_count(turn: MappedTurn) -> int:
@@ -295,10 +297,13 @@ class WeaveSink:
                     "the package's locked dependencies under Python 3.11 or 3.12"
                 ) from error
         try:
-            with _pinned_weave_environment(
-                self.trace_server_url,
-                self.wandb_base_url,
-            ), _bounded_otel_export_batch():
+            with (
+                _pinned_weave_environment(
+                    self.trace_server_url,
+                    self.wandb_base_url,
+                ),
+                _bounded_otel_export_batch(),
+            ):
                 if self.weave is None:
                     self.weave = importlib.import_module("weave")
                 if self.conversation_types is None:

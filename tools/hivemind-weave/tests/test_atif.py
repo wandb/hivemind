@@ -744,7 +744,7 @@ def test_duplicate_deterministic_turn_keys_are_rejected_before_upload(
         map_atif(Session.from_api(session_payload()), atif_wrapper(steps=steps))
 
 
-def test_non_numeric_step_ids_are_hashed_in_searchable_turn_keys(
+def test_non_numeric_step_ids_use_position_without_a_hash_or_raw_value(
     session_payload: Callable[..., dict[str, Any]],
     atif_wrapper: Callable[..., dict[str, Any]],
 ) -> None:
@@ -753,11 +753,11 @@ def test_non_numeric_step_ids_are_hashed_in_searchable_turn_keys(
         {"step_id": "agent", "source": "agent", "message": "world"},
     ]
     turn = map_atif(Session.from_api(session_payload()), atif_wrapper(steps=steps)).turns[0]
-    assert turn.key.startswith("atif:step:sha256:")
+    assert turn.key == "atif:step:index:0"
     assert "Alice" not in turn.key
 
 
-def test_redaction_sensitive_numeric_step_ids_are_hashed_in_turn_keys(
+def test_redaction_sensitive_numeric_step_ids_use_position_in_turn_keys(
     session_payload: Callable[..., dict[str, Any]],
     atif_wrapper: Callable[..., dict[str, Any]],
 ) -> None:
@@ -769,7 +769,7 @@ def test_redaction_sensitive_numeric_step_ids_are_hashed_in_turn_keys(
 
     turn = map_atif(Session.from_api(session_payload()), atif_wrapper(steps=steps)).turns[0]
 
-    assert turn.key.startswith("atif:step:sha256:")
+    assert turn.key == "atif:step:index:0"
     assert card_number not in turn.key
     assert redact_string(turn.key) == turn.key
 

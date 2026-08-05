@@ -29,5 +29,17 @@ class WeaveImportError(ImporterError):
     """The Weave SDK rejected or did not emit a turn."""
 
 
+class HistoricalTurnConflictError(WeaveImportError):
+    """A historical logical key already names different immutable content."""
+
+
+class HistoricalTurnUncertainError(WeaveImportError):
+    """A historical submission requires exact status reconciliation."""
+
+
 class VerificationError(ImporterError):
     """Weave did not make an emitted turn durably visible."""
+
+
+class BackfillError(ImporterError):
+    """A sealed backfill plan could not be created or applied safely."""

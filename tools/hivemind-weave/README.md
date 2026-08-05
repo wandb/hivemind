@@ -1,190 +1,292 @@
-# HiveMind → Weave Agents importer
+# HiveMind → Weave Agents sync
 
-> **Security status:** this is a review prototype. The attempted 45-day live
-> backfill is incomplete, and live recovery is paused. Large turns now fail
-> before `weave.log_turn`; the prototype does not encode content to bypass normal
-> Weave inspection and does not include a manual partial-trace repair tool.
+`hivemind-weave` is a review implementation of a lossless, incremental importer
+for the authenticated user's HiveMind chats. It discovers through the installed
+HiveMind CLI, maps ATIF 1.x transcripts, redacts before serialization, seals
+small immutable plans in private SQLite state, and submits one atomic historical
+turn at a time.
 
-`hivemind-weave` maps recent HiveMind coding-agent sessions into Weave Agents.
-It reads only through the installed, authenticated HiveMind CLI and keeps a local
-SQLite journal for idempotency and crash reconciliation.
+> **Rollout status:** live backfill is intentionally blocked. The companion
+> Weave change proves the SDK shape, validation, recovery, and a local SQLite
+> compare-and-set, but the hosted service does not yet provide the required
+> protobuf/gzip transport, immutable text references, authenticated route,
+> strongly consistent commit store, or Agents-query integration. The importer
+> rejects the prototype capability values, so it cannot silently fall back to
+> `weave.log_turn` or OTLP.
 
-## Read this before a live import
+No command in this version opens, sources, copies, or prints a `.env` file. The
+abandoned 45-day upload remains paused, and this implementation does not repair
+or mutate its old partial traces.
 
-A live import creates another copy of conversation data outside HiveMind. That
-copy can include prompts, reasoning, source code, filenames, tool arguments and
-results, and third-party data. Credential-pattern scrubbing and Presidio are
-defense in depth, not a proof that every confidential value has been removed.
+## Destinations
 
-Before uploading anything:
+The rollout uses separate private projects:
 
-1. confirm that you are authorized to copy every selected session;
-2. review the destination project's members, visibility, retention, and data
-   governance settings;
-3. run `--dry-run` first, while remembering that it validates mapping,
-   redaction, and size limits but cannot prove that every sensitive value was
-   detected; and
-4. use a new private project for evaluation, not a broadly shared default.
+- `wandb/hivemind-chats-canary` — disposable synthetic and one-session checks;
+- `wandb/hivemind-chats-v2` — final backfill and incremental sync, only after
+  the atomic service is deployed; and
+- `wandb/hivemind-chats` — the old experiment and journal, retained read-only.
 
-The CLI therefore requires an explicit `--project`. A live run also requires
-`--confirm-project` with the exact same value. There is no default destination.
-
-## Security boundaries
-
-- HiveMind authentication stays inside `hivemind login`. The importer neither
-  reads credential files nor accepts `HIVEMIND_TOKEN`.
-- The HiveMind child process receives a small environment allowlist instead of
-  ambient API keys, tokens, loader settings, or unrelated application secrets.
-- Mapping keys and values are scrubbed before upload. Session IDs and destination
-  slugs must use bounded ASCII grammars so they cannot inject terminal controls.
-- Live imports currently support only the hosted W&B API and Weave trace
-  endpoints. Both are resolved, validated, pinned during SDK initialization,
-  and recorded in the run manifest. Redirects are refused.
-- Ambient OpenTelemetry providers, endpoints, headers, samplers, resource
-  attributes, TLS overrides, proxies, and SDK debug logging are rejected. The
-  created exporter must retain the exact HTTPS endpoint and system certificate
-  verification before any turn can be logged.
-- Weave error telemetry and its third-party package-version request are
-  disabled. Local response caching, dropped-item files, WAL persistence,
-  code/system capture, unsafe object decoding, and implicit integration
-  patching are also disabled and checked after initialization.
-- The exporter batch ceiling is four spans. A larger ambient override is fatal.
-- Content-bearing fields, root attributes, aggregate turn bytes, and span counts
-  have conservative preflight limits. Oversized turns fail before the SDK call;
-  content is never silently truncated or moved into opaque base64 fragments.
-- The state directory and files must already have private ownership and modes.
-  Existing paths are validated and never chmodded by the importer.
-
-The journal intentionally contains no transcript bodies or API keys, but it does
-contain sensitive session IDs, source timestamps, hashes, trace IDs, project
-names, and statuses. Protect and retain it: deleting or changing the state path
-after an interrupted run can remove evidence needed to avoid duplicates.
+Every preview and apply requires an explicit project. Every apply additionally
+requires `--confirm-project`, and the CLI prints that destination before work
+starts. Verify project membership, visibility, retention, region, integrations,
+and deletion policy before copying any real conversation.
 
 ## Requirements
 
-- Python 3.11 or 3.12.
-- `uv` and the locked dependencies in this directory.
-- HiveMind installed and authenticated with session-read access.
-- `WANDB_API_KEY` injected into the live command's environment by a trusted
-  secret manager, CI secret store, or equivalent mechanism.
+- Python 3.11 or 3.12;
+- the locked dependencies in this directory;
+- an installed HiveMind CLI authenticated with `hivemind login`; and
+- for an eventual manual apply, `WANDB_API_KEY` supplied by the process
+  environment or a trusted secret manager.
 
-Do not put the key inline in shell history, and do not `source` an arbitrary
-`.env`: sourcing executes shell code and can export unrelated secrets. The
-importer never opens or sources `.env` files.
+HiveMind credentials remain inside the HiveMind CLI. Scheduled W&B credentials
+are entered through a hidden macOS Keychain prompt. Secrets do not belong in
+shell arguments, config files, plists, reports, or SQLite.
 
 ```bash
 hivemind login
 hivemind whoami
-uv sync --python 3.12 --offline --locked
+# First bootstrap requires package-index access for the locked runtime and
+# Hatchling/editables build requirements. Later runs can be fully offline.
+uv sync --python 3.12 --locked
+uv run --offline --locked hivemind-weave --version
 ```
 
-## Usage
+## Test one session first
 
-Start with a non-uploading mapping/redaction pass. Dry-run reads HiveMind but
-performs no Weave or SQLite writes and does not print transcript content.
+An exact session filter is the most understandable first test. Preview performs
+discovery, transcript mapping, redaction, reference planning, and exact wire
+preparation, but does not upload content. It stores only content-free
+certificates and prints aliases, counts, and size distributions.
 
 ```bash
-uv run --offline --locked hivemind-weave import \
-  --days 7 \
-  --project your-entity/private-hivemind-review \
-  --dry-run
+uv run --offline --locked hivemind-weave backfill \
+  --preview \
+  --since 2026-06-21 \
+  --until 2026-08-05T12:00:00-04:00 \
+  --session-id SESSION_ID \
+  --project wandb/hivemind-chats-canary
 ```
 
-After separately injecting `WANDB_API_KEY` and reviewing the project access:
+Alternatively, `--canary` chooses the first stable whole session in
+`(last_activity_at, session_id)` order that is at least 24 hours inactive, is
+not a child session, has no mapping/tool-correlation warnings, has at most three
+turns and four physical spans per turn, and fits all advertised wire/reference
+budgets. Limits are never loosened to manufacture a candidate.
 
 ```bash
-uv run --offline --locked hivemind-weave import \
-  --days 7 \
-  --project your-entity/private-hivemind-review \
-  --confirm-project your-entity/private-hivemind-review
+uv run --offline --locked hivemind-weave backfill \
+  --preview \
+  --since 2026-06-21 \
+  --canary \
+  --project wandb/hivemind-chats-canary
 ```
 
-Full interface:
+After the upstream capability is deployed and the private canary project has
+been reviewed, apply the printed plan alias with a one-session execution budget:
+
+```bash
+uv run --offline --locked hivemind-weave backfill \
+  --plan PLAN_ALIAS \
+  --max-sessions 1 \
+  --confirm-project wandb/hivemind-chats-canary
+```
+
+`--max-sessions` never changes plan membership. Remaining whole sessions stay
+queued. Repeating an identical apply emits zero duplicate turns.
+
+## Date-based backfill
 
 ```text
-hivemind-weave import --days N --project ENTITY/PROJECT
-    [--confirm-project ENTITY/PROJECT]
-    [--idle-minutes 10]
-    [--state-path ~/.hivemind/weave-importer/state.sqlite3]
-    [--dry-run]
+hivemind-weave backfill --preview
+    --since DATE|RFC3339
+    [--until DATE|RFC3339]
+    --project ENTITY/PROJECT
+    [--agent NAME ...]
+    [--repo OWNER/REPO ...]
+    [--session-id ID ...]
+    [--exclude-subagents]
+    [--canary]
+    [--state-path PATH]
+
+hivemind-weave backfill
+    --plan PLAN_ALIAS
+    --max-sessions N
+    --confirm-project ENTITY/PROJECT
+    [--state-path PATH]
 ```
 
-`N` must be `1..365`. Sessions are selected when `last_activity_at` falls inside
-the fixed UTC window. Sessions active within the idle grace period, or without a
-reliable activity timestamp, are deferred. The CLI prints the exact destination
-before discovery so a running import is easy to identify.
+Date-only bounds mean midnight in the recorded local IANA timezone. The lower
+bound is inclusive and the upper bound is exclusive. Repeated filters are exact
+matches and subagents are included by default. `--days 1..365` remains a
+deprecated preview alias and cannot be combined with `--since`.
 
-## Mapping
+The planned final rollout is:
 
-- One HiveMind session becomes `hivemind:<session-id>` in Weave.
-- The HiveMind title becomes the conversation name and source agent type becomes
+1. one synthetic canary;
+2. one real `--canary` session and a zero-emission rerun;
+3. final-project cohorts of 1, then 5, then 20 sessions; and
+4. only then the remaining plan and scheduled sync.
+
+For the requested backfill, the final window begins `2026-06-21` and the final
+project is `wandb/hivemind-chats-v2`. Do not run that apply while this README's
+rollout status remains blocked.
+
+## Atomic turn contract
+
+The importer requires these Weave SDK operations:
+
+```python
+prepared = weave.prepare_turn(..., turn_key=...)
+result = weave.upsert_turn(prepared)
+status = weave.get_turn_status(prepared.logical_key)
+```
+
+It also requires capabilities that explicitly promise atomic turn commit,
+durable idempotency, exact status lookup, gzipped protobuf transport, and
+immutable authenticated content references. There is no legacy fallback.
+
+For each session the importer:
+
+1. brackets the transcript with direct session-summary reads;
+2. prepares every turn before the first write;
+3. compares source, wire, logical-key, size, reference, span, schema, and
+   capability certificates with the sealed preview;
+4. submits one root plus all child spans as one server transaction;
+5. resolves transport ambiguity with exact `GET` status evidence; and
+6. records local commit only after the Agents conversation and span views agree.
+
+The logical key excludes content. An identical request replays the same commit;
+changed historical content under the same conversation/turn key conflicts.
+Nothing is truncated, split into opaque fragments, or manually repaired.
+
+Large redacted text is expected to be externalized deterministically by the
+future SDK into immutable, content-addressed references before the exact
+protobuf envelope is certified. The current prototype advertises references as
+unsupported, which is why planning fails closed rather than uploading a smaller
+or lossy substitute.
+
+## Incremental sync on macOS
+
+Do not install the scheduler before the manual canary and final-project
+backfill pass. Configuration, Keychain enrollment, and installation are
+deliberately separate actions:
+
+```bash
+hivemind-weave sync configure \
+  --since 2026-06-21 \
+  --project wandb/hivemind-chats-v2 \
+  --settle-minutes 60
+
+hivemind-weave auth keychain set \
+  --project wandb/hivemind-chats-v2
+
+hivemind-weave sync once
+hivemind-weave sync install --every-minutes 15
+hivemind-weave sync status
+hivemind-weave reconcile
+```
+
+The Keychain command uses `/usr/bin/security` with a value-less final `-w`, so
+the key is entered through a hidden prompt and never placed in argv. The config
+and LaunchAgent contain no credential. The LaunchAgent is not run at load,
+invokes an absolute validated Python executable, inherits no ambient secrets,
+and sends output to `/dev/null`; content-free status is written privately.
+
+Each invocation takes one filesystem/SQLite writer lock, performs stable
+discovery with a 24-hour overlap, explicitly tracks deferred chats, and imports
+at most one settled whole session. Source activity advancement requeues the
+session: identical turns skip, appended turns import, and changed history
+conflicts. A processing, uncertain, blocked, or conflicting attempt pauses all
+later writes while discovery and backlog accounting continue. `reconcile`
+cannot blindly acknowledge a failure; it clears attention only from exact
+atomic commit evidence.
+
+Scheduler-owned files are private:
+
+```text
+~/Library/Application Support/hivemind-weave/       0700
+  sync.json                                          0600
+  status.json                                        0600
+  sync.lock                                          0600
+~/Library/LaunchAgents/
+  com.wandb.hivemind-weave.sync.plist                0600
+```
+
+## Mapping and privacy
+
+- One HiveMind session maps to `hivemind:<internal-session-id>`.
+- The HiveMind title becomes the conversation name; the source agent type is
   the Weave agent name.
-- User steps start turns. Leading system steps become system instructions;
-  following agent/tool/observation steps remain with that user turn.
-- Each agent step becomes an inferred LLM span. Tool calls and observations are
-  correlated by call ID; unmatched data is retained with a warning.
-- Child sessions remain separate conversations with a searchable parent ID.
-- ATIF 1.x is parsed tolerantly; unknown major versions and inconsistent wrapper
-  metadata fail closed.
+- User steps start turns. Leading system steps become system instructions.
+- Agent steps become LLM spans; tool calls and observations correlate by call
+  ID. Unmatched data remains visible with a mapping warning.
+- Child sessions are separate conversations with parent/subagent attributes.
+- ATIF 1.x variants are parsed tolerantly; unknown majors fail at that session.
 
-The mapped root attributes include source session/repository/branch/parent data,
-turn identity and hashes, ATIF/importer versions, activity time, and timestamp
-inference. These ordinary inspected attributes must fit the conservative inline
-budget or the turn is rejected.
+Credential-bearing keys, bearer/API tokens, private-key blocks, and configured
+PII are removed before hashing, staging, or serialization. Non-technical ATIF
+step IDs use stable transcript positions rather than raw or hashed values, so
+they cannot become a guessing oracle. Ordinary remaining
+prompts, reasoning, code, file content, tool arguments/results, model/usage
+metadata, and historical timestamps are preserved. Redaction is defense in
+depth, not proof that every confidential value was detected; authorization and
+destination governance still matter.
 
-## Repeatability and recovery
+Reports never print titles, repositories, raw session IDs, prompts, tools,
+hashes, trace IDs, or service error bodies. SQLite contains no transcript or API
+key, but it does contain sensitive IDs, timestamps, hashes, commit evidence,
+project names, and statuses. Keep its path private and do not delete it while a
+destination project exists.
 
-The default state path is `~/.hivemind/weave-importer/state.sqlite3`. State is
-keyed by destination, source session, and deterministic turn key.
+## State and recovery
 
-- Same key and source hash: skip.
-- New appended turn: import once.
-- Changed historical turn: conflict; do not duplicate.
-- Interrupted pending turn: reconcile by turn key, hashes, timestamps/messages,
-  returned IDs, and exact span count before considering a retry.
-- Partial or ambiguous remote evidence: conflict; never blindly retry.
+The default database is `~/.hivemind/weave-importer/state.sqlite3`. It records
+immutable plan membership, cohorts, scan watermarks, source/wire certificates,
+logical keys, capability versions, reference counts, and the atomic lifecycle:
 
-For each nonempty live run, the importer freezes the cutoff, session worklist,
-activity timestamps, and ordered turn hashes before upload. Source drift during
-certification or upload is a conflict. Sessions are processed one at a time, and
-Weave conversation/chat APIs must show the expected traces before local commit.
+```text
+planned → prepared → submitting → acknowledged → committed
+                                ↘ uncertain / rejected / conflict
+```
 
-## Current limitation and maintainer questions
+An interrupted `submitting` turn is never followed by a later turn. Exact
+status lookup must prove absence before replay or prove the matching immutable
+commit before local completion. Multiple or mismatched evidence is a conflict.
 
-The live experiment established that large non-atomic OTLP delivery can leave a
-partial remote trace when a later request is rejected. The earlier fragment-based
-workaround and one-off recovery harness have been removed. Existing recovery
-evidence remains read-only; no further mutation of those partial traces is
-planned without a supported atomic/idempotent API.
+The legacy `hivemind-weave import --days ...` interface is retained only for
+compatibility and diagnostics; use sealed date-based plans for any future live
+work. It does not bypass the atomic capability gate.
 
-Self-managed W&B/Weave endpoints are intentionally unsupported in this review
-prototype; adding them requires a separate, explicit trust and TLS design.
+## What the upstream Weave PR still needs
 
-Maintainer guidance is requested on:
+The companion Weave prototype intentionally fails closed in hosted adapters.
+Before enabling real data it still needs:
 
-- a stable ATIF transcript export contract;
-- cursor or snapshot-based session pagination;
-- an atomic historical Agent-turn ingestion API with caller idempotency keys;
-- supported compressed and uncompressed request-size limits and byte-aware SDK
-  batching; and
-- standard searchable source-session, parent, repository, branch, timestamp,
-  hash, and importer-version attributes.
+- an authenticated hosted route deriving trusted user/project identity;
+- a linearizable hosted commit ledger and immutable historical-turn writer;
+- protobuf/gzip transport with compressed and decompressed boundary checks;
+- staged immutable text references, authorization, TTL cleanup, and UI expand;
+- unioned Agent cards, conversation, span, and message-search queries;
+- response/status-code semantics, scanner policy/version evidence, retention,
+  deletion tombstones, generated clients, and failure-injection coverage.
+
+ClickHouse query-before-insert, `ReplacingMergeTree`, an in-memory lock, and
+ordinary OTLP ingestion are not acceptable idempotency substitutes.
 
 ## Development
 
 ```bash
 uv run --offline --locked pytest
 uv run --offline --locked ruff check src tests
-uv build --offline
+# The first build needs the Hatchling backend; use --offline after it is cached.
+uv build
 ```
 
-The default pytest configuration excludes live tests. The opt-in smoke test must
-be selected with `-m live` and requires all of:
-
-- `HIVEMIND_WEAVE_LIVE=1`
-- `HIVEMIND_WEAVE_LIVE_SESSION_ID`
-- `HIVEMIND_WEAVE_LIVE_PROJECT`
-- `HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT` exactly equal to that project
-- authenticated HiveMind CLI and `WANDB_API_KEY`
-
-Use a disposable private project and a fresh state path.
+Tests cover date/timezone parsing, exact filters, stable pagination, canary
+selection, byte-identical preview/apply certificates, redaction, ATIF mapping,
+tool correlation, state migrations, cohort budgets, append/conflict behavior,
+atomic recovery, locks, Keychain access, LaunchAgent content, overlap scans, and
+the scheduler circuit breaker. Live tests remain opt-in and must use a fresh
+private canary project and state path.

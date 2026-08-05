@@ -124,10 +124,7 @@ def enforce_weave_error_reporting_disabled() -> None:
         raise VerificationError("Weave error reporting state is unavailable")
     sentry._disabled = True
     sentry.scope = None
-    if (
-        getattr(sentry, "_disabled", None) is not True
-        or getattr(sentry, "scope", 1) is not None
-    ):
+    if getattr(sentry, "_disabled", None) is not True or getattr(sentry, "scope", 1) is not None:
         raise VerificationError("Weave error reporting could not be disabled")
 
 
@@ -168,9 +165,7 @@ def validate_live_transport_environment() -> None:
     insecure = os.environ.get("WEAVE_INSECURE_DISABLE_SSL", "").strip().lower()
     if insecure in {"1", "on", "true", "yes"}:
         raise VerificationError("WEAVE_INSECURE_DISABLE_SSL is forbidden for live imports")
-    configured_overrides = [
-        name for name in _UNSAFE_TRANSPORT_ENV_VARS if name in os.environ
-    ]
+    configured_overrides = [name for name in _UNSAFE_TRANSPORT_ENV_VARS if name in os.environ]
     if configured_overrides:
         raise VerificationError(
             f"{configured_overrides[0]} is forbidden for live imports; "

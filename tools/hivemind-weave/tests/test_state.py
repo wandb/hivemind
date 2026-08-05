@@ -19,6 +19,7 @@ from hivemind_weave.state import (
     ImportRunSession,
     StateRow,
     StateStore,
+    SyncDiscoveryRecord,
 )
 
 PROJECT = "wandb/hivemind-chats"
@@ -775,3 +776,248 @@ def test_future_schema_version_is_rejected(tmp_path: Path) -> None:
     path.chmod(0o600)
     with pytest.raises(StateConflictError, match="newer than"):
         StateStore(path)
+
+
+def test_atomic_turn_journal_guards_full_prepare_submit_get_ui_lifecycle(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with StateStore(path) as state:
+        planned = state.plan_atomic_turn(
+            project=PROJECT,
+            session_id="session-atomic",
+            turn_key="turn-atomic",
+            source_payload_sha256="a" * 64,
+        )
+        prepared = state.record_atomic_turn_prepared(
+            planned,
+            wire_sha256="b" * 64,
+            logical_key="c" * 64,
+            capability_version="historical-turn-v1",
+            reference_count=2,
+            span_count=4,
+        )
+        submitting = state.begin_atomic_turn_submit(prepared)
+        uncertain = state.mark_atomic_turn_uncertain(submitting)
+        resubmitting = state.begin_atomic_turn_submit(uncertain)
+        uncertain = state.mark_atomic_turn_uncertain(resubmitting)
+        acknowledged = state.record_atomic_turn_acknowledged(
+            uncertain,
+            commit_id="commit-1",
+            trace_ids=["trace-1"],
+            root_span_ids=["root-1"],
+        )
+        committed = state.commit_atomic_turn(acknowledged)
+
+        assert planned.status == "planned"
+        assert prepared.status == "prepared"
+        assert submitting.status == "submitting"
+        assert uncertain.status == "uncertain"
+        assert acknowledged.status == "acknowledged"
+        assert committed.status == "committed"
+        assert committed.source_payload_sha256 == "a" * 64
+        assert committed.wire_sha256 == "b" * 64
+        assert committed.logical_key == "c" * 64
+        assert committed.capability_version == "historical-turn-v1"
+        assert committed.reference_count == 2
+        assert committed.span_count == 4
+        assert committed.commit_id == "commit-1"
+        assert committed.trace_ids == ("trace-1",)
+        assert committed.root_span_ids == ("root-1",)
+        assert committed.revision == 7
+        assert state.get_unresolved_atomic_turns(PROJECT) == []
+
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            state.connection.execute(
+                """
+                UPDATE atomic_turn_certificates SET wire_sha256 = ?
+                WHERE project = ? AND session_id = ? AND turn_key = ?
+                """,
+                ("d" * 64, PROJECT, "session-atomic", "turn-atomic"),
+            )
+        state.connection.rollback()
+
+
+def test_atomic_turn_certificate_or_returned_evidence_drift_becomes_conflict(
+    tmp_path: Path,
+) -> None:
+    with StateStore(tmp_path / "state.sqlite3") as state:
+        planned = state.plan_atomic_turn(
+            project=PROJECT,
+            session_id="session-drift",
+            turn_key="turn-drift",
+            source_payload_sha256="a" * 64,
+        )
+        prepared = state.record_atomic_turn_prepared(
+            planned,
+            wire_sha256="b" * 64,
+            logical_key="c" * 64,
+            capability_version="historical-turn-v1",
+            reference_count=0,
+            span_count=2,
+        )
+        with pytest.raises(StateConflictError, match="prepared certificate changed"):
+            state.record_atomic_turn_prepared(
+                prepared,
+                wire_sha256="d" * 64,
+                logical_key="c" * 64,
+                capability_version="historical-turn-v1",
+                reference_count=0,
+                span_count=2,
+            )
+        conflicted = state.get_atomic_turn(PROJECT, "session-drift", "turn-drift")
+        assert conflicted is not None and conflicted.status == "conflict"
+
+        planned_receipt = state.plan_atomic_turn(
+            project=PROJECT,
+            session_id="session-receipt",
+            turn_key="turn-receipt",
+            source_payload_sha256="e" * 64,
+        )
+        prepared_receipt = state.record_atomic_turn_prepared(
+            planned_receipt,
+            wire_sha256="f" * 64,
+            logical_key="1" * 64,
+            capability_version="historical-turn-v1",
+            reference_count=0,
+            span_count=1,
+        )
+        submitting = state.begin_atomic_turn_submit(prepared_receipt)
+        acknowledged = state.record_atomic_turn_acknowledged(
+            submitting,
+            commit_id="commit-stable",
+            trace_ids=["trace-stable"],
+            root_span_ids=["root-stable"],
+        )
+        with pytest.raises(StateConflictError, match="returned evidence changed"):
+            state.record_atomic_turn_acknowledged(
+                acknowledged,
+                commit_id="commit-changed",
+                trace_ids=["trace-stable"],
+                root_span_ids=["root-stable"],
+            )
+        receipt_conflict = state.get_atomic_turn(PROJECT, "session-receipt", "turn-receipt")
+        assert receipt_conflict is not None
+        assert receipt_conflict.status == "conflict"
+        assert receipt_conflict.commit_id == "commit-stable"
+
+
+def test_atomic_turn_invalid_or_stale_transitions_fail_closed(tmp_path: Path) -> None:
+    with StateStore(tmp_path / "state.sqlite3") as state:
+        planned = state.plan_atomic_turn(
+            project=PROJECT,
+            session_id="session-stale",
+            turn_key="turn-stale",
+            source_payload_sha256="a" * 64,
+        )
+        with pytest.raises(StateConflictError, match="prepared or proven absent"):
+            state.begin_atomic_turn_submit(planned)
+        prepared = state.record_atomic_turn_prepared(
+            planned,
+            wire_sha256="b" * 64,
+            logical_key="c" * 64,
+            capability_version="historical-turn-v1",
+            reference_count=0,
+            span_count=1,
+        )
+        with pytest.raises(StateConflictError, match="acknowledged"):
+            state.commit_atomic_turn(prepared)
+        state.begin_atomic_turn_submit(prepared)
+        with pytest.raises(StateConflictError, match="changed unexpectedly"):
+            state.begin_atomic_turn_submit(prepared)
+
+
+def test_deferred_sync_worklist_and_candidate_digest_are_stable(tmp_path: Path) -> None:
+    project = "wandb/sync-ledger"
+    since = datetime(2026, 8, 1, tzinfo=UTC)
+    cutoff = datetime(2026, 8, 5, tzinfo=UTC)
+    records = [
+        SyncDiscoveryRecord(
+            session_id="later-id",
+            started_at=since,
+            last_activity_at=datetime(2026, 8, 4, 12, tzinfo=UTC),
+            activity_known=True,
+            eligible_after=datetime(2026, 8, 7, tzinfo=UTC),
+            status="deferred",
+        ),
+        SyncDiscoveryRecord(
+            session_id="earlier-id",
+            started_at=since,
+            last_activity_at=datetime(2026, 8, 4, 13, tzinfo=UTC),
+            activity_known=True,
+            eligible_after=datetime(2026, 8, 6, tzinfo=UTC),
+            status="deferred",
+        ),
+    ]
+    with StateStore(tmp_path / "state.sqlite3") as state:
+        first = state.record_sync_scan(
+            project=project,
+            config_sha256="a" * 64,
+            since_utc=since,
+            scan_started_at=cutoff,
+            cutoff=cutoff,
+            records=records,
+        )
+        deferred = state.get_deferred_sync_sessions(project)
+        second = state.record_sync_scan(
+            project=project,
+            config_sha256="a" * 64,
+            since_utc=since,
+            scan_started_at=cutoff,
+            cutoff=cutoff,
+            records=list(reversed(records)),
+        )
+
+    assert [item.session_id for item in deferred] == ["earlier-id", "later-id"]
+    assert len(first.candidate_universe_sha256) == 64
+    assert second.candidate_universe_sha256 == first.candidate_universe_sha256
+
+
+def test_schema_v5_migrates_atomically_to_v6_attempt_journal(tmp_path: Path) -> None:
+    path = tmp_path / "v5.sqlite3"
+    connection = sqlite3.connect(path)
+    old_sync_feeds_sql = """
+    CREATE TABLE sync_feeds (
+        project TEXT PRIMARY KEY,
+        config_sha256 TEXT NOT NULL CHECK(length(config_sha256) = 64),
+        since_utc TEXT NOT NULL,
+        successful_scan_watermark TEXT NOT NULL DEFAULT '',
+        last_scan_started_at TEXT NOT NULL DEFAULT '',
+        last_scan_succeeded_at TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """
+    atomic_statements = set(state_module._ATOMIC_TURN_SCHEMA_SQL)
+    for statement in state_module._SCHEMA_SQL:
+        if statement in atomic_statements:
+            continue
+        connection.execute(
+            old_sync_feeds_sql if statement == state_module._SYNC_FEEDS_SQL else statement
+        )
+    connection.execute(f"PRAGMA application_id={DB_APPLICATION_ID}")
+    connection.execute("PRAGMA user_version=5")
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+
+    with StateStore(path) as state:
+        version = state.connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = {
+            str(row["name"])
+            for row in state.connection.execute("PRAGMA table_info(sync_feeds)").fetchall()
+        }
+        tables = {
+            str(row[0])
+            for row in state.connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert version == 6
+    assert "candidate_universe_sha256" in columns
+    assert {
+        "atomic_turn_attempts",
+        "atomic_turn_certificates",
+        "atomic_turn_receipts",
+    } <= tables

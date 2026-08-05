@@ -11,7 +11,8 @@ REDACTED = "[REDACTED]"
 _CAMEL_CASE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _KEY_PART = re.compile(r"[A-Za-z0-9]+")
 _PRIVATE_KEY = re.compile(
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?"
+    r"(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
     re.DOTALL,
 )
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
@@ -30,7 +31,10 @@ _WANDB_KEY_CONTEXT = re.compile(
     r"(?i)(?P<prefix>\b(?:wandb|weights[ -]?and[ -]?biases)(?:[ _-]?api)?[ _-]?key\s*[:=]?\s*)"
     r"(?P<value>[a-f0-9]{40})\b"
 )
-_SECRET_KEY_NAME = r"[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|PASSWD)"
+_SECRET_KEY_NAME = (
+    r"[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|"
+    r"DATABASE_URL|CONNECTION_STRING|DSN)"
+)
 _SECRET_QUOTED_ASSIGNMENT = re.compile(
     # Start only at a key-token boundary. Without this guard the greedy key
     # prefix is retried at every character of a large ordinary string, which
@@ -54,6 +58,10 @@ _CANONICAL_UUID = re.compile(
     r"(?i)(?<![0-9a-f])[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}(?![0-9a-f])"
 )
 _CARD_DIGIT_RUN = re.compile(r"(?<!\d)(?:\d[ -]?){12,}\d(?!\d)")
+_URL_USERINFO = re.compile(
+    r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]{1,31}://)"
+    r"(?P<userinfo>[^\s/@:]+:[^\s/@]+)@"
+)
 
 
 def _redact_card_run(match: re.Match[str]) -> str:
@@ -131,9 +139,15 @@ def _is_sensitive_key(key: str) -> bool:
         "bearertoken",
         "clientsecret",
         "clienttoken",
+        "connectionstring",
         "credential",
         "credentials",
+        "databaseurl",
+        "dburl",
+        "dsn",
         "idtoken",
+        "jdbcurl",
+        "passphrase",
         "password",
         "passwd",
         "privatekey",
@@ -185,6 +199,10 @@ def redact_string(value: str) -> str:
     )
     redacted = _SECRET_BARE_ASSIGNMENT.sub(
         lambda match: f"{match.group('prefix')}{REDACTED}", redacted
+    )
+    redacted = _URL_USERINFO.sub(
+        lambda match: f"{match.group('scheme')}{REDACTED}@",
+        redacted,
     )
     redacted = _EMAIL.sub(REDACTED, redacted)
     redacted = _SSN.sub(REDACTED, redacted)

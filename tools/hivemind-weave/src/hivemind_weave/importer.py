@@ -15,16 +15,19 @@ from typing import Any
 from .atif import map_atif
 from .errors import (
     ATIFSchemaError,
+    HistoricalTurnConflictError,
+    HistoricalTurnUncertainError,
     ImporterError,
     StateConflictError,
     StateStoreError,
     VerificationError,
     WeaveImportError,
 )
+from .historical_sink import HistoricalTurnSink, PreparedOutcome
 from .hivemind import HiveMindClient
 from .models import MappedConversation, MappedTurn, RunReport, Session
 from .pii import configure_weave_pii, sanitize_mapped_conversation
-from .state import ImportRun, ImportRunSession, StateRow, StateStore
+from .state import AtomicTurnAttempt, ImportRun, ImportRunSession, StateRow, StateStore
 from .verify import (
     VerificationExpectation,
     WeaveVerifier,
@@ -34,11 +37,9 @@ from .verify import (
     resolve_wandb_base_url,
     validate_live_transport_environment,
 )
-from .weave_sink import LogOutcome, WeaveSink, expected_turn_span_count
+from .weave_sink import LogOutcome, expected_turn_span_count
 
-_PROJECT = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-)
+_PROJECT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -63,9 +64,7 @@ class ImportConfig:
         if not _PROJECT.fullmatch(self.project):
             raise ValueError("--project must use a bounded ASCII entity/project slug")
         if not self.dry_run and self.confirm_project != self.project:
-            raise ValueError(
-                "live import requires --confirm-project to exactly match --project"
-            )
+            raise ValueError("live import requires --confirm-project to exactly match --project")
         if self.verification_timeout <= 0:
             raise ValueError("verification timeout must be positive")
 
@@ -86,6 +85,7 @@ class _Emitted:
     verification_signature: str
     outcome: LogOutcome
     state_row: StateRow
+    atomic_attempt: AtomicTurnAttempt | None = None
 
 
 def _expected_span_count(turn: MappedTurn, *, recorded_span_count: int = 0) -> int:
@@ -96,9 +96,9 @@ def _expected_span_count(turn: MappedTurn, *, recorded_span_count: int = 0) -> i
 
 
 def _safe_error(error: Exception) -> str:
-    # Domain errors are already constructed without transcript bodies.
-    if isinstance(error, ImporterError):
-        return str(error)[:500]
+    # Exception messages can be populated by service bodies or source metadata.
+    # Persist/report only the bounded type category; console rendering withholds
+    # even these per-item details.
     return error.__class__.__name__
 
 
@@ -106,11 +106,13 @@ def _record_error_best_effort(
     state: StateStore,
     *,
     row: StateRow,
-    error: str,
+    error_code: str,
 ) -> None:
-    """Journal an error without masking the failure that prompted the write."""
+    """Journal a content-free category without masking the original failure."""
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code):
+        error_code = "import_failure"
     with suppress(sqlite3.Error, StateConflictError):
-        state.record_error(row=row, error=error)
+        state.record_error(row=row, error=error_code)
 
 
 def _select_sessions(
@@ -303,6 +305,7 @@ def _classify_candidates(
     state: StateStore,
     verifier: WeaveVerifier | None,
     report: RunReport,
+    atomic_replay: bool = False,
 ) -> list[_Candidate]:
     candidates: list[_Candidate] = []
     for conversation in conversations:
@@ -358,6 +361,27 @@ def _classify_candidates(
                 continue
             if existing.status == "committed":
                 report.skipped += 1
+                continue
+            if existing.status == "pending" and atomic_replay:
+                atomic_attempt = state.get_atomic_turn(
+                    config.project,
+                    session_id,
+                    turn.key,
+                )
+                if atomic_attempt is None:
+                    # A pre-v6 pending row may represent the old OTLP path. It
+                    # has no durable logical-key/digest evidence, so treating
+                    # it as an atomic attempt could create a second trace.
+                    state.mark_remote_conflict(
+                        row=existing,
+                        error="pending turn predates atomic commit evidence",
+                    )
+                    report.conflicted += 1
+                    report.errors.append(
+                        f"session {session_id} turn {turn.key} lacks atomic recovery evidence"
+                    )
+                    continue
+                candidates.append(_Candidate(conversation, turn, existing))
                 continue
             if existing.status == "conflict":
                 if not _has_recorded_emission(existing):
@@ -432,14 +456,55 @@ def _classify_candidates(
     return candidates
 
 
+def _journal_atomic_preflight(
+    *,
+    candidates: list[_Candidate],
+    project: str,
+    state: StateStore,
+    sink: HistoricalTurnSink,
+) -> dict[tuple[str, str], tuple[PreparedOutcome, AtomicTurnAttempt]]:
+    """Prepare a whole session, then durably bind its exact wire certificates."""
+    prepared_items: list[tuple[_Candidate, PreparedOutcome]] = []
+    for candidate in candidates:
+        prepared_items.append(
+            (candidate, sink.prepare_turn(candidate.conversation, candidate.turn))
+        )
+
+    journal: dict[tuple[str, str], tuple[PreparedOutcome, AtomicTurnAttempt]] = {}
+    for candidate, prepared in prepared_items:
+        session_id = candidate.conversation.conversation_id.removeprefix("hivemind:")
+        attempt = state.plan_atomic_turn(
+            project=project,
+            session_id=session_id,
+            turn_key=candidate.turn.key,
+            source_payload_sha256=candidate.turn.payload_sha256,
+        )
+        attempt = state.record_atomic_turn_prepared(
+            attempt,
+            wire_sha256=prepared.wire_sha256,
+            logical_key=prepared.logical_key,
+            capability_version=prepared.capability_version,
+            reference_count=prepared.reference_count,
+            span_count=prepared.span_count,
+        )
+        if attempt.status in {"rejected", "conflict"}:
+            raise StateConflictError(
+                "atomic turn has a terminal rejection or conflict in private state"
+            )
+        journal[(session_id, candidate.turn.key)] = (prepared, attempt)
+    return journal
+
+
 def _emit_candidates(
     *,
     run_id: str,
     candidates: list[_Candidate],
     config: ImportConfig,
     state: StateStore,
-    sink: WeaveSink,
+    sink: HistoricalTurnSink,
     report: RunReport,
+    atomic_preflight: dict[tuple[str, str], tuple[PreparedOutcome, AtomicTurnAttempt]]
+    | None = None,
 ) -> tuple[list[_Emitted], bool]:
     if not candidates:
         return ([], True)
@@ -449,7 +514,23 @@ def _emit_candidates(
         turn = candidate.turn
         session_id = conversation.conversation_id.removeprefix("hivemind:")
         journal_row = candidate.existing
+        atomic_attempt: AtomicTurnAttempt | None = None
         try:
+            reconciled: LogOutcome | None = None
+            submitted = False
+            prepared: PreparedOutcome | None = None
+            if atomic_preflight is not None:
+                try:
+                    prepared, atomic_attempt = atomic_preflight[(session_id, turn.key)]
+                except KeyError as error:
+                    raise StateConflictError(
+                        "atomic turn is missing its whole-session preflight certificate"
+                    ) from error
+            elif journal_row is not None and bool(getattr(sink, "supports_atomic_replay", False)):
+                raise StateConflictError(
+                    "atomic pending turn is missing its v6 recovery certificate"
+                )
+
             if journal_row is None:
                 journal_row = state.begin_pending(
                     run_id=run_id,
@@ -461,14 +542,85 @@ def _emit_candidates(
                     source_last_activity_at=conversation.source_last_activity_at,
                     atif_schema_version=conversation.schema_version,
                 )
-            outcome = sink.log_turn(conversation, turn)
+
+            if (
+                prepared is not None
+                and atomic_attempt is not None
+                and atomic_attempt.status
+                in {
+                    "submitting",
+                    "uncertain",
+                    "acknowledged",
+                    "committed",
+                }
+            ):
+                reconcile = getattr(sink, "reconcile_prepared", None)
+                if not callable(reconcile):
+                    raise WeaveImportError(
+                        "atomic historical-turn sink does not support exact status reconciliation"
+                    )
+                reconciled = reconcile(prepared)
+                if reconciled is None:
+                    if atomic_attempt.status in {"acknowledged", "committed"}:
+                        if atomic_attempt.status == "acknowledged":
+                            atomic_attempt = state.mark_atomic_turn_conflict(
+                                atomic_attempt,
+                                error_code="committed_evidence_disappeared",
+                            )
+                        raise HistoricalTurnConflictError(
+                            "atomic commit evidence disappeared during exact reconciliation"
+                        )
+                    if atomic_attempt.status == "submitting":
+                        atomic_attempt = state.mark_atomic_turn_uncertain(
+                            atomic_attempt,
+                            error_code="status_proved_absent",
+                        )
+                else:
+                    atomic_attempt = state.record_atomic_turn_acknowledged(
+                        atomic_attempt,
+                        commit_id=reconciled.commit_id,
+                        trace_ids=reconciled.trace_ids,
+                        root_span_ids=reconciled.root_span_ids,
+                    )
+
+            if reconciled is None:
+                if atomic_attempt is not None:
+                    atomic_attempt = state.begin_atomic_turn_submit(atomic_attempt)
+                submitted = True
+                try:
+                    outcome = sink.log_turn(conversation, turn)
+                except HistoricalTurnUncertainError:
+                    if atomic_attempt is not None and atomic_attempt.status == "submitting":
+                        with suppress(sqlite3.Error, StateConflictError):
+                            state.mark_atomic_turn_uncertain(atomic_attempt)
+                    raise
+                except HistoricalTurnConflictError:
+                    if atomic_attempt is not None and atomic_attempt.status not in {
+                        "committed",
+                        "rejected",
+                        "conflict",
+                    }:
+                        with suppress(sqlite3.Error, StateConflictError):
+                            state.mark_atomic_turn_conflict(atomic_attempt)
+                    raise
+                if atomic_attempt is not None:
+                    atomic_attempt = state.record_atomic_turn_acknowledged(
+                        atomic_attempt,
+                        commit_id=outcome.commit_id,
+                        trace_ids=outcome.trace_ids,
+                        root_span_ids=outcome.root_span_ids,
+                    )
+            else:
+                outcome = reconciled
+
             journal_row = state.record_emitted(
                 row=journal_row,
                 trace_ids=outcome.trace_ids,
                 root_span_ids=outcome.root_span_ids,
                 span_count=outcome.span_count,
             )
-            report.emitted_spans += outcome.span_count
+            if submitted:
+                report.emitted_spans += outcome.span_count
             emitted.append(
                 _Emitted(
                     conversation_id=conversation.conversation_id,
@@ -478,12 +630,29 @@ def _emit_candidates(
                     verification_signature=turn.verification_signature,
                     outcome=outcome,
                     state_row=journal_row,
+                    atomic_attempt=atomic_attempt,
                 )
             )
+        except HistoricalTurnConflictError as error:
+            message = _safe_error(error)
+            if journal_row is not None:
+                with suppress(sqlite3.Error, StateConflictError):
+                    state.mark_conflict(
+                        row=journal_row,
+                        new_payload_sha256=turn.payload_sha256,
+                        error=message,
+                    )
+            report.conflicted += 1
+            report.errors.append(f"session {session_id} turn {turn.key}: {message}")
+            return (emitted, False)
         except (ImporterError, OSError, sqlite3.Error) as error:
             message = _safe_error(error)
             if journal_row is not None:
-                _record_error_best_effort(state, row=journal_row, error=message)
+                _record_error_best_effort(
+                    state,
+                    row=journal_row,
+                    error_code="upload_or_journal_failure",
+                )
             report.failed += 1
             report.errors.append(f"session {session_id} turn {turn.key}: {message}")
             remaining = len(candidates) - index - 1
@@ -529,7 +698,7 @@ def _verify_emitted(
                 _record_error_best_effort(
                     state,
                     row=item.state_row,
-                    error=str(error),
+                    error_code="verification_failed",
                 )
                 report.failed += 1
             report.errors.append(f"conversation {conversation_id}: {error}")
@@ -537,6 +706,12 @@ def _verify_emitted(
 
         for item in conversation_items:
             if item.turn_key in result.conflicts:
+                if item.atomic_attempt is not None and item.atomic_attempt.status == "acknowledged":
+                    with suppress(sqlite3.Error, StateConflictError):
+                        state.mark_atomic_turn_conflict(
+                            item.atomic_attempt,
+                            error_code="ui_visibility_conflict",
+                        )
                 with suppress(sqlite3.Error, StateConflictError):
                     state.mark_remote_conflict(
                         row=item.state_row,
@@ -554,12 +729,19 @@ def _verify_emitted(
                 _record_error_best_effort(
                     state,
                     row=item.state_row,
-                    error=detail,
+                    error_code="verification_timeout",
                 )
                 report.failed += 1
                 report.errors.append(f"session {item.session_id} turn {item.turn_key}: {detail}")
                 continue
             try:
+                if item.atomic_attempt is not None:
+                    if item.atomic_attempt.status == "acknowledged":
+                        state.commit_atomic_turn(item.atomic_attempt)
+                    elif item.atomic_attempt.status != "committed":
+                        raise StateConflictError(
+                            "atomic turn lacks acknowledged commit evidence after UI verification"
+                        )
                 state.mark_committed(row=item.state_row)
             except (sqlite3.Error, StateConflictError) as error:
                 report.failed += 1
@@ -745,7 +927,7 @@ def _process_ready_run(
     config: ImportConfig,
     client: HiveMindClient,
     report: RunReport,
-    sink: WeaveSink | None,
+    sink: HistoricalTurnSink | None,
     verifier: WeaveVerifier | None,
 ) -> None:
     entries = state.get_run_sessions(run.run_id)
@@ -756,7 +938,7 @@ def _process_ready_run(
 
     api_key = os.environ.get("WANDB_API_KEY", "")
     active_verifier = verifier
-    active_sink = sink or WeaveSink(
+    active_sink = sink or HistoricalTurnSink(
         trace_server_url=config.trace_server_url,
         wandb_base_url=config.wandb_base_url,
     )
@@ -836,6 +1018,7 @@ def _process_ready_run(
                 config=config,
                 state=state,
                 verifier=active_verifier,
+                atomic_replay=bool(getattr(active_sink, "supports_atomic_replay", False)),
                 report=report,
             )
             if report.conflicted > before_conflicted:
@@ -893,6 +1076,54 @@ def _process_ready_run(
                     break
                 sink_started = True
 
+            atomic_preflight: (
+                dict[tuple[str, str], tuple[PreparedOutcome, AtomicTurnAttempt]] | None
+            ) = None
+            if bool(getattr(active_sink, "supports_atomic_replay", False)):
+                # Build every exact wire envelope for this session before the
+                # first network write. A deterministic schema, redaction,
+                # graph, or size failure must leave the conversation wholly
+                # untouched rather than failing after earlier turns commit.
+                try:
+                    atomic_preflight = _journal_atomic_preflight(
+                        candidates=candidates,
+                        project=config.project,
+                        state=state,
+                        sink=active_sink,
+                    )
+                except StateConflictError as error:
+                    message = _safe_error(error)
+                    report.conflicted += 1
+                    report.errors.append(
+                        f"session {entry.session_id}: atomic preflight conflict: {message}"
+                    )
+                    state.mark_run_session_issue(
+                        entry=entry,
+                        status="conflict",
+                        error=message,
+                    )
+                    del candidates
+                    del turns
+                    del conversation
+                    upload_aborted = True
+                    break
+                except (ImporterError, OSError) as error:
+                    message = _safe_error(error)
+                    report.failed += 1
+                    report.errors.append(
+                        f"session {entry.session_id}: atomic preflight failed: {message}"
+                    )
+                    state.mark_run_session_issue(
+                        entry=entry,
+                        status="failed",
+                        error=message,
+                    )
+                    del candidates
+                    del turns
+                    del conversation
+                    upload_aborted = True
+                    break
+
             emitted, emission_completed = _emit_candidates(
                 run_id=run.run_id,
                 candidates=candidates,
@@ -900,6 +1131,7 @@ def _process_ready_run(
                 state=state,
                 sink=active_sink,
                 report=report,
+                atomic_preflight=atomic_preflight,
             )
             flush_failed = False
             if emitted:
@@ -907,7 +1139,11 @@ def _process_ready_run(
                     active_sink.flush()
                 except WeaveImportError as error:
                     for item in emitted:
-                        _record_error_best_effort(state, row=item.state_row, error=str(error))
+                        _record_error_best_effort(
+                            state,
+                            row=item.state_row,
+                            error_code="flush_failed",
+                        )
                     report.failed += len(emitted)
                     report.errors.append(str(error))
                     flush_failed = True
@@ -972,7 +1208,7 @@ def run_import(
     config: ImportConfig,
     *,
     hivemind: HiveMindClient | None = None,
-    sink: WeaveSink | None = None,
+    sink: HistoricalTurnSink | None = None,
     verifier: WeaveVerifier | None = None,
 ) -> RunReport:
     config.validate()
@@ -1002,7 +1238,7 @@ def _run_import_impl(
     config: ImportConfig,
     *,
     hivemind: HiveMindClient | None,
-    sink: WeaveSink | None,
+    sink: HistoricalTurnSink | None,
     verifier: WeaveVerifier | None,
 ) -> RunReport:
     report = RunReport()

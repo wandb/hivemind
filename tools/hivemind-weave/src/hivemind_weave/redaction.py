@@ -50,22 +50,58 @@ _SECRET_BARE_ASSIGNMENT = re.compile(
 _EMAIL = re.compile(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", re.I)
 _SSN = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
 _PHONE = re.compile(r"(?<!\w)(?:\+?1[ .-]?)?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?!\w)")
-_CARD_CANDIDATE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_CANONICAL_UUID = re.compile(
+    r"(?i)(?<![0-9a-f])[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}(?![0-9a-f])"
+)
+_CARD_DIGIT_RUN = re.compile(r"(?<!\d)(?:\d[ -]?){12,}\d(?!\d)")
 
 
-def _luhn(candidate: str) -> bool:
-    digits = [int(char) for char in candidate if char.isdigit()]
-    if not 13 <= len(digits) <= 19:
-        return False
-    total = 0
-    parity = len(digits) % 2
+def _redact_card_run(match: re.Match[str]) -> str:
+    """Redact every non-overlapping Luhn-valid 13-19 digit window in a run."""
+    value = match.group(0)
+    digit_positions = [index for index, character in enumerate(value) if character.isdigit()]
+    digits = [int(value[position]) for position in digit_positions]
+    # A Luhn window doubles one of the two global index parities. Prefix sums
+    # make every 13-19 digit check O(1), keeping large numeric fields linear.
+    prefix_sums = [[0], [0]]
     for index, digit in enumerate(digits):
-        if index % 2 == parity:
-            digit *= 2
-            if digit > 9:
-                digit -= 9
-        total += digit
-    return total % 10 == 0
+        doubled = digit * 2
+        if doubled > 9:
+            doubled -= 9
+        for parity in (0, 1):
+            contribution = doubled if index % 2 == parity else digit
+            prefix_sums[parity].append(prefix_sums[parity][-1] + contribution)
+
+    selected: list[tuple[int, int]] = []
+    start = 0
+    while start + 13 <= len(digits):
+        selected_length = 0
+        for length in range(min(19, len(digits) - start), 12, -1):
+            end = start + length
+            doubled_parity = (start + length % 2) % 2
+            checksum = prefix_sums[doubled_parity][end] - prefix_sums[doubled_parity][start]
+            if checksum % 10 == 0:
+                selected.append((digit_positions[start], digit_positions[end - 1] + 1))
+                selected_length = length
+                break
+        start += selected_length or 1
+
+    redacted = value
+    for start, end in sorted(selected, reverse=True):
+        redacted = f"{redacted[:start]}{REDACTED}{redacted[end:]}"
+    return redacted
+
+
+def _redact_cards_preserving_uuids(value: str) -> str:
+    """Keep canonical UUID tokens while scanning all surrounding numeric runs."""
+    parts: list[str] = []
+    offset = 0
+    for match in _CANONICAL_UUID.finditer(value):
+        parts.append(_CARD_DIGIT_RUN.sub(_redact_card_run, value[offset : match.start()]))
+        parts.append(match.group(0))
+        offset = match.end()
+    parts.append(_CARD_DIGIT_RUN.sub(_redact_card_run, value[offset:]))
+    return "".join(parts)
 
 
 def _key_parts(key: str) -> list[str]:
@@ -153,9 +189,7 @@ def redact_string(value: str) -> str:
     redacted = _EMAIL.sub(REDACTED, redacted)
     redacted = _SSN.sub(REDACTED, redacted)
     redacted = _PHONE.sub(REDACTED, redacted)
-    redacted = _CARD_CANDIDATE.sub(
-        lambda match: REDACTED if _luhn(match.group(0)) else match.group(0), redacted
-    )
+    redacted = _redact_cards_preserving_uuids(redacted)
     return redacted
 
 
@@ -166,10 +200,18 @@ def redact_data(value: Any, *, key: str = "") -> Any:
     if isinstance(value, str):
         return redact_string(value)
     if isinstance(value, Mapping):
-        return {
-            str(item_key): redact_data(item_value, key=str(item_key))
-            for item_key, item_value in value.items()
-        }
+        result: dict[str, Any] = {}
+        redacted_key_index = 0
+        for item_key, item_value in value.items():
+            raw_key = str(item_key)
+            scrubbed_key = redact_string(raw_key)
+            if scrubbed_key != raw_key:
+                redacted_key_index += 1
+                scrubbed_key = f"[REDACTED_KEY_{redacted_key_index:04d}]"
+            if scrubbed_key in result:
+                raise ValueError("mapping keys collide after credential redaction")
+            result[scrubbed_key] = redact_data(item_value, key=raw_key)
+        return result
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
         return [redact_data(item) for item in value]
     return value

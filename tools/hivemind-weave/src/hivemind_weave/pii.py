@@ -11,7 +11,6 @@ from dataclasses import replace
 from functools import lru_cache
 from typing import Any
 
-from .attribute_safety import chunk_large_attributes
 from .models import (
     ChatMessage,
     MappedConversation,
@@ -21,11 +20,10 @@ from .redaction import redact_data, redact_string
 from .utils import canonical_json, sha256_json
 
 _PII_ENGINE_REDACTOR: Any | None = None
-_LARGE_REDACTION_CACHE: OrderedDict[tuple[int, str], str] = OrderedDict()
-_LARGE_REDACTION_CACHE_CHARS = 0
-_MAX_LARGE_CACHE_ENTRY_CHARS = 256 * 1024
-_MAX_LARGE_CACHE_CHARS = 32 * 1024 * 1024
-
+_REDACTION_CACHE: OrderedDict[tuple[int, str], str] = OrderedDict()
+_REDACTION_CACHE_CHARS = 0
+_MAX_REDACTION_CACHE_ENTRY_CHARS = 256 * 1024
+_MAX_REDACTION_CACHE_CHARS = 32 * 1024 * 1024
 _CORRELATION_ATTRIBUTES = {
     "hivemind.session_id",
     "hivemind.turn_key",
@@ -292,7 +290,9 @@ def configure_weave_pii() -> None:
     from presidio_anonymizer import AnonymizerEngine
     from weave.utils import pii_redaction
 
-    global _PII_ENGINE_REDACTOR
+    global _PII_ENGINE_REDACTOR, _REDACTION_CACHE_CHARS
+    _REDACTION_CACHE.clear()
+    _REDACTION_CACHE_CHARS = 0
     engine_redactor = getattr(
         pii_redaction,
         "_hivemind_engine_redactor",
@@ -357,37 +357,25 @@ def _redact_pii_string_uncached(value: str) -> str:
     return _source_aware_redact(value, _PII_ENGINE_REDACTOR)
 
 
-@lru_cache(maxsize=32_768)
-def _redact_pii_string_cached(value: str) -> str:
-    return _redact_pii_string_uncached(value)
-
-
 def _redact_pii_string(value: str) -> str:
-    """Redact one value with a bounded, process-only backfill cache.
-
-    Large canonical JSON attributes recurse through this function, so caching
-    their smaller leaf strings removes duplicate NER work without retaining
-    multi-megabyte transcript blobs in memory.
-    """
-    if len(value) <= 8_192:
-        return _redact_pii_string_cached(value)
-    if len(value) > _MAX_LARGE_CACHE_ENTRY_CHARS:
+    """Cache by digest only; raw pre-redaction text is never retained as a key."""
+    if len(value) > _MAX_REDACTION_CACHE_ENTRY_CHARS:
         return _redact_pii_string_uncached(value)
 
-    global _LARGE_REDACTION_CACHE_CHARS
+    global _REDACTION_CACHE_CHARS
     cache_key = (len(value), hashlib.sha256(value.encode("utf-8")).hexdigest())
-    cached = _LARGE_REDACTION_CACHE.get(cache_key)
+    cached = _REDACTION_CACHE.get(cache_key)
     if cached is not None:
-        _LARGE_REDACTION_CACHE.move_to_end(cache_key)
+        _REDACTION_CACHE.move_to_end(cache_key)
         return cached
 
     redacted = _redact_pii_string_uncached(value)
-    if len(redacted) <= _MAX_LARGE_CACHE_ENTRY_CHARS:
-        _LARGE_REDACTION_CACHE[cache_key] = redacted
-        _LARGE_REDACTION_CACHE_CHARS += len(redacted)
-        while _LARGE_REDACTION_CACHE_CHARS > _MAX_LARGE_CACHE_CHARS:
-            _, evicted = _LARGE_REDACTION_CACHE.popitem(last=False)
-            _LARGE_REDACTION_CACHE_CHARS -= len(evicted)
+    if len(redacted) <= _MAX_REDACTION_CACHE_ENTRY_CHARS:
+        _REDACTION_CACHE[cache_key] = redacted
+        _REDACTION_CACHE_CHARS += len(redacted)
+        while _REDACTION_CACHE_CHARS > _MAX_REDACTION_CACHE_CHARS:
+            _, evicted = _REDACTION_CACHE.popitem(last=False)
+            _REDACTION_CACHE_CHARS -= len(evicted)
     return redacted
 
 
@@ -396,11 +384,16 @@ def _pii_walk(value: Any) -> Any:
         return _redact_pii_string(value)
     if isinstance(value, dict):
         result: dict[str, Any] = {}
+        redacted_key_index = 0
         for raw_key, raw_value in value.items():
-            # Keys carry schema and code semantics. redact_data() has already
-            # replaced values under credential-bearing keys; NER applies only
-            # to remaining values so fields like session_id are not destroyed.
-            result[str(raw_key)] = _pii_walk(raw_value)
+            source_key = str(raw_key)
+            scrubbed_key = _redact_pii_string(source_key)
+            if scrubbed_key != source_key:
+                redacted_key_index += 1
+                scrubbed_key = f"[REDACTED_PII_KEY_{redacted_key_index:04d}]"
+            if scrubbed_key in result:
+                raise ValueError("mapping keys collide after PII redaction")
+            result[scrubbed_key] = _pii_walk(raw_value)
         return result
     if isinstance(value, list):
         return [_pii_walk(item) for item in value]
@@ -497,10 +490,6 @@ def _sanitize_turn(turn: MappedTurn) -> MappedTurn:
         if key in turn.attributes:
             attributes[key] = turn.attributes[key]
     attributes["hivemind.source_payload_sha256"] = source_payload_sha256
-    # Chunk only after the complete PII pass so entities cannot straddle a
-    # boundary. These attributes are upload representation, not source identity;
-    # the sink reconstructs and re-chunks them at the final transport boundary.
-    attributes = chunk_large_attributes(attributes)
     for key in _HASH_CORRELATORS:
         if key in turn.hash_context:
             hash_context[key] = turn.hash_context[key]

@@ -5,14 +5,16 @@ from __future__ import annotations
 import base64
 import json
 import os
-import ssl
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
+from . import __version__
 from .errors import VerificationError
 from .utils import first_present, parse_datetime, sha256_json
 
@@ -22,6 +24,158 @@ ItemT = TypeVar("ItemT")
 _VERIFICATION_FILTER_BATCH_SIZE = 100
 _VERIFICATION_QUERY_PAGE_SIZE = 1_000
 _MEDIA_MESSAGE_PART_TYPES = {"uri", "blob", "file"}
+_HOSTED_TRACE_SERVER_URL = "https://trace.wandb.ai"
+_HOSTED_WANDB_BASE_URL = "https://api.wandb.ai"
+_UNSAFE_TRANSPORT_ENV_VARS = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_INSECURE",
+    "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+    "OTEL_PYTHON_TRACER_PROVIDER",
+    "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+    "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "WEAVE_DEBUG_HTTP",
+    "WEAVE_REDACT_PII_FIELDS",
+    "WEAVE_REDACT_PII_EXCLUDE_FIELDS",
+    "WEAVE_ENABLE_DISK_FALLBACK",
+    "WEAVE_USE_SERVER_CACHE",
+    "WEAVE_SERVER_CACHE_DIR",
+    "WEAVE_SERVER_CACHE_SIZE_LIMIT",
+    "WEAVE_ENABLE_WAL",
+    "WEAVE_DISABLE_WAL_SENDER",
+    "WEAVE_CAPTURE_CODE",
+    "WEAVE_CAPTURE_CLIENT_INFO",
+    "WEAVE_CAPTURE_SYSTEM_INFO",
+    "WEAVE_IMPLICITLY_PATCH_INTEGRATIONS",
+    "WEAVE_PRINT_CALL_LINK",
+    "WEAVE_USE_STAINLESS_SERVER",
+    "WEAVE_ALLOW_UNSAFE_CUSTOM_OBJ_DECODE",
+    "WEAVE_LOG_LEVEL",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_EXPERIMENTAL_RESOURCE_DETECTORS",
+    "OTEL_ATTRIBUTE_COUNT_LIMIT",
+    "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT",
+    "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT",
+    "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT",
+    "OTEL_SDK_DISABLED",
+    "OTEL_TRACES_SAMPLER",
+    "OTEL_TRACES_SAMPLER_ARG",
+    "SSLKEYLOGFILE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Do not forward the W&B Authorization header across redirects."""
+
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+def _open_no_redirect(request: urllib.request.Request, *, timeout: float) -> Any:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
+@contextmanager
+def disabled_weave_error_reporting() -> Iterator[None]:
+    """Disable SDK error telemetry before the first Weave import and for the live run."""
+    variable = "WANDB_ERROR_REPORTING"
+    original_present = variable in os.environ
+    original_value = os.environ.get(variable)
+    os.environ[variable] = "false"
+    try:
+        yield
+    finally:
+        if original_present:
+            assert original_value is not None
+            os.environ[variable] = original_value
+        else:
+            os.environ.pop(variable, None)
+
+
+def enforce_weave_error_reporting_disabled() -> None:
+    """Disable an already-imported Weave Sentry client without flushing it."""
+    try:
+        from weave.telemetry import trace_sentry
+    except ImportError as error:  # pragma: no cover - required live dependency.
+        raise VerificationError("the pinned Weave SDK is unavailable") from error
+    sentry = getattr(trace_sentry, "global_trace_sentry", None)
+    if sentry is None:
+        raise VerificationError("Weave error reporting state is unavailable")
+    sentry._disabled = True
+    sentry.scope = None
+    if (
+        getattr(sentry, "_disabled", None) is not True
+        or getattr(sentry, "scope", 1) is not None
+    ):
+        raise VerificationError("Weave error reporting could not be disabled")
+
+
+def validate_trace_server_url(url: str) -> str:
+    """Return a normalized HTTPS trace endpoint or fail before credentials are used."""
+    if not url or any(ord(character) < 0x21 or ord(character) > 0x7E for character in url):
+        raise VerificationError("Weave trace endpoint must use visible ASCII characters")
+    try:
+        parsed = urlsplit(url)
+        _ = parsed.port
+    except ValueError as error:
+        raise VerificationError("Weave trace endpoint is invalid") from error
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise VerificationError(
+            "Weave trace endpoint must be HTTPS and contain no credentials, query, or fragment"
+        )
+    return url.rstrip("/")
+
+
+def validate_wandb_base_url(url: str) -> str:
+    """Return a normalized HTTPS W&B API origin or fail before auth is used."""
+    normalized = validate_trace_server_url(url)
+    parsed = urlsplit(normalized)
+    if parsed.path not in {"", "/"}:
+        raise VerificationError("W&B API endpoint must be an HTTPS origin without a path")
+    return normalized
+
+
+def validate_live_transport_environment() -> None:
+    """Reject ambient settings that can bypass the reviewed authenticated transport."""
+    insecure = os.environ.get("WEAVE_INSECURE_DISABLE_SSL", "").strip().lower()
+    if insecure in {"1", "on", "true", "yes"}:
+        raise VerificationError("WEAVE_INSECURE_DISABLE_SSL is forbidden for live imports")
+    configured_overrides = [
+        name for name in _UNSAFE_TRANSPORT_ENV_VARS if name in os.environ
+    ]
+    if configured_overrides:
+        raise VerificationError(
+            f"{configured_overrides[0]} is forbidden for live imports; "
+            "remove ambient diagnostic, OpenTelemetry, and TLS transport overrides"
+        )
 
 
 def _equals(field: str, value: str) -> dict[str, Any]:
@@ -86,6 +240,7 @@ def _post_json(
     headers: dict[str, str],
     timeout: float,
 ) -> dict[str, Any]:
+    validate_trace_server_url(url)
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -93,18 +248,7 @@ def _post_json(
         method="POST",
     )
     try:
-        insecure = os.environ.get("WEAVE_INSECURE_DISABLE_SSL", "").lower() == "true"
-        if insecure:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            response_context = urllib.request.urlopen(
-                request,
-                timeout=timeout,
-                context=context,
-            )
-        else:
-            response_context = urllib.request.urlopen(request, timeout=timeout)
+        response_context = _open_no_redirect(request, timeout=timeout)
         with response_context as response:
             body = response.read()
     except urllib.error.HTTPError as error:
@@ -154,7 +298,7 @@ class _RootSignatureEvidence:
 
 
 def _trace_server_url() -> str:
-    """Resolve the same hosted or self-managed trace endpoint as Weave 0.53."""
+    """Resolve the endpoint exactly as the pinned Weave SDK would."""
     try:
         from weave.trace.env import weave_trace_server_url
     except ImportError:  # pragma: no cover - Weave is a required live dependency.
@@ -170,6 +314,35 @@ def _trace_server_url() -> str:
     return weave_trace_server_url()
 
 
+def _wandb_base_url() -> str:
+    try:
+        from weave.trace.env import wandb_base_url
+    except ImportError as error:  # pragma: no cover - required live dependency.
+        raise VerificationError("the pinned Weave SDK is unavailable") from error
+
+    return wandb_base_url()
+
+
+def resolve_trace_server_url() -> str:
+    """Resolve and require the reviewed hosted trace endpoint."""
+    resolved = validate_trace_server_url(_trace_server_url())
+    if resolved != _HOSTED_TRACE_SERVER_URL:
+        raise VerificationError(
+            "custom Weave trace endpoints are not supported by this review prototype"
+        )
+    return resolved
+
+
+def resolve_wandb_base_url() -> str:
+    """Resolve and require the reviewed hosted W&B control-plane endpoint."""
+    resolved = validate_wandb_base_url(_wandb_base_url())
+    if resolved != _HOSTED_WANDB_BASE_URL:
+        raise VerificationError(
+            "custom W&B API endpoints are not supported by this review prototype"
+        )
+    return resolved
+
+
 class WeaveVerifier:
     def __init__(
         self,
@@ -182,7 +355,7 @@ class WeaveVerifier:
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.project = project
-        self.base_url = (base_url or _trace_server_url()).rstrip("/")
+        self.base_url = validate_trace_server_url(base_url or _trace_server_url())
         self.transport = transport
         self.sleep = sleep
         self.monotonic = monotonic
@@ -190,7 +363,7 @@ class WeaveVerifier:
         self.headers = {
             "Authorization": f"Basic {auth_token}",
             "Content-Type": "application/json",
-            "User-Agent": "hivemind-weave/0.1.0",
+            "User-Agent": f"hivemind-weave/{__version__}",
         }
 
     def _post(

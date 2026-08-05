@@ -153,6 +153,7 @@ def _create_legacy_journal(path: Path) -> None:
     )
     connection.commit()
     connection.close()
+    path.chmod(0o600)
 
 
 def test_existing_journal_migrates_transactionally_and_records_contract_version(
@@ -652,13 +653,26 @@ def test_hostile_umask_still_produces_private_modes(tmp_path: Path) -> None:
         os.umask(prior)
 
 
-def test_chmod_failures_are_fatal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def deny_chmod(_fd: int, _mode: int) -> None:
-        raise PermissionError("denied")
+def test_existing_state_directory_permissions_are_not_changed(tmp_path: Path) -> None:
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o750)
+    before = stat.S_IMODE(parent.stat().st_mode)
 
-    monkeypatch.setattr(os, "fchmod", deny_chmod)
-    with pytest.raises(StateConflictError, match="permissions could not be secured"):
-        StateStore(tmp_path / "state.sqlite3")
+    with pytest.raises(StateConflictError, match="refusing to change"):
+        StateStore(parent / "state.sqlite3")
+
+    assert stat.S_IMODE(parent.stat().st_mode) == before
+
+
+def test_existing_state_file_permissions_are_not_changed(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    path.write_bytes(b"")
+    path.chmod(0o640)
+
+    with pytest.raises(StateConflictError, match="refusing to change"):
+        StateStore(path)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
 
 
 def test_database_inode_swap_during_connect_is_rejected(
@@ -746,6 +760,7 @@ def test_wrong_application_id_is_rejected(tmp_path: Path) -> None:
     connection.execute("PRAGMA application_id=1234")
     connection.commit()
     connection.close()
+    path.chmod(0o600)
     with pytest.raises(StateConflictError, match="different application"):
         StateStore(path)
 
@@ -757,5 +772,6 @@ def test_future_schema_version_is_rejected(tmp_path: Path) -> None:
     connection.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION + 1}")
     connection.commit()
     connection.close()
+    path.chmod(0o600)
     with pytest.raises(StateConflictError, match="newer than"):
         StateStore(path)

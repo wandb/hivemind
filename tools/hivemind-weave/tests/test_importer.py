@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import weakref
 from collections.abc import Callable
 from dataclasses import replace
@@ -165,8 +166,10 @@ class FakeVerifier:
 def _config(tmp_path: Path, *, dry_run: bool = False) -> ImportConfig:
     return ImportConfig(
         days=3,
+        project="wandb/hivemind-chats",
         state_path=tmp_path / "state.sqlite3",
         dry_run=dry_run,
+        confirm_project="" if dry_run else "wandb/hivemind-chats",
         cutoff=datetime(2026, 8, 3, 12, 0, tzinfo=UTC),
     )
 
@@ -205,6 +208,18 @@ def test_dry_run_filters_window_and_writes_no_state(
     atif_wrapper: Callable[..., dict[str, Any]],
 ) -> None:
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    error_reporting_values: list[str | None] = []
+    configure_required_pii = importer_module._configure_required_pii
+
+    def tracked_configure_required_pii() -> None:
+        error_reporting_values.append(os.environ.get("WANDB_ERROR_REPORTING"))
+        configure_required_pii()
+
+    monkeypatch.setattr(
+        importer_module,
+        "_configure_required_pii",
+        tracked_configure_required_pii,
+    )
     eligible = session_payload(id="eligible", last_activity_at="2026-08-01T12:20:00Z")
     deferred = session_payload(id="deferred", last_activity_at="2026-08-03T11:55:00Z")
     old = session_payload(id="old", last_activity_at="2026-07-01T12:00:00Z")
@@ -223,6 +238,7 @@ def test_dry_run_filters_window_and_writes_no_state(
     assert client.requested_days == [4]
     assert client.fetched == ["eligible"]
     assert not (tmp_path / "state.sqlite3").exists()
+    assert error_reporting_values == ["false"]
 
 
 def test_no_work_succeeds_without_wandb_credentials(
@@ -488,7 +504,7 @@ def test_pending_turn_is_reconciled_after_crash(
     wrapper = atif_wrapper()
     conversation = sanitize_mapped_conversation(map_atif(session, wrapper))
     turn = conversation.turns[0]
-    assert expected_turn_span_count(turn) > 4
+    assert expected_turn_span_count(turn) == 4
     config = _config(tmp_path)
     with StateStore(config.state_path) as state:
         run = _seed_certified_run(state, config, session, conversation)
@@ -509,7 +525,7 @@ def test_pending_turn_is_reconciled_after_crash(
             row=pending,
             trace_ids=["trace-existing"],
             root_span_ids=["root-existing"],
-            span_count=4,
+            span_count=3,
         )
     sink = FakeSink()
     verifier = FakeVerifier(
@@ -517,7 +533,7 @@ def test_pending_turn_is_reconciled_after_crash(
             matches=1,
             trace_ids=["trace-existing"],
             root_span_ids=["root-reconciled"],
-            span_count=4,
+            span_count=3,
         )
     )
 
@@ -530,7 +546,7 @@ def test_pending_turn_is_reconciled_after_crash(
     assert report.ok
     assert report.skipped == 1
     assert sink.logged == []
-    assert verifier.reconcile_signatures == [("legacy-signature", 4)]
+    assert verifier.reconcile_signatures == [("legacy-signature", 3)]
     assert verifier.reconcile_alternate_signatures == [(turn.verification_signature,)]
     with StateStore(config.state_path) as state:
         row = state.get(config.project, session.id, turn.key)
@@ -637,7 +653,8 @@ def test_changed_unemitted_conflict_is_repaired_only_after_both_hashes_are_absen
     sink = FakeSink()
     verifier_construction: list[tuple[str, str]] = []
 
-    def verifier_factory(*, project: str, api_key: str) -> FakeVerifier:
+    def verifier_factory(*, project: str, api_key: str, base_url: str) -> FakeVerifier:
+        assert base_url == "https://trace.wandb.ai"
         verifier_construction.append((project, api_key))
         return verifier
 
@@ -809,6 +826,7 @@ def test_cutoff_boundaries_and_unknown_activity(
     unknown = session_payload(id="unknown", last_activity_at=None)
     config = ImportConfig(
         days=3,
+        project="wandb/hivemind-chats",
         idle_minutes=10,
         state_path=tmp_path / "state.sqlite3",
         dry_run=True,

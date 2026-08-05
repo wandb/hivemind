@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import time
@@ -36,6 +37,19 @@ _SESSION_RECOVERY_SWEEPS = (
     (89, "desc"),
 )
 
+_CHILD_ENV_ALLOWLIST = frozenset(
+    {
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    }
+)
+
 
 @dataclass(frozen=True)
 class _SessionSweep:
@@ -47,27 +61,27 @@ def _default_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
     # HiveMind owns its authentication through `hivemind login`. Do not leak
     # unrelated destination/model credentials into the child process or allow
     # WANDB_API_KEY to override the CLI's stored authenticated identity.
-    child_env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("WANDB_")
-        and key
-        not in {
-            "ANTHROPIC_API_KEY",
-            "GOOGLE_API_KEY",
-            # The CLI documents this variable as an override for its stored
-            # login.  The importer intentionally authenticates only through
-            # that stored login, so never copy an ambient override into the
-            # child process.
-            "HIVEMIND_TOKEN",
-            "OPENAI_API_KEY",
+    child_env = {key: os.environ[key] for key in _CHILD_ENV_ALLOWLIST if key in os.environ}
+    account = pwd.getpwuid(os.geteuid())
+    binary_directory = os.path.dirname(os.path.abspath(command[0]))
+    child_env.update(
+        {
+            "HOME": account.pw_dir,
+            "USER": account.pw_name,
+            "LOGNAME": account.pw_name,
+            "PATH": ":".join(
+                dict.fromkeys(
+                    [binary_directory, "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+                )
+            ),
         }
-    }
+    )
     return subprocess.run(
         command,
         check=False,
         capture_output=True,
         env=child_env,
+        stdin=subprocess.DEVNULL,
         text=True,
         timeout=_CLI_TIMEOUT_SECONDS,
     )
@@ -118,10 +132,13 @@ class HiveMindClient:
         return payload
 
     def preflight(self) -> None:
-        if shutil.which(self.binary) is None and self.runner is _default_runner:
-            raise AuthenticationError(
-                "hivemind executable was not found; install HiveMind and run 'hivemind login'"
-            )
+        if self.runner is _default_runner:
+            resolved_binary = shutil.which(self.binary)
+            if resolved_binary is None:
+                raise AuthenticationError(
+                    "hivemind executable was not found; install HiveMind and run 'hivemind login'"
+                )
+            self.binary = os.path.realpath(resolved_binary)
         try:
             payload = self._run(
                 ["api", "/auth/me", "--raw"],

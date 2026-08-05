@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
 from .errors import ATIFSchemaError
+from .redaction import redact_string
 from .utils import coerce_string, first_present, parse_datetime, sha256_json
+
+_SOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,8 @@ class Session:
         session_id = coerce_string(data.get("id")).strip()
         if not session_id:
             raise ATIFSchemaError("session summary is missing id")
+        if not _SOURCE_ID.fullmatch(session_id) or redact_string(session_id) != session_id:
+            raise ATIFSchemaError("session summary has an unsafe or unsupported id")
         started_at = parse_datetime(data.get("started_at"))
         if started_at is None:
             raise ATIFSchemaError(f"session {session_id} has an invalid started_at timestamp")

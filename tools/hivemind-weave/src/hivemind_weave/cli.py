@@ -25,8 +25,8 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("--days", type=int, required=True, help="activity window (1-365)")
     import_parser.add_argument(
         "--project",
-        default="wandb/hivemind-chats",
-        help="destination in entity/project form (default: %(default)s)",
+        required=True,
+        help="explicit destination in entity/project form",
     )
     import_parser.add_argument(
         "--idle-minutes",
@@ -45,6 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="discover, redact, map, and count without Weave or state writes",
     )
+    import_parser.add_argument(
+        "--confirm-project",
+        default="",
+        metavar="ENTITY/PROJECT",
+        help="required for live import and must exactly match --project",
+    )
     return parser
 
 
@@ -60,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             idle_minutes=args.idle_minutes,
             state_path=args.state_path,
             dry_run=args.dry_run,
+            confirm_project=args.confirm_project,
         )
         config.validate()
         mode = "dry run" if config.dry_run else "live import"

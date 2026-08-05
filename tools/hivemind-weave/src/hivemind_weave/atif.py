@@ -118,7 +118,7 @@ def verification_signature(
 
 def _turn_key_component(step_id: str) -> str:
     stripped = step_id.strip()
-    if re.fullmatch(r"\d{1,20}", stripped):
+    if re.fullmatch(r"\d{1,20}", stripped) and redact_string(stripped) == stripped:
         return stripped
     # ATIF step IDs are source-controlled and may contain paths or names. Keep
     # the journal/search key deterministic without exempting that raw value

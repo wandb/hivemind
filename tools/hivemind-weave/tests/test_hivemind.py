@@ -39,20 +39,31 @@ def test_default_runner_does_not_inherit_destination_or_model_api_keys(
     monkeypatch.setenv("OPENAI_API_KEY", "model-secret")
     monkeypatch.setenv("GOOGLE_API_KEY", "model-secret")
     monkeypatch.setenv("HIVEMIND_TOKEN", "ambient-login-override")
-    monkeypatch.setenv("HIVEMIND_TEST_MARKER", "preserved")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "unrelated-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "unrelated-secret")
+    monkeypatch.setenv("HIVEMIND_TEST_MARKER", "must-not-be-inherited")
+    monkeypatch.setenv("HOME", "/private/tmp/untrusted-home")
+    monkeypatch.setenv("PATH", "/private/tmp/untrusted-bin")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
     monkeypatch.setattr(hivemind_module.subprocess, "run", fake_run)
 
     hivemind_module._default_runner(["hivemind", "api", "/auth/me", "--raw"])
 
     child_env = captured["env"]
     assert captured["timeout"] == 600
-    assert child_env["HIVEMIND_TEST_MARKER"] == "preserved"
+    assert captured["stdin"] is subprocess.DEVNULL
+    assert child_env["LANG"] == "en_US.UTF-8"
+    assert child_env["HOME"] != "/private/tmp/untrusted-home"
+    assert "/private/tmp/untrusted-bin" not in child_env["PATH"]
+    assert "HIVEMIND_TEST_MARKER" not in child_env
     assert "WANDB_API_KEY" not in child_env
     assert "WANDB_ENTITY" not in child_env
     assert "ANTHROPIC_API_KEY" not in child_env
     assert "OPENAI_API_KEY" not in child_env
     assert "GOOGLE_API_KEY" not in child_env
     assert "HIVEMIND_TOKEN" not in child_env
+    assert "AWS_SESSION_TOKEN" not in child_env
+    assert "GITHUB_TOKEN" not in child_env
 
 
 def _sessions_page(

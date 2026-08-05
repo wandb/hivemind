@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import ssl
+import os
 import sys
 from collections.abc import Callable
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,10 +18,17 @@ from hivemind_weave.pii import (
 )
 from hivemind_weave.utils import sha256_json
 from hivemind_weave.verify import (
+    _UNSAFE_TRANSPORT_ENV_VARS,
     ReconcileResult,
     VerificationExpectation,
     WeaveVerifier,
     _post_json,
+    disabled_weave_error_reporting,
+    enforce_weave_error_reporting_disabled,
+    resolve_trace_server_url,
+    resolve_wandb_base_url,
+    validate_live_transport_environment,
+    validate_wandb_base_url,
 )
 
 
@@ -284,7 +291,7 @@ def test_transport_os_errors_and_invalid_utf8_are_domain_failures(monkeypatch: A
     def fail_transport(*_: object, **__: object) -> None:
         raise TimeoutError("private transport detail")
 
-    monkeypatch.setattr("urllib.request.urlopen", fail_transport)
+    monkeypatch.setattr("hivemind_weave.verify._open_no_redirect", fail_transport)
     with pytest.raises(VerificationError, match="transport failed"):
         _post_json("https://trace.example/test", {}, {}, 1)
 
@@ -298,33 +305,87 @@ def test_transport_os_errors_and_invalid_utf8_are_domain_failures(monkeypatch: A
         def read(self) -> bytes:
             return b"\xff"
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: InvalidResponse())
+    monkeypatch.setattr(
+        "hivemind_weave.verify._open_no_redirect",
+        lambda *_args, **_kwargs: InvalidResponse(),
+    )
     with pytest.raises(VerificationError, match="invalid JSON"):
         _post_json("https://trace.example/test", {}, {}, 1)
 
 
-def test_transport_honors_weave_insecure_ssl_setting(monkeypatch: Any) -> None:
-    captured_context: list[Any] = []
-
-    class ValidResponse:
-        def __enter__(self) -> ValidResponse:
-            return self
-
-        def __exit__(self, *_: object) -> None:
-            return None
-
-        def read(self) -> bytes:
-            return b"{}"
-
-    def open_with_context(*_: object, **kwargs: Any) -> ValidResponse:
-        captured_context.append(kwargs.get("context"))
-        return ValidResponse()
-
+def test_transport_rejects_insecure_ssl_setting_and_plain_http(monkeypatch: Any) -> None:
     monkeypatch.setenv("WEAVE_INSECURE_DISABLE_SSL", "true")
-    monkeypatch.setattr("urllib.request.urlopen", open_with_context)
-    assert _post_json("https://trace.example/test", {}, {}, 1) == {}
-    assert captured_context[0].check_hostname is False
-    assert captured_context[0].verify_mode == ssl.CERT_NONE
+    with pytest.raises(VerificationError, match="forbidden"):
+        validate_live_transport_environment()
+    with pytest.raises(VerificationError, match="must be HTTPS"):
+        _post_json("http://trace.example/test", {}, {}, 1)
+    with pytest.raises(VerificationError, match="credentials"):
+        WeaveVerifier(project="e/p", api_key="secret", base_url="https://user@trace.example")
+
+
+@pytest.mark.parametrize("variable", _UNSAFE_TRANSPORT_ENV_VARS)
+def test_live_transport_rejects_every_ambient_override_even_when_blank(
+    monkeypatch: Any,
+    variable: str,
+) -> None:
+    monkeypatch.delenv("WEAVE_INSECURE_DISABLE_SSL", raising=False)
+    monkeypatch.setenv(variable, "")
+    with pytest.raises(VerificationError, match=variable):
+        validate_live_transport_environment()
+
+
+def test_live_endpoint_resolution_is_hosted_only(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "hivemind_weave.verify._trace_server_url",
+        lambda: "https://trace.internal.example/custom/",
+    )
+    with pytest.raises(VerificationError, match="not supported"):
+        resolve_trace_server_url()
+
+    monkeypatch.setattr(
+        "hivemind_weave.verify._trace_server_url",
+        lambda: "https://trace.wandb.ai/",
+    )
+    assert resolve_trace_server_url() == "https://trace.wandb.ai"
+
+    monkeypatch.setattr(
+        "hivemind_weave.verify._wandb_base_url",
+        lambda: "https://api.internal.example/",
+    )
+    with pytest.raises(VerificationError, match="not supported"):
+        resolve_wandb_base_url()
+
+    monkeypatch.setattr(
+        "hivemind_weave.verify._wandb_base_url",
+        lambda: "https://api.wandb.ai/",
+    )
+    assert resolve_wandb_base_url() == "https://api.wandb.ai"
+
+
+def test_wandb_base_url_must_be_an_https_origin() -> None:
+    with pytest.raises(VerificationError, match="without a path"):
+        validate_wandb_base_url("https://api.wandb.ai/graphql")
+    with pytest.raises(VerificationError, match="HTTPS"):
+        validate_wandb_base_url("http://api.wandb.ai")
+
+
+def test_error_reporting_is_pinned_and_restored(monkeypatch: Any) -> None:
+    monkeypatch.setenv("WANDB_ERROR_REPORTING", "true")
+    with disabled_weave_error_reporting():
+        assert os.environ["WANDB_ERROR_REPORTING"] == "false"
+    assert os.environ["WANDB_ERROR_REPORTING"] == "true"
+
+
+def test_existing_weave_error_reporting_client_is_disabled(monkeypatch: Any) -> None:
+    from weave.telemetry import trace_sentry
+
+    sentry = SimpleNamespace(_disabled=False, scope=object())
+    monkeypatch.setattr(trace_sentry, "global_trace_sentry", sentry)
+
+    enforce_weave_error_reporting_disabled()
+
+    assert sentry._disabled is True
+    assert sentry.scope is None
 
 
 def test_batch_verification_pages_conversation_once_for_multiple_turns() -> None:

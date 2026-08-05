@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from hivemind_weave.redaction import REDACTED, redact_data, redact_string
 
 
@@ -128,6 +130,46 @@ def test_non_luhn_long_number_is_preserved() -> None:
     assert redact_string("build 1234567890123 completed") == "build 1234567890123 completed"
 
 
+def test_all_numeric_uuid_is_not_redacted_as_a_card_number() -> None:
+    source = "11111111-1111-4111-8111-111111111111"
+
+    assert redact_string(source) == source
+
+
+def test_card_number_is_redacted_with_a_hyphenated_numeric_suffix() -> None:
+    source = "card 4111111111111111-1"
+
+    result = redact_string(source)
+
+    assert "4111111111111111" not in result
+    assert result == f"card {REDACTED}-1"
+
+
+def test_uuid_exemption_does_not_protect_an_adjacent_card_number() -> None:
+    uuid = "11111111-1111-4111-8111-111111111111"
+    card = "4111111111111111"
+
+    result = redact_string(f"{uuid} card {card}-1")
+
+    assert uuid in result
+    assert card not in result
+
+
 def test_large_ordinary_string_redaction_is_stable() -> None:
     source = "x" * 300_000
     assert redact_string(source) == source
+
+
+def test_secret_bearing_mapping_keys_are_replaced_without_leaking() -> None:
+    token = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"
+    redacted = redact_data({token: "ordinary", "token": "opaque-secret"})
+
+    serialized = json.dumps(redacted)
+    assert token not in serialized
+    assert redacted["[REDACTED_KEY_0001]"] == "ordinary"
+    assert redacted["token"] == REDACTED
+
+
+def test_mapping_key_collision_after_redaction_fails_closed() -> None:
+    with pytest.raises(ValueError, match="collide"):
+        redact_data({"alice@example.com": 1, "[REDACTED_KEY_0001]": 2})

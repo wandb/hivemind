@@ -25,19 +25,32 @@ from .hivemind import HiveMindClient
 from .models import MappedConversation, MappedTurn, RunReport, Session
 from .pii import configure_weave_pii, sanitize_mapped_conversation
 from .state import ImportRun, ImportRunSession, StateRow, StateStore
-from .verify import VerificationExpectation, WeaveVerifier
+from .verify import (
+    VerificationExpectation,
+    WeaveVerifier,
+    disabled_weave_error_reporting,
+    enforce_weave_error_reporting_disabled,
+    resolve_trace_server_url,
+    resolve_wandb_base_url,
+    validate_live_transport_environment,
+)
 from .weave_sink import LogOutcome, WeaveSink, expected_turn_span_count
 
-_PROJECT = re.compile(r"^[^/\s]+/[^/\s]+$")
+_PROJECT = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+)
 
 
 @dataclass(frozen=True)
 class ImportConfig:
     days: int
-    project: str = "wandb/hivemind-chats"
+    project: str
     idle_minutes: int = 10
     state_path: Path = Path("~/.hivemind/weave-importer/state.sqlite3")
     dry_run: bool = False
+    confirm_project: str = ""
+    trace_server_url: str = "https://trace.wandb.ai"
+    wandb_base_url: str = "https://api.wandb.ai"
     verification_timeout: float = 60.0
     cutoff: datetime | None = None
     session_ids: frozenset[str] = frozenset()
@@ -48,7 +61,11 @@ class ImportConfig:
         if self.idle_minutes < 0:
             raise ValueError("--idle-minutes cannot be negative")
         if not _PROJECT.fullmatch(self.project):
-            raise ValueError("--project must use the entity/project form")
+            raise ValueError("--project must use a bounded ASCII entity/project slug")
+        if not self.dry_run and self.confirm_project != self.project:
+            raise ValueError(
+                "live import requires --confirm-project to exactly match --project"
+            )
         if self.verification_timeout <= 0:
             raise ValueError("verification timeout must be positive")
 
@@ -559,6 +576,8 @@ def _run_config_payload(config: ImportConfig) -> dict[str, Any]:
         "days": config.days,
         "idle_minutes": config.idle_minutes,
         "project": config.project,
+        "trace_server_url": config.trace_server_url,
+        "wandb_base_url": config.wandb_base_url,
         "session_ids": sorted(config.session_ids),
         "verification_timeout": config.verification_timeout,
     }
@@ -566,6 +585,7 @@ def _run_config_payload(config: ImportConfig) -> dict[str, Any]:
 
 def _configure_required_pii() -> None:
     try:
+        enforce_weave_error_reporting_disabled()
         configure_weave_pii()
     except Exception as error:
         raise WeaveImportError(
@@ -736,7 +756,10 @@ def _process_ready_run(
 
     api_key = os.environ.get("WANDB_API_KEY", "")
     active_verifier = verifier
-    active_sink = sink or WeaveSink()
+    active_sink = sink or WeaveSink(
+        trace_server_url=config.trace_server_url,
+        wandb_base_url=config.wandb_base_url,
+    )
     sink_started = False
     sink_finished = False
     upload_aborted = False
@@ -800,7 +823,11 @@ def _process_ready_run(
                             "WANDB_API_KEY is not set; pending uploads require remote "
                             "reconciliation before they can be resumed"
                         )
-                    active_verifier = WeaveVerifier(project=config.project, api_key=api_key)
+                    active_verifier = WeaveVerifier(
+                        project=config.project,
+                        api_key=api_key,
+                        base_url=config.trace_server_url,
+                    )
 
             before_failed = report.failed
             before_conflicted = report.conflicted
@@ -843,7 +870,11 @@ def _process_ready_run(
                     "WANDB_API_KEY is not set; export it in the process environment and retry"
                 )
             if active_verifier is None:
-                active_verifier = WeaveVerifier(project=config.project, api_key=api_key)
+                active_verifier = WeaveVerifier(
+                    project=config.project,
+                    api_key=api_key,
+                    base_url=config.trace_server_url,
+                )
             if not sink_started:
                 try:
                     active_sink.start(config.project)
@@ -945,6 +976,35 @@ def run_import(
     verifier: WeaveVerifier | None = None,
 ) -> RunReport:
     config.validate()
+    with disabled_weave_error_reporting():
+        if config.dry_run:
+            return _run_import_impl(
+                config,
+                hivemind=hivemind,
+                sink=sink,
+                verifier=verifier,
+            )
+        validate_live_transport_environment()
+        config = replace(
+            config,
+            trace_server_url=resolve_trace_server_url(),
+            wandb_base_url=resolve_wandb_base_url(),
+        )
+        return _run_import_impl(
+            config,
+            hivemind=hivemind,
+            sink=sink,
+            verifier=verifier,
+        )
+
+
+def _run_import_impl(
+    config: ImportConfig,
+    *,
+    hivemind: HiveMindClient | None,
+    sink: WeaveSink | None,
+    verifier: WeaveVerifier | None,
+) -> RunReport:
     report = RunReport()
     cutoff = config.cutoff or datetime.now(UTC)
     cutoff = cutoff.replace(tzinfo=UTC) if cutoff.tzinfo is None else cutoff.astimezone(UTC)

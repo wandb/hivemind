@@ -7,10 +7,7 @@ from typing import Any
 
 import hivemind_weave.pii as pii_module
 from hivemind_weave.atif import map_atif
-from hivemind_weave.attribute_safety import (
-    MAX_ATTRIBUTE_VALUE_CHARS,
-    restore_chunked_attributes,
-)
+from hivemind_weave.attribute_safety import MAX_ATTRIBUTE_VALUE_CHARS
 from hivemind_weave.models import Session
 from hivemind_weave.pii import (
     configure_weave_pii,
@@ -241,9 +238,7 @@ def test_verification_signature_keeps_sdk_json_looking_content_as_text(
     assert observed_roles == ["user", "assistant"]
 
 
-def test_large_redaction_cache_keeps_only_redacted_outputs(
-    monkeypatch: Any,
-) -> None:
+def test_redaction_cache_uses_only_digest_keys_and_redacted_values(monkeypatch: Any) -> None:
     calls = 0
 
     def fake_redactor(value: str) -> str:
@@ -251,18 +246,19 @@ def test_large_redaction_cache_keeps_only_redacted_outputs(
         calls += 1
         return f"[safe:{len(value)}]"
 
-    pii_module._LARGE_REDACTION_CACHE.clear()
-    monkeypatch.setattr(pii_module, "_LARGE_REDACTION_CACHE_CHARS", 0)
     monkeypatch.setattr(pii_module, "_redact_pii_string_uncached", fake_redactor)
     source = "private-source-value " * 500
+    pii_module._REDACTION_CACHE.clear()
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_CHARS", 0)
 
     assert pii_module._redact_pii_string(source) == f"[safe:{len(source)}]"
     assert pii_module._redact_pii_string(source) == f"[safe:{len(source)}]"
     assert calls == 1
-    assert source not in pii_module._LARGE_REDACTION_CACHE.values()
+    assert all(source not in str(key) for key in pii_module._REDACTION_CACHE)
+    assert source not in pii_module._REDACTION_CACHE.values()
 
 
-def test_sanitization_chunks_large_canonical_attributes_after_pii(
+def test_sanitization_keeps_large_attributes_inline_for_fail_closed_preflight(
     monkeypatch: Any,
     session_payload: Callable[..., dict[str, Any]],
     atif_wrapper: Callable[..., dict[str, Any]],
@@ -275,13 +271,7 @@ def test_sanitization_chunks_large_canonical_attributes_after_pii(
     sanitized = sanitize_mapped_conversation(conversation)
     attributes = sanitized.turns[0].attributes
 
-    assert "hivemind.preserved_step_data" not in attributes
-    assert attributes["hivemind.preserved_step_data.chunk_count"] == 2
-    assert (
-        attributes["hivemind.preserved_step_data.chunk.0000"]
-        + attributes["hivemind.preserved_step_data.chunk.0001"]
-        == source
-    )
+    assert attributes["hivemind.preserved_step_data"] == source
 
 
 def test_source_payload_hash_is_stable_across_different_ml_redactions(
@@ -326,6 +316,6 @@ def test_source_payload_hash_is_stable_across_different_ml_redactions(
     assert first.attributes["hivemind.source_payload_sha256"] == first.payload_sha256
     assert second.attributes["hivemind.source_payload_sha256"] == second.payload_sha256
     assert (
-        restore_chunked_attributes(first.attributes)["hivemind.preserved_step_data"]
-        != (restore_chunked_attributes(second.attributes)["hivemind.preserved_step_data"])
+        first.attributes["hivemind.preserved_step_data"]
+        != second.attributes["hivemind.preserved_step_data"]
     )

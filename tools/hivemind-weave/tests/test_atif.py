@@ -8,6 +8,41 @@ import pytest
 from hivemind_weave.atif import content_to_text, map_atif
 from hivemind_weave.errors import ATIFSchemaError
 from hivemind_weave.models import Session
+from hivemind_weave.redaction import redact_string
+
+
+@pytest.mark.parametrize("unsafe_id", ["line\nbreak", "ansi\x1b[31m", "path/segment", "x" * 257])
+def test_session_ids_use_a_bounded_terminal_safe_grammar(
+    unsafe_id: str,
+    session_payload: Callable[..., dict[str, Any]],
+) -> None:
+    with pytest.raises(ATIFSchemaError, match="unsafe or unsupported"):
+        Session.from_api(session_payload(id=unsafe_id))
+
+
+@pytest.mark.parametrize(
+    "credential_shaped_id",
+    [
+        "sk-proj-1234567890abcdef",
+        "AKIAIOSFODNN7EXAMPLE",
+        "eyJabcde.abcdefgh.abcdefgh",
+        "4111111111111111-1",
+    ],
+)
+def test_session_ids_reject_values_changed_by_credential_redaction(
+    credential_shaped_id: str,
+    session_payload: Callable[..., dict[str, Any]],
+) -> None:
+    with pytest.raises(ATIFSchemaError, match="unsafe or unsupported"):
+        Session.from_api(session_payload(id=credential_shaped_id))
+
+
+def test_session_ids_preserve_normal_opaque_identifiers(
+    session_payload: Callable[..., dict[str, Any]],
+) -> None:
+    source_id = "11111111-1111-4111-8111-111111111111"
+
+    assert Session.from_api(session_payload(id=source_id)).id == source_id
 
 
 @pytest.mark.parametrize("minor", [*range(8), 8, 42])
@@ -720,6 +755,23 @@ def test_non_numeric_step_ids_are_hashed_in_searchable_turn_keys(
     turn = map_atif(Session.from_api(session_payload()), atif_wrapper(steps=steps)).turns[0]
     assert turn.key.startswith("atif:step:sha256:")
     assert "Alice" not in turn.key
+
+
+def test_redaction_sensitive_numeric_step_ids_are_hashed_in_turn_keys(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    card_number = "4111111111111111"
+    steps = [
+        {"step_id": card_number, "source": "user", "message": "hello"},
+        {"step_id": 2, "source": "agent", "message": "world"},
+    ]
+
+    turn = map_atif(Session.from_api(session_payload()), atif_wrapper(steps=steps)).turns[0]
+
+    assert turn.key.startswith("atif:step:sha256:")
+    assert card_number not in turn.key
+    assert redact_string(turn.key) == turn.key
 
 
 def test_payload_hash_changes_when_preserved_step_data_changes(

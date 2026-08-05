@@ -8,7 +8,9 @@ from hivemind_weave.models import RunReport
 
 
 def test_cli_validates_days_before_source_access(capsys: Any) -> None:
-    exit_code = cli.main(["import", "--days", "0", "--dry-run"])
+    exit_code = cli.main(
+        ["import", "--days", "0", "--project", "wandb/hivemind-chats", "--dry-run"]
+    )
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "between 1 and 365" in captured.err
@@ -45,3 +47,11 @@ def test_cli_builds_expected_config(monkeypatch: Any, tmp_path: Path, capsys: An
     assert captured_config[0].idle_minutes == 15
     assert captured_config[0].state_path == state_path
     assert captured_config[0].dry_run is True
+
+
+def test_cli_requires_project_bound_confirmation_for_live_import(capsys: Any) -> None:
+    exit_code = cli.main(
+        ["import", "--days", "7", "--project", "wandb/hivemind-chats"]
+    )
+    assert exit_code == 1
+    assert "--confirm-project" in capsys.readouterr().err

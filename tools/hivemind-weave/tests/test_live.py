@@ -8,12 +8,6 @@ from typing import Any
 import pytest
 
 from hivemind_weave.atif import map_atif
-from hivemind_weave.attribute_safety import (
-    ARCHIVAL_ATTRIBUTE_KEYS,
-    ATTRIBUTE_SPILL_FRAGMENT_COUNT_KEY,
-    ATTRIBUTE_SPILL_MANIFEST_KEY,
-    restore_chunked_attributes,
-)
 from hivemind_weave.hivemind import HiveMindClient
 from hivemind_weave.importer import ImportConfig, run_import
 from hivemind_weave.models import MappedTurn, Session
@@ -119,6 +113,10 @@ def test_one_session_live_import_is_idempotent(tmp_path: Path) -> None:
         pytest.fail(
             "live test requires HIVEMIND_WEAVE_LIVE_SESSION_ID and HIVEMIND_WEAVE_LIVE_PROJECT"
         )
+    if os.environ.get("HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT") != project:
+        pytest.fail(
+            "HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT must exactly match the disposable project"
+        )
     api_key = os.environ.get("WANDB_API_KEY")
     if not api_key:
         pytest.fail("live test requires WANDB_API_KEY")
@@ -140,6 +138,7 @@ def test_one_session_live_import_is_idempotent(tmp_path: Path) -> None:
         project=project,
         idle_minutes=0,
         state_path=tmp_path / "live-state.sqlite3",
+        confirm_project=project,
         session_ids=frozenset({session_id}),
     )
     first = run_import(config)
@@ -174,12 +173,8 @@ def test_one_session_live_import_is_idempotent(tmp_path: Path) -> None:
             conversation_id=expected.conversation_id,
             trace_id=trace_id,
         )
-        logical_attributes = restore_chunked_attributes(expected_turn.attributes)
-        archival_keys = ARCHIVAL_ATTRIBUTE_KEYS.intersection(logical_attributes)
-        assert archival_keys
-        assert ATTRIBUTE_SPILL_MANIFEST_KEY in remote_attributes
-        assert int(remote_attributes[ATTRIBUTE_SPILL_FRAGMENT_COUNT_KEY]) >= 1
-        assert archival_keys.isdisjoint(remote_attributes)
+        for key, value in expected_turn.attributes.items():
+            assert remote_attributes.get(key) == value
         messages = remote_turn.get("messages", [])
         timestamps = [
             parsed

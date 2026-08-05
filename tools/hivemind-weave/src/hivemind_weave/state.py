@@ -600,12 +600,13 @@ class StateStore:
                 raise StateConflictError(f"{label} has an unsafe owner or file type")
             if not directory and details.st_nlink != 1:
                 raise StateConflictError(f"{label} must not be hard-linked")
-            os.fchmod(fd, mode)
             secured = os.fstat(fd)
         except OSError as error:
-            raise StateConflictError(f"{label} permissions could not be secured") from error
+            raise StateConflictError(f"{label} permissions could not be validated") from error
         if stat.S_IMODE(secured.st_mode) != mode:
-            raise StateConflictError(f"{label} permissions are not private")
+            raise StateConflictError(
+                f"{label} permissions are not private; refusing to change an existing path"
+            )
         return secured
 
     def _open_regular_at(self, name: str, *, create: bool, label: str) -> int:

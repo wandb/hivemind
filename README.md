@@ -139,6 +139,9 @@ If you already use [W&B Weave](https://wandb.ai/site/weave/), it works together 
 - Weave observes what your AI application does in _production_, tracking LLM and agent traces, evaluations, and quality.
 - HiveMind observes how your team _builds software_ with AI coding agents, tracking details like sessions, spend, and productivity.
 
+To review personal HiveMind coding chats in Weave Agents, see the experimental
+[`hivemind-weave` importer](tools/hivemind-weave/README.md).
+
 ## Next steps
 
 - [hivemind.wandb.tools](https://hivemind.wandb.tools): Sign in and see your team's sessions on the live dashboard

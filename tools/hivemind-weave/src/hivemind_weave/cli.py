@@ -15,8 +15,18 @@ from .backfill import (
     preview_backfill,
     resolve_backfill_window,
 )
-from .errors import BackfillError, ImporterError
+from .errors import BackfillError, ImporterError, ReviewMirrorError
 from .importer import ImportConfig, run_import
+from .review import (
+    REVIEW_PROJECT,
+    ReviewApplyConfig,
+    ReviewPreviewConfig,
+    ReviewReconcileConfig,
+    apply_review,
+    preview_review,
+    reconcile_review,
+    review_status,
+)
 from .scheduled_sync import (
     ScheduledSyncError,
     SyncConfig,
@@ -164,6 +174,52 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ENTITY/PROJECT",
         help="required for apply and must exactly match --project",
     )
+
+    review_parser = subparsers.add_parser(
+        "review",
+        help="manage the noncanonical content-object Agents review mirror",
+    )
+    review_subparsers = review_parser.add_subparsers(dest="review_command", required=True)
+    review_state_default = Path("~/.hivemind/weave-importer/state.sqlite3")
+
+    review_preview = review_subparsers.add_parser(
+        "preview",
+        help="seal a redacted, content-free review plan without uploading",
+    )
+    review_preview.add_argument("--since", required=True, help="inclusive RFC3339 timestamp")
+    review_preview.add_argument(
+        "--until",
+        help="exclusive RFC3339 timestamp (default: captured current UTC time)",
+    )
+    review_preview.add_argument("--project", required=True)
+    review_preview.add_argument("--agent", action="append", default=[])
+    review_preview.add_argument("--repo", action="append", default=[])
+    review_preview.add_argument("--session-id", action="append", default=[])
+    review_preview.add_argument("--exclude-subagents", action="store_true")
+    review_preview.add_argument("--canary", action="store_true")
+    review_preview.add_argument("--state-path", type=Path, default=review_state_default)
+
+    review_apply = review_subparsers.add_parser(
+        "apply",
+        help="apply a bounded number of whole sessions from a sealed review plan",
+    )
+    review_apply.add_argument("--plan", dest="plan_id", required=True)
+    review_apply.add_argument("--max-sessions", type=int, required=True)
+    review_apply.add_argument("--confirm-project", required=True)
+    review_apply.add_argument("--state-path", type=Path, default=review_state_default)
+
+    review_status_parser = review_subparsers.add_parser(
+        "status",
+        help="show content-free local review progress",
+    )
+    review_status_parser.add_argument("--state-path", type=Path, default=review_state_default)
+
+    review_reconcile = review_subparsers.add_parser(
+        "reconcile",
+        help="query exact root evidence without retrying an ambiguous submission",
+    )
+    review_reconcile.add_argument("--plan", dest="plan_id", required=True)
+    review_reconcile.add_argument("--state-path", type=Path, default=review_state_default)
 
     auth_parser = subparsers.add_parser("auth", help="manage scheduler authentication")
     auth_subparsers = auth_parser.add_subparsers(dest="auth_backend", required=True)
@@ -319,6 +375,60 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             rendered = report.render()
+        elif args.command == "review":
+            if args.review_command == "preview":
+                if args.project != REVIEW_PROJECT:
+                    raise ValueError(
+                        f"review preview requires the fixed private project {REVIEW_PROJECT}"
+                    )
+                print(f"Weave destination (review preview): {args.project}", flush=True)
+                report = preview_review(
+                    ReviewPreviewConfig(
+                        since=args.since,
+                        until=args.until,
+                        project=args.project,
+                        state_path=args.state_path,
+                        canary=args.canary,
+                        agents=tuple(args.agent),
+                        repositories=tuple(args.repo),
+                        session_ids=tuple(args.session_id),
+                        exclude_subagents=args.exclude_subagents,
+                    )
+                )
+                rendered = report.render()
+            elif args.review_command == "apply":
+                if args.confirm_project != REVIEW_PROJECT:
+                    raise ValueError(f"review apply requires --confirm-project {REVIEW_PROJECT}")
+                print(
+                    f"Weave destination (review apply): {args.confirm_project}",
+                    flush=True,
+                )
+                report = apply_review(
+                    ReviewApplyConfig(
+                        plan_id=args.plan_id,
+                        confirm_project=args.confirm_project,
+                        state_path=args.state_path,
+                        max_sessions=args.max_sessions,
+                    )
+                )
+                rendered = report.render()
+            elif args.review_command == "status":
+                print(review_status(args.state_path, project=REVIEW_PROJECT))
+                return 0
+            elif args.review_command == "reconcile":
+                print(
+                    f"Weave destination (review reconcile): {REVIEW_PROJECT}",
+                    flush=True,
+                )
+                report = reconcile_review(
+                    ReviewReconcileConfig(
+                        plan_id=args.plan_id,
+                        state_path=args.state_path,
+                    )
+                )
+                rendered = report.render()
+            else:  # pragma: no cover - guarded by argparse.
+                parser.error("a review command is required")
         elif args.command == "auth":
             if args.auth_backend != "keychain" or args.keychain_command != "set":
                 parser.error("an auth keychain command is required")
@@ -407,7 +517,10 @@ def main(argv: list[str] | None = None) -> int:
         else:  # pragma: no cover - guarded by argparse's required subparser.
             parser.error("a command is required")
     except (ImporterError, ValueError) as error:
-        if isinstance(error, (ValueError, BackfillError, ScheduledSyncError)):
+        if isinstance(
+            error,
+            (ValueError, BackfillError, ReviewMirrorError, ScheduledSyncError),
+        ):
             message = str(error)
         else:
             message = "private failure details were withheld; inspect the private state/status"

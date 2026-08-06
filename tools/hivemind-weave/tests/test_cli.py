@@ -4,9 +4,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from hivemind_weave import cli
 from hivemind_weave.backfill import BackfillReport
+from hivemind_weave.errors import ReviewMirrorUncertainError
 from hivemind_weave.models import RunReport
+from hivemind_weave.review import REVIEW_PROJECT, ReviewReport
 from hivemind_weave.scheduled_sync import SyncInspection, SyncOnceOutcome, SyncStatus
 
 
@@ -259,6 +263,220 @@ def test_backfill_rejects_phase_inapplicable_flags(capsys: Any) -> None:
     assert preview_exit == apply_exit == 1
     assert "apply-only" in captured.err
     assert "sealed timezone" in captured.err
+
+
+def _review_report(*, phase: str = "preview") -> ReviewReport:
+    return ReviewReport(
+        phase=phase,
+        project=REVIEW_PROJECT,
+        plan_id="c" * 64,
+        status="planned",
+        since_utc=datetime(2026, 7, 16, tzinfo=UTC),
+        until_utc=datetime(2026, 8, 6, tzinfo=UTC),
+        selector="backlog",
+        selected_sessions=2,
+        remaining_sessions=2,
+    )
+
+
+def test_review_preview_builds_exact_filters_and_prints_fixed_project_first(
+    monkeypatch: Any,
+    tmp_path: Path,
+    capsys: Any,
+) -> None:
+    captured: list[Any] = []
+
+    def fake_preview(config: Any) -> ReviewReport:
+        captured.append(config)
+        return _review_report()
+
+    monkeypatch.setattr(cli, "preview_review", fake_preview)
+    state_path = tmp_path / "state.sqlite3"
+    exit_code = cli.main(
+        [
+            "review",
+            "preview",
+            "--since",
+            "2026-07-16T16:00:00Z",
+            "--until",
+            "2026-08-06T16:00:00Z",
+            "--project",
+            REVIEW_PROJECT,
+            "--agent",
+            "codex",
+            "--repo",
+            "wandb/hivemind",
+            "--session-id",
+            "session-1",
+            "--exclude-subagents",
+            "--canary",
+            "--state-path",
+            str(state_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured[0].agents == ("codex",)
+    assert captured[0].repositories == ("wandb/hivemind",)
+    assert captured[0].session_ids == ("session-1",)
+    assert captured[0].exclude_subagents is True
+    assert captured[0].canary is True
+    assert captured[0].state_path == state_path
+    output = capsys.readouterr().out
+    assert output.startswith(f"Weave destination (review preview): {REVIEW_PROJECT}\n")
+
+
+def test_review_preview_does_not_expose_a_timezone_option(capsys: Any) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            [
+                "review",
+                "preview",
+                "--since",
+                "2026-07-16T00:00:00Z",
+                "--project",
+                REVIEW_PROJECT,
+                "--timezone",
+                "UTC",
+            ]
+        )
+    assert "unrecognized arguments: --timezone UTC" in capsys.readouterr().err
+
+
+def test_review_apply_requires_fixed_confirmation_and_passes_session_budget(
+    monkeypatch: Any,
+    tmp_path: Path,
+    capsys: Any,
+) -> None:
+    captured: list[Any] = []
+
+    def fake_apply(config: Any) -> ReviewReport:
+        captured.append(config)
+        return _review_report(phase="apply")
+
+    monkeypatch.setattr(cli, "apply_review", fake_apply)
+    state_path = tmp_path / "state.sqlite3"
+    exit_code = cli.main(
+        [
+            "review",
+            "apply",
+            "--plan",
+            "c" * 12,
+            "--max-sessions",
+            "5",
+            "--confirm-project",
+            REVIEW_PROJECT,
+            "--state-path",
+            str(state_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured[0].plan_id == "c" * 12
+    assert captured[0].max_sessions == 5
+    assert captured[0].confirm_project == REVIEW_PROJECT
+    assert capsys.readouterr().out.startswith(
+        f"Weave destination (review apply): {REVIEW_PROJECT}\n"
+    )
+
+
+def test_review_reconcile_and_status_use_the_fixed_project_without_confirmation(
+    monkeypatch: Any,
+    tmp_path: Path,
+    capsys: Any,
+) -> None:
+    reconciled: list[Any] = []
+    statuses: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        cli,
+        "reconcile_review",
+        lambda config: reconciled.append(config) or _review_report(phase="reconcile"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "review_status",
+        lambda state_path, *, project: statuses.append((state_path, project)) or "status ok",
+    )
+    state_path = tmp_path / "state.sqlite3"
+
+    assert (
+        cli.main(
+            [
+                "review",
+                "reconcile",
+                "--plan",
+                "c" * 12,
+                "--state-path",
+                str(state_path),
+            ]
+        )
+        == 0
+    )
+    assert reconciled[0].plan_id == "c" * 12
+    assert not hasattr(reconciled[0], "confirm_project")
+    assert cli.main(["review", "status", "--state-path", str(state_path)]) == 0
+    assert statuses == [(state_path, REVIEW_PROJECT)]
+    output = capsys.readouterr().out
+    assert f"Weave destination (review reconcile): {REVIEW_PROJECT}" in output
+    assert "status ok" in output
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["review", "status", "--project", REVIEW_PROJECT])
+
+
+def test_review_commands_reject_non_review_projects_before_dispatch(
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "preview_review",
+        lambda _config: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+    )
+    exit_code = cli.main(
+        [
+            "review",
+            "preview",
+            "--since",
+            "2026-07-16T00:00:00Z",
+            "--project",
+            "wandb/hivemind-chats-v2",
+        ]
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "fixed private project" in captured.err
+    assert not captured.out
+
+
+def test_review_uncertainty_prints_content_free_reconciliation_direction(
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "apply_review",
+        lambda _config: (_ for _ in ()).throw(
+            ReviewMirrorUncertainError("review root delivery is uncertain; run review reconcile")
+        ),
+    )
+
+    exit_code = cli.main(
+        [
+            "review",
+            "apply",
+            "--plan",
+            "c" * 12,
+            "--max-sessions",
+            "1",
+            "--confirm-project",
+            REVIEW_PROJECT,
+        ]
+    )
+
+    assert exit_code == 1
+    assert "run review reconcile" in capsys.readouterr().err
 
 
 def test_sync_configure_builds_secret_free_incremental_policy(

@@ -8,9 +8,10 @@ import os
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
@@ -290,6 +291,7 @@ class BatchVerificationResult:
 class _RootSignatureEvidence:
     span_id: str
     signature: str | None
+    metadata_state: str = "unused"
 
 
 def _trace_server_url() -> str:
@@ -614,11 +616,45 @@ class WeaveVerifier:
             }
         )
 
+    @staticmethod
+    def _root_metadata_state(
+        span: dict[str, Any],
+        *,
+        expected_root_attributes: Mapping[str, str] | None,
+        expected_started_at: datetime | None,
+        expected_ended_at: datetime | None,
+    ) -> str:
+        """Classify independently read root metadata as exact, missing, or mismatched."""
+        if expected_root_attributes is None:
+            return "unused"
+        attributes = span.get("custom_attrs_string")
+        started_at = parse_datetime(span.get("started_at"))
+        ended_at = parse_datetime(span.get("ended_at"))
+        if (
+            not isinstance(attributes, dict)
+            or any(key not in attributes for key in expected_root_attributes)
+            or started_at is None
+            or ended_at is None
+        ):
+            # Detail/custom-attribute indexes can lag the root-key index. Keep
+            # polling when required evidence is absent, but never accept it.
+            return "missing"
+        if (
+            any(attributes.get(key) != value for key, value in expected_root_attributes.items())
+            or started_at != expected_started_at
+            or ended_at != expected_ended_at
+        ):
+            return "mismatch"
+        return "exact"
+
     def root_span_signatures_many(
         self,
         *,
         conversation_id: str,
         trace_ids: list[str],
+        expected_root_attributes: Mapping[str, str] | None = None,
+        expected_started_at: datetime | None = None,
+        expected_ended_at: datetime | None = None,
         request_timeout: float = 30.0,
     ) -> dict[str, list[_RootSignatureEvidence]]:
         """Read canonical root messages for many traces in bounded queries.
@@ -638,23 +674,29 @@ class WeaveVerifier:
             expected_total: int | None = None
             seen_span_ids: set[tuple[str, str]] = set()
             while True:
+                request: dict[str, Any] = {
+                    "project_id": self.project,
+                    "query": {
+                        "$expr": {
+                            "$and": [
+                                _equals("conversation_id", conversation_id),
+                                _equals("parent_span_id", ""),
+                                _one_of("trace_id", trace_id_batch),
+                            ]
+                        }
+                    },
+                    "include_details": True,
+                    "limit": _VERIFICATION_QUERY_PAGE_SIZE,
+                    "offset": offset,
+                }
+                if expected_root_attributes is not None:
+                    request["custom_attr_columns"] = [
+                        {"source": "custom_attrs_string", "key": key}
+                        for key in sorted(expected_root_attributes)
+                    ]
                 payload = self._post(
                     "/agents/spans/query",
-                    {
-                        "project_id": self.project,
-                        "query": {
-                            "$expr": {
-                                "$and": [
-                                    _equals("conversation_id", conversation_id),
-                                    _equals("parent_span_id", ""),
-                                    _one_of("trace_id", trace_id_batch),
-                                ]
-                            }
-                        },
-                        "include_details": True,
-                        "limit": _VERIFICATION_QUERY_PAGE_SIZE,
-                        "offset": offset,
-                    },
+                    request,
                     timeout=request_timeout,
                 )
                 spans = payload.get("spans")
@@ -696,6 +738,12 @@ class WeaveVerifier:
                         _RootSignatureEvidence(
                             span_id=span_id,
                             signature=self._root_span_signature(span),
+                            metadata_state=self._root_metadata_state(
+                                span,
+                                expected_root_attributes=expected_root_attributes,
+                                expected_started_at=expected_started_at,
+                                expected_ended_at=expected_ended_at,
+                            ),
                         )
                     )
                 offset += len(spans)
@@ -1075,8 +1123,66 @@ class WeaveVerifier:
         verification_signature: str = "",
         alternate_verification_signatures: tuple[str, ...] = (),
         expected_span_count: int = 0,
+        expected_root_attributes: Mapping[str, str] | None = None,
+        expected_started_at: datetime | None = None,
+        expected_ended_at: datetime | None = None,
         timeout_seconds: float = 60.0,
     ) -> ReconcileResult:
+        expects_root_metadata = any(
+            value is not None
+            for value in (
+                expected_root_attributes,
+                expected_started_at,
+                expected_ended_at,
+            )
+        )
+        if expects_root_metadata:
+            if (
+                not isinstance(expected_root_attributes, Mapping)
+                or not expected_root_attributes
+                or any(
+                    not isinstance(key, str) or not key or not isinstance(value, str)
+                    for key, value in expected_root_attributes.items()
+                )
+                or not isinstance(expected_started_at, datetime)
+                or expected_started_at.tzinfo is None
+                or expected_started_at.utcoffset() is None
+                or not isinstance(expected_ended_at, datetime)
+                or expected_ended_at.tzinfo is None
+                or expected_ended_at.utcoffset() is None
+                or expected_ended_at < expected_started_at
+            ):
+                raise VerificationError("exact root metadata expectation is malformed")
+            expected_root_attributes = dict(expected_root_attributes)
+
+        def metadata_matches(
+            evidence: dict[str, list[_RootSignatureEvidence]],
+            *,
+            trace_ids: set[str],
+            expected_root_span_ids: set[str] | None = None,
+        ) -> tuple[list[str], bool]:
+            if not expects_root_metadata:
+                return sorted(trace_ids), False
+            exact: list[str] = []
+            mismatch = False
+            for trace_id in trace_ids:
+                roots = evidence.get(trace_id, [])
+                if len(roots) != 1:
+                    continue
+                root = roots[0]
+                if root.metadata_state == "mismatch":
+                    mismatch = True
+                    continue
+                if (
+                    expected_root_span_ids is not None
+                    and root.span_id not in expected_root_span_ids
+                ):
+                    mismatch = True
+                    continue
+                if root.metadata_state == "exact":
+                    exact.append(trace_id)
+            return sorted(exact), mismatch
+
         deadline = self.monotonic() + timeout_seconds
         verification_signatures = {
             item for item in (verification_signature, *alternate_verification_signatures) if item
@@ -1160,12 +1266,33 @@ class WeaveVerifier:
                         self.root_span_signatures_many(
                             conversation_id=conversation_id,
                             trace_ids=sorted(matched_ids),
+                            expected_root_attributes=expected_root_attributes,
+                            expected_started_at=expected_started_at,
+                            expected_ended_at=expected_ended_at,
                             request_timeout=min(30.0, remaining),
                         )
-                        if verification_signatures
+                        if verification_signatures or expects_root_metadata
                         else {}
                     )
                     if any(len(root_evidence.get(trace_id, [])) > 1 for trace_id in matched_ids):
+                        return ReconcileResult(
+                            matches=2,
+                            trace_ids=matched.trace_ids,
+                            root_span_ids=sorted(
+                                {
+                                    root.span_id
+                                    for trace_id in matched_ids
+                                    for root in root_evidence.get(trace_id, [])
+                                }
+                            ),
+                            span_count=remote_span_count,
+                        )
+                    metadata_trace_matches, metadata_mismatch = metadata_matches(
+                        root_evidence,
+                        trace_ids=matched_ids,
+                        expected_root_span_ids=set(matched.root_span_ids),
+                    )
+                    if metadata_mismatch:
                         return ReconcileResult(
                             matches=2,
                             trace_ids=matched.trace_ids,
@@ -1201,6 +1328,7 @@ class WeaveVerifier:
                         complete_count
                         and matched_ids.issubset(chat_ids)
                         and len(signature_matches) == 1
+                        and len(metadata_trace_matches) == 1
                     ):
                         return candidate
                     saw_incomplete_match = candidate
@@ -1229,9 +1357,12 @@ class WeaveVerifier:
                         self.root_span_signatures_many(
                             conversation_id=conversation_id,
                             trace_ids=sorted(expected_ids),
+                            expected_root_attributes=expected_root_attributes,
+                            expected_started_at=expected_started_at,
+                            expected_ended_at=expected_ended_at,
                             request_timeout=min(30.0, remaining),
                         )
-                        if verification_signatures
+                        if verification_signatures or expects_root_metadata
                         else {}
                     )
                     remote_span_count = (
@@ -1268,6 +1399,17 @@ class WeaveVerifier:
                             trace_ids=sorted(expected_ids),
                             root_span_ids=root_span_ids,
                         )
+                    metadata_trace_matches, metadata_mismatch = metadata_matches(
+                        root_evidence,
+                        trace_ids=expected_ids,
+                    )
+                    if metadata_mismatch:
+                        return ReconcileResult(
+                            matches=2,
+                            trace_ids=sorted(expected_ids),
+                            root_span_ids=root_span_ids,
+                            span_count=remote_span_count,
+                        )
                     candidate = ReconcileResult(
                         matches=1,
                         trace_ids=sorted(expected_ids),
@@ -1288,6 +1430,7 @@ class WeaveVerifier:
                     if (
                         expected_ids.issubset(chat_ids)
                         and len(signature_matches) == 1
+                        and len(metadata_trace_matches) == 1
                         and complete_count
                     ):
                         return candidate

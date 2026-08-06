@@ -38,7 +38,7 @@ class Session:
             raise ATIFSchemaError("session summary has an unsafe or unsupported id")
         started_at = parse_datetime(data.get("started_at"))
         if started_at is None:
-            raise ATIFSchemaError(f"session {session_id} has an invalid started_at timestamp")
+            raise ATIFSchemaError("session summary has an invalid started_at timestamp")
         parsed_activity = parse_datetime(data.get("last_activity_at"))
         last_activity_at = parsed_activity or started_at
         repository = first_present(data, "git_repo", "repository", "repo", "repo_name", default="")

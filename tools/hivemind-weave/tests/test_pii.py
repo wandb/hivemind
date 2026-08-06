@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import socket
 from collections.abc import Callable
+from dataclasses import asdict
 from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 import hivemind_weave.pii as pii_module
 from hivemind_weave.atif import map_atif
 from hivemind_weave.attribute_safety import MAX_ATTRIBUTE_VALUE_CHARS
-from hivemind_weave.models import ChatMessage, Session
+from hivemind_weave.models import ChatMessage, MappedSubAgent, Session
 from hivemind_weave.pii import (
     configure_weave_pii,
     redact_agent_name,
     redact_model_name,
+    redact_source_coordinate,
     redact_upload_data,
     sanitize_mapped_conversation,
 )
@@ -75,11 +79,160 @@ def test_code_aware_redaction_preserves_ordinary_identifiers() -> None:
         "class Washington:\n    pass",
         "class Washington:\n    pass\n\nx = Washington()",
         "const Paris = new Map();",
+        "class CustomerLedger:\n    pass",
+        "def customer_ledger(value):\n    return value",
         "def jordan(value):\n    return value",
     ]
     assert [redact_upload_data(value) for value in code_samples] == code_samples
     assert redact_agent_name("cursor") == "cursor"
     assert redact_model_name("o3") == "o3"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "class AliceJohnson:\n    pass",
+        "const AliceJohnson = new Map();",
+        "def AliceJohnson(value):\n    return value",
+        "const result = new AliceJohnson();",
+        "AliceJohnson::run()",
+        "def alice_johnson(value):\n    return alice_johnson(value)",
+        "const alice$johnson = 1;",
+        "class Alice_Johnson:\n    pass",
+        "const result = new Alice_Johnson();",
+        "alice_johnson()",
+        "Alice_Johnson::run()",
+    ],
+)
+def test_person_names_cannot_hide_in_declared_code_identifiers(code: str) -> None:
+    redacted = str(redact_upload_data(code))
+    assert "Alice" not in redacted
+    assert "Johnson" not in redacted
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "session-AliceJohnson",
+        "call-JohnSmith",
+        "gpt-AliceJohnson",
+        "gpt-5-john-smith",
+        "claude-3-john-smith",
+        "gemini-2-john-smith",
+        "codex-5-john-smith",
+        "Claude",
+    ],
+)
+def test_protocol_shaped_text_cannot_bypass_pii_redaction(source: str) -> None:
+    redacted = str(redact_upload_data(source))
+    assert redacted != source
+    assert "john" not in redacted.lower()
+    assert "smith" not in redacted.lower()
+    assert "alice" not in redacted.lower()
+
+
+def test_field_specific_model_metadata_keeps_reviewed_machine_names() -> None:
+    for model in ("gpt-5.6-codex", "claude-sonnet-4-5", "gemini-2.5-pro", "o3"):
+        assert redact_model_name(model) == model
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5-john-smith",
+        "claude-3-john-smith",
+        "gemini-2-john-smith",
+        "codex-5-john-smith",
+    ],
+)
+def test_field_specific_model_metadata_scrubs_name_like_suffixes(model: str) -> None:
+    redacted = redact_model_name(model)
+    assert "john" not in redacted.lower()
+    assert "smith" not in redacted.lower()
+
+
+def test_agent_session_coordinate_is_redacted_as_content(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    source = "nonopaque-source-coordinate"
+    mapped = map_atif(
+        Session.from_api(session_payload(agent_session_id=source)),
+        atif_wrapper(),
+    )
+    turn = mapped.turns[0]
+    turn.subagents.append(
+        MappedSubAgent(
+            name="worker",
+            model="gpt-5.6-codex",
+            agent_id=source,
+            description="delegated review",
+            version="1",
+            system_instructions=[],
+            started_at=turn.started_at,
+            ended_at=turn.ended_at,
+            timestamp_inferred=False,
+        )
+    )
+    serialized = repr(asdict(sanitize_mapped_conversation(mapped)))
+
+    assert source not in serialized
+    assert "[REDACTED_SOURCE_COORDINATE]" in serialized
+
+
+def test_source_coordinates_inside_preserved_atif_json_are_redacted(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    source = "nonopaque-source-coordinate"
+    wrapper = atif_wrapper(
+        session_id=source,
+        trajectory_id=source,
+        extra={"parent_session_id": source},
+        agent={
+            "name": "codex",
+            "version": "1.2.3",
+            "model_name": "gpt-5.6-codex",
+            "extra": {"agent_id": source},
+        },
+    )
+    wrapper["metadata"] = {"agent_session_id": source}
+    mapped = map_atif(Session.from_api(session_payload()), wrapper)
+
+    serialized = repr(asdict(sanitize_mapped_conversation(mapped)))
+
+    assert source not in serialized
+    assert "[REDACTED_SOURCE_COORDINATE]" in serialized
+
+
+def test_coordinate_bearing_mapping_keys_fail_closed_without_hashing_names() -> None:
+    source = "nonopaque-source-coordinate"
+    redacted = redact_upload_data(
+        {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "agent_session_id": source,
+            "agent_id": source,
+        }
+    )
+
+    assert redacted == {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "agent_session_id": "[REDACTED_SOURCE_COORDINATE]",
+        "agent_id": "[REDACTED_SOURCE_COORDINATE]",
+    }
+    assert redact_source_coordinate(source) == "[REDACTED_SOURCE_COORDINATE]"
+
+
+def test_redacted_mapping_key_allocation_cannot_collide_on_a_later_pass() -> None:
+    payload = {
+        "[REDACTED_PII_KEY_0001]": "already redacted",
+        "Alice_Johnson": "private field",
+    }
+
+    redacted = redact_upload_data(payload)
+
+    assert redacted["[REDACTED_PII_KEY_0001]"] == "already redacted"
+    assert redacted["[REDACTED_PII_KEY_0002]"] == "private field"
 
 
 def test_code_aware_redaction_scrubs_comments_and_literals() -> None:
@@ -124,7 +277,10 @@ def test_structured_schema_keys_and_versions_are_not_corrupted() -> None:
         "source": "agent",
         "message": "ok",
     }
-    assert redact_upload_data(payload) == payload
+    assert redact_upload_data(payload) == {
+        **payload,
+        "session_id": "[REDACTED_SOURCE_COORDINATE]",
+    }
 
 
 def test_code_aware_redaction_still_scrubs_credentials_inside_code() -> None:

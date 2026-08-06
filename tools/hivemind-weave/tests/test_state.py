@@ -973,7 +973,9 @@ def test_deferred_sync_worklist_and_candidate_digest_are_stable(tmp_path: Path) 
     assert second.candidate_universe_sha256 == first.candidate_universe_sha256
 
 
-def test_schema_v5_migrates_atomically_to_v6_attempt_journal(tmp_path: Path) -> None:
+def test_schema_v5_migrates_atomically_to_v7_attempt_and_review_journals(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "v5.sqlite3"
     connection = sqlite3.connect(path)
     old_sync_feeds_sql = """
@@ -988,9 +990,11 @@ def test_schema_v5_migrates_atomically_to_v6_attempt_journal(tmp_path: Path) -> 
         updated_at TEXT NOT NULL
     )
     """
-    atomic_statements = set(state_module._ATOMIC_TURN_SCHEMA_SQL)
+    later_statements = set(
+        (*state_module._ATOMIC_TURN_SCHEMA_SQL, *state_module._REVIEW_SCHEMA_SQL)
+    )
     for statement in state_module._SCHEMA_SQL:
-        if statement in atomic_statements:
+        if statement in later_statements:
             continue
         connection.execute(
             old_sync_feeds_sql if statement == state_module._SYNC_FEEDS_SQL else statement
@@ -1014,7 +1018,7 @@ def test_schema_v5_migrates_atomically_to_v6_attempt_journal(tmp_path: Path) -> 
             ).fetchall()
         }
 
-    assert version == 6
+    assert version == DB_SCHEMA_VERSION
     assert "candidate_universe_sha256" in columns
     assert {
         "atomic_turn_attempts",

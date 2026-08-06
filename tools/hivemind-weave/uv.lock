@@ -480,7 +480,7 @@ wheels = [
 
 [[package]]
 name = "hivemind-weave"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "en-core-web-sm" },
@@ -503,7 +503,7 @@ requires-dist = [
     { name = "presidio-analyzer", specifier = "==2.2.357" },
     { name = "presidio-anonymizer", specifier = "==2.2.357" },
     { name = "spacy", specifier = "==3.8.14" },
-    { name = "weave", extras = ["presidio"], specifier = "==0.53.4" },
+    { name = "weave", extras = ["presidio"], git = "https://github.com/wandb/weave.git?rev=eaf0a27beffd13f90d4ec64547c53a37df4bdb94" },
 ]
 
 [package.metadata.requires-dev]
@@ -1776,8 +1776,8 @@ wheels = [
 
 [[package]]
 name = "weave"
-version = "0.53.4"
-source = { registry = "https://pypi.org/simple" }
+version = "0.53.5.dev0"
+source = { git = "https://github.com/wandb/weave.git?rev=eaf0a27beffd13f90d4ec64547c53a37df4bdb94#eaf0a27beffd13f90d4ec64547c53a37df4bdb94" }
 dependencies = [
     { name = "cachetools" },
     { name = "click" },
@@ -1793,10 +1793,6 @@ dependencies = [
     { name = "sentry-sdk" },
     { name = "tenacity" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/36/c0/12d8a59b82030a102d1b6a133228581aa82b567506a456d8ef24696b7bf8/weave-0.53.4.tar.gz", hash = "sha256:b6fa986153f6fe4353beaa2c306c9e6fc216c4b6da8732b0c6d393e93874fe20", size = 1168284, upload-time = "2026-07-30T23:43:45.526Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/30/2ef9d05a9babc3ab9e5274cc1c91e1919cc0e29a6daeb412703addce5ae4/weave-0.53.4-py3-none-any.whl", hash = "sha256:dc34d79108a706818b9bde0fadb53939eaa21885762f1129809ea74fad7c8caa", size = 1414466, upload-time = "2026-07-30T23:43:43.394Z" },
 ]
 
 [package.optional-dependencies]

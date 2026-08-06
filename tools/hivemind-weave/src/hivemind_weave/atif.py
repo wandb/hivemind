@@ -520,9 +520,7 @@ def _attach_unreferenced_subagents(
     if not payloads:
         return
     if not turns:
-        raise ATIFSchemaError(
-            f"session {session.id} has unreferenced embedded trajectories but no turn"
-        )
+        raise ATIFSchemaError("selected session has unreferenced embedded trajectories but no turn")
     buckets: list[list[Any]] = [[] for _ in turns]
     for payload in payloads:
         timestamp = _embedded_start(payload)
@@ -555,7 +553,7 @@ def _map_group(
     hash_context: dict[str, Any],
 ) -> MappedTurn:
     if not group.steps:
-        raise ATIFSchemaError(f"session {session.id} contains an empty turn group")
+        raise ATIFSchemaError("selected session contains an empty turn group")
     warnings: list[str] = []
 
     root_system_instructions: list[str] = []
@@ -860,26 +858,26 @@ def map_atif(session: Session, wrapper: dict[str, Any]) -> MappedConversation:
     """Map a HiveMind ATIF wrapper without mutating or retaining raw secrets."""
     wrapper_session_id = wrapper.get("session_id")
     if not isinstance(wrapper_session_id, str) or wrapper_session_id != session.id:
-        raise ATIFSchemaError(f"session {session.id} ATIF wrapper has a mismatched session_id")
+        raise ATIFSchemaError("selected-session ATIF wrapper has a mismatched session_id")
     wrapper_step_count = wrapper.get("step_count")
     if (
         isinstance(wrapper_step_count, bool)
         or not isinstance(wrapper_step_count, int)
         or wrapper_step_count < 0
     ):
-        raise ATIFSchemaError(f"session {session.id} ATIF wrapper has invalid step_count")
+        raise ATIFSchemaError("selected-session ATIF wrapper has invalid step_count")
     raw_wrapper_metadata = wrapper.get("metadata")
     if not isinstance(raw_wrapper_metadata, dict):
-        raise ATIFSchemaError(f"session {session.id} ATIF wrapper has invalid metadata")
+        raise ATIFSchemaError("selected-session ATIF wrapper has invalid metadata")
     raw_trajectory = wrapper.get("trajectory")
     if not isinstance(raw_trajectory, dict):
-        raise ATIFSchemaError(f"session {session.id} is missing ATIF trajectory")
+        raise ATIFSchemaError("selected session is missing an ATIF trajectory")
     trajectory = redact_data(raw_trajectory)
     if not isinstance(trajectory, dict):
-        raise ATIFSchemaError(f"session {session.id} has invalid ATIF trajectory")
+        raise ATIFSchemaError("selected session has an invalid ATIF trajectory")
     wrapper_metadata = redact_data(raw_wrapper_metadata)
     if not isinstance(wrapper_metadata, dict):
-        raise ATIFSchemaError(f"session {session.id} ATIF wrapper has invalid metadata")
+        raise ATIFSchemaError("selected-session ATIF wrapper has invalid metadata")
     wrapper_extra = redact_data(
         {
             key: value
@@ -888,17 +886,17 @@ def map_atif(session: Session, wrapper: dict[str, Any]) -> MappedConversation:
         }
     )
     if not isinstance(wrapper_extra, dict):  # pragma: no cover - dict input above.
-        raise ATIFSchemaError(f"session {session.id} ATIF wrapper has invalid extra fields")
+        raise ATIFSchemaError("selected-session ATIF wrapper has invalid extra fields")
     schema_version = _validate_schema_version(trajectory.get("schema_version"))
     agent = trajectory.get("agent")
     if not isinstance(agent, dict):
-        raise ATIFSchemaError(f"session {session.id} ATIF trajectory is missing agent")
+        raise ATIFSchemaError("selected-session ATIF trajectory is missing its agent")
     steps = _normalize_steps(trajectory.get("steps"), session)
     groups = _split_groups(steps)
 
     if wrapper_step_count != len(steps):
         raise ATIFSchemaError(
-            f"session {session.id} ATIF wrapper step_count {wrapper_step_count} "
+            f"selected-session ATIF wrapper step_count {wrapper_step_count} "
             f"does not match trajectory length {len(steps)}"
         )
     embedded_raw = trajectory.get("subagent_trajectories", [])
@@ -924,7 +922,7 @@ def map_atif(session: Session, wrapper: dict[str, Any]) -> MappedConversation:
                 and embedded_subagents[resolution_key] != embedded
             ):
                 raise ATIFSchemaError(
-                    f"session {session.id} has duplicate embedded subagent resolution keys"
+                    "selected session has duplicate embedded subagent resolution keys"
                 )
             embedded_subagents[resolution_key] = embedded
     referenced_subagent_keys = {
@@ -1054,7 +1052,7 @@ def map_atif(session: Session, wrapper: dict[str, Any]) -> MappedConversation:
     ]
     turn_keys = [turn.key for turn in turns]
     if len(set(turn_keys)) != len(turn_keys):
-        raise ATIFSchemaError(f"session {session.id} contains duplicate deterministic turn keys")
+        raise ATIFSchemaError("selected session contains duplicate deterministic turn keys")
     _attach_unreferenced_subagents(turns, unreferenced_subagents, session=session)
     return MappedConversation(
         conversation_id=f"hivemind:{session.id}",

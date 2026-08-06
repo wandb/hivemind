@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -66,17 +67,24 @@ def _remote_root(
     span_id: str = "root-1",
     first_user: str = "hello",
     last_assistant: str = "world",
+    started_at: str = "2026-08-01T12:00:00Z",
+    ended_at: str = "2026-08-01T12:00:02Z",
+    custom_attributes: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "trace_id": trace_id,
         "span_id": span_id,
-        "started_at": "2026-08-01T12:00:00Z",
+        "started_at": started_at,
+        "ended_at": ended_at,
         "input_messages": [
             {"role": "system", "content": "system"},
             {"role": "user", "content": first_user},
         ],
         "output_messages": [{"role": "assistant", "content": last_assistant}],
     }
+    if custom_attributes is not None:
+        result["custom_attrs_string"] = custom_attributes
+    return result
 
 
 def test_conversation_pagination_uses_offsets() -> None:
@@ -150,6 +158,108 @@ def test_reconcile_by_stable_custom_attributes() -> None:
     assert "custom_attrs_string.hivemind.payload_sha256" in serialized
     assert "parent_span_id" in serialized
     assert seen_query[0]["group_by"][1]["key"] == "span_id"
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [None, "attribute", "started_at", "ended_at", "missing_attribute"],
+)
+def test_review_reconcile_independently_compares_root_attributes_and_timestamps(
+    mismatch: str | None,
+) -> None:
+    trace_id = "1" * 32
+    root_span_id = "2" * 16
+    started_at = datetime(2026, 8, 1, 12, tzinfo=UTC)
+    ended_at = started_at + timedelta(seconds=2)
+    expected_attributes = {
+        "hivemind.turn_key": f"review:{'a' * 64}",
+        "hivemind.payload_sha256": "b" * 64,
+        "hivemind.review.index_uri": "weave:///wandb/project/object/index:version",
+        "hivemind.review.logical_key": "a" * 64,
+        "hivemind.review.match_sha256": "b" * 64,
+        "hivemind.review.preview_signature": "c" * 64,
+        "hivemind.review.schema": "hivemind-hosted-review-root-v1",
+    }
+    remote_attributes = dict(expected_attributes)
+    remote_started_at = "2026-08-01T12:00:00Z"
+    remote_ended_at = "2026-08-01T12:00:02Z"
+    if mismatch == "attribute":
+        remote_attributes["hivemind.review.index_uri"] = "weave:///wrong:index"
+    elif mismatch == "started_at":
+        remote_started_at = "2026-08-01T11:59:59Z"
+    elif mismatch == "ended_at":
+        remote_ended_at = "2026-08-01T12:00:03Z"
+    elif mismatch == "missing_attribute":
+        remote_attributes.pop("hivemind.review.preview_signature")
+
+    seen_detail_queries: list[dict[str, Any]] = []
+
+    def transport(
+        url: str, payload: dict[str, Any], headers: dict[str, str], timeout: float
+    ) -> dict[str, Any]:
+        del headers, timeout
+        if url.endswith("/chat"):
+            return {"turns": [_remote_turn(trace_id)], "has_more": False}
+        if url.endswith("/conversations/spans"):
+            return {
+                "conversations": [
+                    {
+                        "conversation_id": "hivemind:s",
+                        "spans": [{"trace_id": trace_id}],
+                    }
+                ]
+            }
+        if payload.get("include_details") is True:
+            seen_detail_queries.append(payload)
+            return {
+                "spans": [
+                    _remote_root(
+                        trace_id,
+                        span_id=root_span_id,
+                        started_at=remote_started_at,
+                        ended_at=remote_ended_at,
+                        custom_attributes=remote_attributes,
+                    )
+                ],
+                "total_count": 1,
+            }
+        if "custom_attrs_string.hivemind.turn_key" in str(payload):
+            return {
+                "groups": [
+                    {
+                        "group_keys": {"trace_id": trace_id, "span_id": root_span_id},
+                        "span_count": 1,
+                    }
+                ],
+                "total_count": 1,
+            }
+        return {
+            "groups": [{"group_keys": {"trace_id": trace_id}, "span_count": 1}],
+            "total_count": 1,
+        }
+
+    verifier = WeaveVerifier(project="e/p", api_key="secret", transport=transport)
+    result = verifier.reconcile(
+        conversation_id="hivemind:s",
+        expected_trace_ids=[trace_id],
+        turn_key=f"review:{'a' * 64}",
+        payload_sha256="b" * 64,
+        expected_span_count=1,
+        expected_root_attributes=expected_attributes,
+        expected_started_at=started_at,
+        expected_ended_at=ended_at,
+        timeout_seconds=0,
+    )
+
+    assert len(seen_detail_queries) == 1
+    requested_columns = {item["key"] for item in seen_detail_queries[0]["custom_attr_columns"]}
+    assert requested_columns == set(expected_attributes)
+    if mismatch is None:
+        assert result.matches == 1
+        assert result.trace_ids == [trace_id]
+        assert result.root_span_ids == [root_span_id]
+    else:
+        assert result.matches > 1
 
 
 def test_verify_polls_until_chat_and_spans_are_visible() -> None:

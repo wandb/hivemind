@@ -1,214 +1,234 @@
 from __future__ import annotations
 
+import hashlib
 import os
-from datetime import datetime
+import re
+import stat
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 
-from hivemind_weave.atif import map_atif
-from hivemind_weave.hivemind import HiveMindClient
-from hivemind_weave.importer import ImportConfig, run_import
-from hivemind_weave.models import MappedTurn, Session
-from hivemind_weave.pii import sanitize_mapped_conversation
-from hivemind_weave.utils import parse_datetime
-from hivemind_weave.verify import WeaveVerifier
-from hivemind_weave.weave_sink import expected_turn_span_count
+from hivemind_weave.review import (
+    REVIEW_PROJECT,
+    ReviewApplyConfig,
+    ReviewPreviewConfig,
+    apply_review,
+    preview_review,
+)
 
 pytestmark = pytest.mark.live
 
-
-def _span_count(turn: MappedTurn) -> int:
-    return expected_turn_span_count(turn)
-
-
-def _root_attribute_trace_ids(
-    verifier: WeaveVerifier,
-    *,
-    conversation_id: str,
-    attribute: str,
-    value: str,
-) -> set[str]:
-    def equals(field: str, expected: str) -> dict[str, Any]:
-        return {"$eq": [{"$getField": field}, {"$literal": expected}]}
-
-    response = verifier._post(
-        "/agents/spans/query",
-        {
-            "project_id": verifier.project,
-            "query": {
-                "$expr": {
-                    "$and": [
-                        equals("conversation_id", conversation_id),
-                        equals("parent_span_id", ""),
-                        equals(f"custom_attrs_string.{attribute}", value),
-                    ]
-                }
-            },
-            "group_by": [{"source": "field", "key": "trace_id", "alias": "trace_id"}],
-            "limit": 1000,
-            "offset": 0,
-        },
-    )
-    return {
-        str(keys["trace_id"])
-        for group in response.get("groups", [])
-        if isinstance(group, dict)
-        and isinstance((keys := group.get("group_keys")), dict)
-        and isinstance(keys.get("trace_id"), str)
-    }
+_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_FIXTURE_NOW = datetime(2026, 8, 3, tzinfo=UTC)
+_FIXTURE_SINCE = "2026-08-01T00:00:00Z"
+_FIXTURE_UNTIL = "2026-08-02T00:00:00Z"
+_LARGE_BLOCK_BYTES = 64 * 1024
+_LARGE_BLOCK_COUNT = 32
 
 
-def _root_span_attributes(
-    verifier: WeaveVerifier,
-    *,
-    conversation_id: str,
-    trace_id: str,
-) -> dict[str, Any]:
-    def equals(field: str, expected: str) -> dict[str, Any]:
-        return {"$eq": [{"$getField": field}, {"$literal": expected}]}
+class SyntheticHiveMind:
+    """In-memory source for the opt-in smoke; it never invokes HiveMind."""
 
-    response = verifier._post(
-        "/agents/spans/query",
-        {
-            "project_id": verifier.project,
-            "query": {
-                "$expr": {
-                    "$and": [
-                        equals("conversation_id", conversation_id),
-                        equals("trace_id", trace_id),
-                        equals("parent_span_id", ""),
-                    ]
-                }
-            },
-            "include_details": True,
-            "limit": 2,
-            "offset": 0,
-        },
-    )
-    spans = response.get("spans")
-    assert response.get("total_count") == 1
-    assert isinstance(spans, list) and len(spans) == 1 and isinstance(spans[0], dict)
-    root = spans[0]
-    attributes: dict[str, Any] = {}
-    for field in (
-        "custom_attrs_string",
-        "custom_attrs_int",
-        "custom_attrs_float",
-        "custom_attrs_bool",
-    ):
-        values = root.get(field, {})
-        assert isinstance(values, dict)
-        attributes.update(values)
-    return attributes
-
-
-def test_one_session_live_import_is_idempotent(tmp_path: Path) -> None:
-    if os.environ.get("HIVEMIND_WEAVE_LIVE") != "1":
-        pytest.skip("set HIVEMIND_WEAVE_LIVE=1 to enable the live smoke test")
-    session_id = os.environ.get("HIVEMIND_WEAVE_LIVE_SESSION_ID")
-    project = os.environ.get("HIVEMIND_WEAVE_LIVE_PROJECT")
-    if not session_id or not project:
-        pytest.fail(
-            "live test requires HIVEMIND_WEAVE_LIVE_SESSION_ID and HIVEMIND_WEAVE_LIVE_PROJECT"
-        )
-    if os.environ.get("HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT") != project:
-        pytest.fail("HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT must exactly match the disposable project")
-    api_key = os.environ.get("WANDB_API_KEY")
-    if not api_key:
-        pytest.fail("live test requires WANDB_API_KEY")
-
-    client = HiveMindClient()
-    client.preflight()
-    raw_session = next(
-        (item for item in client.list_sessions(days=365) if item.get("id") == session_id),
-        None,
-    )
-    if raw_session is None:
-        pytest.fail("live session was not returned inside the 365-day authenticated-user window")
-    source_session = Session.from_api(raw_session)
-    expected = sanitize_mapped_conversation(
-        map_atif(source_session, client.get_atif(source_session.id))
-    )
-    config = ImportConfig(
-        days=365,
-        project=project,
-        idle_minutes=0,
-        state_path=tmp_path / "live-state.sqlite3",
-        confirm_project=project,
-        session_ids=frozenset({session_id}),
-    )
-    first = run_import(config)
-    assert first.ok, first.render()
-    assert first.imported == len(expected.turns) >= 1, first.render()
-
-    verifier = WeaveVerifier(project=project, api_key=api_key)
-    remote_turns = verifier.conversation_turns(expected.conversation_id)
-    assert remote_turns
-    assert all(turn.get("agent_name") == expected.agent_name for turn in remote_turns)
-
-    all_expected_trace_ids: set[str] = set()
-    previous_started_at: datetime | None = None
-    for expected_turn in expected.turns:
-        matched = verifier.attribute_trace_matches(
-            conversation_id=expected.conversation_id,
-            turn_key=expected_turn.key,
-            payload_sha256=expected_turn.payload_sha256,
-        )
-        assert matched.matches == 1
-        assert len(matched.trace_ids) == 1
-        trace_id = matched.trace_ids[0]
-        all_expected_trace_ids.add(trace_id)
-        assert verifier.trace_span_count(
-            conversation_id=expected.conversation_id,
-            trace_id=trace_id,
-        ) == _span_count(expected_turn)
-        remote_turn = next(item for item in remote_turns if item.get("trace_id") == trace_id)
-        assert verifier._turn_signature(remote_turn) == expected_turn.verification_signature
-        remote_attributes = _root_span_attributes(
-            verifier,
-            conversation_id=expected.conversation_id,
-            trace_id=trace_id,
-        )
-        for key, value in expected_turn.attributes.items():
-            assert remote_attributes.get(key) == value
-        messages = remote_turn.get("messages", [])
-        timestamps = [
-            parsed
-            for message in messages
-            if isinstance(message, dict)
-            and (parsed := parse_datetime(message.get("started_at"))) is not None
-        ]
-        assert timestamps == sorted(timestamps)
-        if timestamps:
-            assert previous_started_at is None or timestamps[0] >= previous_started_at
-            previous_started_at = timestamps[0]
-        if expected_turn.tools:
-            assert any(message.get("tool_call") for message in messages)
-        if any(llm.reasoning for llm in expected_turn.llms):
-            assert any(
-                isinstance((assistant := message.get("assistant_message")), dict)
-                and assistant.get("reasoning_content")
-                for message in messages
-                if isinstance(message, dict)
+    def __init__(self, *, run_id: str) -> None:
+        session_id = str(
+            UUID(
+                bytes=hashlib.sha256(f"hivemind-weave-review-smoke:{run_id}".encode()).digest()[
+                    :16
+                ],
+                version=4,
             )
-
-    assert all_expected_trace_ids.issubset(verifier.span_trace_ids(expected.conversation_id))
-    if source_session.parent_session_id:
-        parent_trace_ids = _root_attribute_trace_ids(
-            verifier,
-            conversation_id=expected.conversation_id,
-            attribute="hivemind.parent_session_id",
-            value=source_session.parent_session_id,
         )
-        assert all_expected_trace_ids.issubset(parent_trace_ids)
-    elif os.environ.get("HIVEMIND_WEAVE_LIVE_REQUIRE_PARENT") == "1":
+        block_line = "const deterministicArchiveValue = 'synthetic';\n"
+        block = (block_line * ((_LARGE_BLOCK_BYTES // len(block_line)) + 1))[:_LARGE_BLOCK_BYTES]
+        large_result = {
+            "fixture": "hivemind-review-large-v1",
+            "chunks": [block] * _LARGE_BLOCK_COUNT,
+        }
+        self.user_id: str | None = "22222222-2222-4222-8222-222222222222"
+        self.session = {
+            "id": session_id,
+            "agent_session_id": f"run-{session_id}",
+            "title": "Deterministic synthetic large review smoke",
+            "agent_type": "codex",
+            "model": "gpt-5.6-codex",
+            "started_at": "2026-08-01T12:00:00Z",
+            "last_activity_at": "2026-08-01T12:05:00Z",
+            "git_repo": "wandb/hivemind",
+            "git_branch": "synthetic/review-smoke",
+            "parent_session_id": "",
+            "username": "synthetic-review-user",
+        }
+        steps: list[dict[str, Any]] = [
+            {
+                "step_id": 1,
+                "timestamp": "2026-08-01T12:00:00Z",
+                "source": "system",
+                "message": "Validate only the deterministic synthetic review fixture.",
+            },
+            {
+                "step_id": 2,
+                "timestamp": "2026-08-01T12:00:01Z",
+                "source": "user",
+                "message": "Inspect the generated synthetic archive and summarize its shape.",
+            },
+            {
+                "step_id": 3,
+                "timestamp": "2026-08-01T12:00:02Z",
+                "source": "agent",
+                "model_name": "gpt-5.6-codex",
+                "message": "I will inspect the deterministic archive.",
+                "reasoning_content": "Check the declared chunk count and preserve the full result.",
+                "tool_calls": [
+                    {
+                        "tool_call_id": "call-synthetic-1",
+                        "function_name": "inspect_synthetic_archive",
+                        "arguments": {
+                            "fixture": "hivemind-review-large-v1",
+                            "expected_chunks": _LARGE_BLOCK_COUNT,
+                        },
+                    }
+                ],
+                "observation": {
+                    "results": [
+                        {
+                            "source_call_id": "call-synthetic-1",
+                            "content": large_result,
+                        }
+                    ]
+                },
+                "metrics": {
+                    "prompt_tokens": 32,
+                    "completion_tokens": 16,
+                    "cached_tokens": 0,
+                    "reasoning_tokens": 8,
+                },
+                "finish_reason": "tool_call",
+            },
+            {
+                "step_id": 4,
+                "timestamp": "2026-08-01T12:05:00Z",
+                "source": "agent",
+                "model_name": "gpt-5.6-codex",
+                "message": (
+                    "The deterministic synthetic archive is complete and internally consistent."
+                ),
+                "finish_reason": "stop",
+            },
+        ]
+        self.transcript = {
+            "session_id": session_id,
+            "trajectory": {
+                "schema_version": "ATIF-v1.7",
+                "session_id": f"atif-{session_id}",
+                "agent": {
+                    "name": "codex",
+                    "version": "synthetic-review-v1",
+                    "model_name": "gpt-5.6-codex",
+                },
+                "steps": steps,
+            },
+            "step_count": len(steps),
+            "metadata": {"fixture": "hivemind-review-large-v1"},
+        }
+
+    def preflight(self) -> None:
+        return None
+
+    def list_sessions(self, *, days: int, include_subagents: bool) -> list[dict[str, Any]]:
+        assert 1 <= days <= 365
+        assert include_subagents is True
+        return [dict(self.session)]
+
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        assert session_id == self.session["id"]
+        return dict(self.session)
+
+    def get_atif(self, session_id: str) -> dict[str, Any]:
+        assert session_id == self.session["id"]
+        return self.transcript
+
+
+def _required_live_state_path() -> Path:
+    raw = os.environ.get("HIVEMIND_WEAVE_LIVE_STATE_PATH", "").strip()
+    if not raw:
         pytest.fail(
-            "parent-link acceptance requested, but the selected live session is not a child"
+            "live synthetic review requires HIVEMIND_WEAVE_LIVE_STATE_PATH pointing to a "
+            "caller-owned persistent private SQLite path"
+        )
+    path = Path(raw).expanduser()
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        pytest.fail("HIVEMIND_WEAVE_LIVE_STATE_PATH must be an absolute database-file path")
+    resolved = Path(os.path.abspath(path))
+    volatile_roots = {
+        Path("/tmp"),
+        Path("/private/tmp"),
+        Path(tempfile.gettempdir()).resolve(),
+    }
+    if any(resolved == root or root in resolved.parents for root in volatile_roots):
+        pytest.fail("HIVEMIND_WEAVE_LIVE_STATE_PATH must not use a temporary directory")
+    parent = resolved.parent
+    if not parent.is_dir():
+        pytest.fail("create the dedicated persistent state directory before running the live smoke")
+    details = parent.stat()
+    if details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) != 0o700:
+        pytest.fail("the live-smoke state directory must be caller-owned with mode 0700")
+    return resolved
+
+
+def test_fixed_project_synthetic_review_is_idempotent() -> None:
+    if os.environ.get("HIVEMIND_WEAVE_LIVE") != "1":
+        pytest.skip("set HIVEMIND_WEAVE_LIVE=1 to enable the live synthetic review smoke")
+    if os.environ.get("HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT") != REVIEW_PROJECT:
+        pytest.fail(
+            "HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT must exactly equal wandb/hivemind-chats-review"
+        )
+    if not os.environ.get("WANDB_API_KEY"):
+        pytest.fail("live synthetic review requires WANDB_API_KEY in the process environment")
+    run_id = os.environ.get("HIVEMIND_WEAVE_LIVE_RUN_ID", "").strip()
+    if not _RUN_ID.fullmatch(run_id):
+        pytest.fail(
+            "HIVEMIND_WEAVE_LIVE_RUN_ID must be a new bounded ASCII identifier for this smoke"
         )
 
-    second = run_import(config)
+    state_path = _required_live_state_path()
+    client = SyntheticHiveMind(run_id=run_id)
+    preview = preview_review(
+        ReviewPreviewConfig(
+            since=_FIXTURE_SINCE,
+            until=_FIXTURE_UNTIL,
+            project=REVIEW_PROJECT,
+            state_path=state_path,
+            canary=True,
+            now=_FIXTURE_NOW,
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+    )
+    assert preview.ok, preview.render()
+    assert preview.selected_sessions == 1
+    assert preview.turns == 1
+    assert preview.manifest_bytes > 1024 * 1024
+
+    apply_config = ReviewApplyConfig(
+        plan_id=preview.plan_id,
+        confirm_project=REVIEW_PROJECT,
+        state_path=state_path,
+        max_sessions=1,
+    )
+    first = apply_review(apply_config, hivemind=client)  # type: ignore[arg-type]
+    assert first.ok, first.render()
+    assert first.visible_turns == 1, (
+        "the run ID must be new for the persistent state journal; preserve this state path "
+        "after any uncertain result"
+    )
+    assert first.remaining_sessions == 0
+
+    second = apply_review(apply_config, hivemind=client)  # type: ignore[arg-type]
     assert second.ok, second.render()
-    assert second.imported == 0, second.render()
-    assert second.skipped == first.imported, second.render()
+    assert second.visible_turns == 0
+    assert second.uncertain_turns == 0
+    assert second.conflicted_turns == 0
+    assert second.remaining_sessions == 0

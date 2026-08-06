@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - the importer targets macOS/Linux.
 
 
 DB_APPLICATION_ID = 0x484D5756
-DB_SCHEMA_VERSION = 6
+DB_SCHEMA_VERSION = 8
 RUN_SCHEMA_VERSION = "2"
 _HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ATOMIC_EVIDENCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
@@ -838,6 +838,342 @@ _ATOMIC_TURN_SCHEMA_SQL = (
     _ATOMIC_TURN_ATTEMPT_NO_DELETE_TRIGGER_SQL,
 )
 
+_REVIEW_PLANS_SQL = """
+CREATE TABLE review_plans (
+    plan_id TEXT PRIMARY KEY CHECK(length(plan_id) = 64),
+    project TEXT NOT NULL,
+    source_principal_sha256 TEXT NOT NULL CHECK(length(source_principal_sha256) = 64),
+    since_utc TEXT NOT NULL,
+    until_utc TEXT NOT NULL,
+    timezone_name TEXT NOT NULL,
+    selector TEXT NOT NULL CHECK(selector IN ('backlog', 'canary')),
+    universe_sha256 TEXT NOT NULL CHECK(length(universe_sha256) = 64),
+    status TEXT NOT NULL CHECK(status IN ('planned', 'applying', 'completed', 'blocked')),
+    discovered_count INTEGER NOT NULL CHECK(discovered_count >= 0),
+    eligible_count INTEGER NOT NULL CHECK(eligible_count >= 0),
+    deferred_count INTEGER NOT NULL CHECK(deferred_count >= 0),
+    invalid_count INTEGER NOT NULL CHECK(invalid_count >= 0),
+    selected_count INTEGER NOT NULL CHECK(selected_count >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    last_error_code TEXT NOT NULL DEFAULT '' CHECK(length(last_error_code) <= 64),
+    CHECK(
+        (status = 'completed' AND completed_at IS NOT NULL)
+        OR (status != 'completed' AND completed_at IS NULL)
+    )
+)
+"""
+
+_REVIEW_PLAN_SESSIONS_SQL = """
+CREATE TABLE review_plan_sessions (
+    plan_id TEXT NOT NULL REFERENCES review_plans(plan_id),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    session_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    last_activity_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'blocked')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (plan_id, session_id),
+    UNIQUE (plan_id, ordinal)
+)
+"""
+
+_REVIEW_PLAN_FILTERS_SQL = """
+CREATE TABLE review_plan_filters (
+    plan_id TEXT NOT NULL REFERENCES review_plans(plan_id),
+    filter_kind TEXT NOT NULL CHECK(
+        filter_kind IN ('agent', 'repository', 'session', 'exclude_subagents')
+    ),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    filter_value TEXT NOT NULL,
+    PRIMARY KEY (plan_id, filter_kind, ordinal),
+    UNIQUE (plan_id, filter_kind, filter_value)
+)
+"""
+
+_REVIEW_PLAN_TURNS_SQL = """
+CREATE TABLE review_plan_turns (
+    plan_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    turn_key TEXT NOT NULL,
+    source_payload_sha256 TEXT NOT NULL CHECK(length(source_payload_sha256) = 64),
+    manifest_sha256 TEXT NOT NULL CHECK(length(manifest_sha256) = 64),
+    index_sha256 TEXT NOT NULL CHECK(length(index_sha256) = 64),
+    logical_key TEXT NOT NULL CHECK(length(logical_key) = 64),
+    preview_signature TEXT NOT NULL CHECK(length(preview_signature) = 64),
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    manifest_bytes INTEGER NOT NULL CHECK(manifest_bytes > 0),
+    chunk_count INTEGER NOT NULL CHECK(chunk_count BETWEEN 1 AND 64),
+    max_chunk_bytes INTEGER NOT NULL CHECK(max_chunk_bytes BETWEEN 1 AND 8388608),
+    index_bytes INTEGER NOT NULL CHECK(index_bytes > 0),
+    atif_schema_version TEXT NOT NULL,
+    PRIMARY KEY (plan_id, session_id, turn_key),
+    UNIQUE (plan_id, session_id, ordinal),
+    FOREIGN KEY (plan_id, session_id)
+        REFERENCES review_plan_sessions(plan_id, session_id)
+)
+"""
+
+_REVIEW_COHORTS_SQL = """
+CREATE TABLE review_cohorts (
+    cohort_id TEXT PRIMARY KEY CHECK(length(cohort_id) = 64),
+    plan_id TEXT NOT NULL REFERENCES review_plans(plan_id),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    status TEXT NOT NULL CHECK(status IN ('planned', 'applying', 'completed', 'blocked')),
+    session_count INTEGER NOT NULL CHECK(session_count > 0),
+    visible_turns INTEGER NOT NULL DEFAULT 0 CHECK(visible_turns >= 0),
+    skipped_turns INTEGER NOT NULL DEFAULT 0 CHECK(skipped_turns >= 0),
+    conflicted_turns INTEGER NOT NULL DEFAULT 0 CHECK(conflicted_turns >= 0),
+    failed_items INTEGER NOT NULL DEFAULT 0 CHECK(failed_items >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    last_error_code TEXT NOT NULL DEFAULT '' CHECK(length(last_error_code) <= 64),
+    UNIQUE (plan_id, ordinal),
+    CHECK(
+        (status = 'completed' AND completed_at IS NOT NULL)
+        OR (status != 'completed' AND completed_at IS NULL)
+    )
+)
+"""
+
+_REVIEW_COHORT_SESSIONS_SQL = """
+CREATE TABLE review_cohort_sessions (
+    cohort_id TEXT NOT NULL REFERENCES review_cohorts(cohort_id),
+    plan_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (cohort_id, session_id),
+    UNIQUE (cohort_id, ordinal),
+    FOREIGN KEY (plan_id, session_id)
+        REFERENCES review_plan_sessions(plan_id, session_id)
+)
+"""
+
+_REVIEW_TURN_LEDGER_SQL = """
+CREATE TABLE review_turn_ledger (
+    project TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_key TEXT NOT NULL,
+    source_payload_sha256 TEXT NOT NULL CHECK(length(source_payload_sha256) = 64),
+    manifest_sha256 TEXT NOT NULL CHECK(length(manifest_sha256) = 64),
+    logical_key TEXT NOT NULL CHECK(length(logical_key) = 64),
+    preview_signature TEXT NOT NULL CHECK(length(preview_signature) = 64),
+    manifest_bytes INTEGER NOT NULL CHECK(manifest_bytes > 0),
+    chunk_count INTEGER NOT NULL CHECK(chunk_count BETWEEN 1 AND 64),
+    status TEXT NOT NULL CHECK(status IN (
+        'planned', 'objects_publishing', 'objects_verified', 'root_submitting',
+        'visible', 'uncertain', 'conflict'
+    )),
+    chunk_refs_json TEXT NOT NULL DEFAULT '[]',
+    chunk_hashes_json TEXT NOT NULL DEFAULT '[]',
+    chunk_sizes_json TEXT NOT NULL DEFAULT '[]',
+    index_ref TEXT NOT NULL DEFAULT '',
+    index_sha256 TEXT NOT NULL DEFAULT '' CHECK(length(index_sha256) IN (0, 64)),
+    trace_id TEXT NOT NULL DEFAULT '',
+    root_span_id TEXT NOT NULL DEFAULT '',
+    error_code TEXT NOT NULL DEFAULT '' CHECK(length(error_code) <= 64),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    visible_at TEXT,
+    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+    index_size INTEGER NOT NULL DEFAULT 0 CHECK(index_size >= 0),
+    PRIMARY KEY (project, session_id, turn_key),
+    CHECK(
+        (status = 'visible' AND visible_at IS NOT NULL)
+        OR (status != 'visible' AND visible_at IS NULL)
+    )
+)
+"""
+
+_REVIEW_PLANS_INDEX_SQL = """
+CREATE INDEX review_plans_project_status ON review_plans(project, status)
+"""
+
+_REVIEW_LEDGER_INDEX_SQL = """
+CREATE INDEX review_turn_ledger_project_status ON review_turn_ledger(project, status)
+"""
+
+_REVIEW_PLAN_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER review_plans_immutable
+BEFORE UPDATE OF
+    plan_id, project, source_principal_sha256, since_utc, until_utc,
+    timezone_name, selector, universe_sha256, discovered_count,
+    eligible_count, deferred_count, invalid_count, selected_count, created_at
+ON review_plans
+BEGIN
+    SELECT RAISE(ABORT, 'review plan identity is immutable');
+END
+"""
+
+_REVIEW_PLAN_SESSION_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER review_plan_sessions_immutable
+BEFORE UPDATE OF plan_id, ordinal, session_id, started_at, last_activity_at
+ON review_plan_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'review plan session identity is immutable');
+END
+"""
+
+_REVIEW_PLAN_FILTER_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER review_plan_filters_immutable
+BEFORE UPDATE ON review_plan_filters
+BEGIN
+    SELECT RAISE(ABORT, 'review plan filters are immutable');
+END
+"""
+
+_REVIEW_PLAN_TURN_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER review_plan_turns_immutable
+BEFORE UPDATE ON review_plan_turns
+BEGIN
+    SELECT RAISE(ABORT, 'review plan turn certificates are immutable');
+END
+"""
+
+_REVIEW_COHORT_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER review_cohorts_immutable
+BEFORE UPDATE OF cohort_id, plan_id, ordinal, session_count, created_at
+ON review_cohorts
+BEGIN
+    SELECT RAISE(ABORT, 'review cohort identity is immutable');
+END
+"""
+
+_REVIEW_COHORT_SESSION_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER review_cohort_sessions_immutable
+BEFORE UPDATE ON review_cohort_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'review cohort membership is immutable');
+END
+"""
+
+_REVIEW_LEDGER_IDENTITY_TRIGGER_SQL = """
+CREATE TRIGGER review_turn_ledger_identity_immutable
+BEFORE UPDATE OF
+    project, session_id, turn_key, source_payload_sha256, manifest_sha256,
+    logical_key, preview_signature, manifest_bytes, chunk_count, created_at
+ON review_turn_ledger
+BEGIN
+    SELECT RAISE(ABORT, 'review turn identity is immutable');
+END
+"""
+
+_REVIEW_LEDGER_REVISION_TRIGGER_SQL = """
+CREATE TRIGGER review_turn_ledger_revision_guard
+BEFORE UPDATE ON review_turn_ledger
+WHEN NEW.revision != OLD.revision + 1
+BEGIN
+    SELECT RAISE(ABORT, 'review turn revision was not advanced');
+END
+"""
+
+_REVIEW_LEDGER_TRANSITION_TRIGGER_SQL = """
+CREATE TRIGGER review_turn_ledger_transition_guard
+BEFORE UPDATE OF status ON review_turn_ledger
+WHEN NOT (
+    (OLD.status = 'planned' AND NEW.status IN ('objects_publishing', 'conflict'))
+    OR (OLD.status = 'objects_publishing' AND NEW.status IN (
+        'objects_publishing', 'objects_verified', 'conflict'
+    ))
+    OR (OLD.status = 'objects_verified' AND NEW.status IN ('root_submitting', 'conflict'))
+    OR (OLD.status = 'root_submitting' AND NEW.status IN ('visible', 'uncertain', 'conflict'))
+    OR (OLD.status = 'uncertain' AND NEW.status IN ('uncertain', 'visible', 'conflict'))
+    OR (OLD.status = 'visible' AND NEW.status IN ('visible', 'conflict'))
+    OR (OLD.status = NEW.status AND OLD.status = 'conflict')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid review turn state transition');
+END
+"""
+
+_REVIEW_PLAN_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_plans_no_delete
+BEFORE DELETE ON review_plans
+BEGIN
+    SELECT RAISE(ABORT, 'review plans cannot be deleted');
+END
+"""
+
+_REVIEW_PLAN_SESSION_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_plan_sessions_no_delete
+BEFORE DELETE ON review_plan_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'review plan sessions cannot be deleted');
+END
+"""
+
+_REVIEW_PLAN_FILTER_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_plan_filters_no_delete
+BEFORE DELETE ON review_plan_filters
+BEGIN
+    SELECT RAISE(ABORT, 'review plan filters cannot be deleted');
+END
+"""
+
+_REVIEW_PLAN_TURN_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_plan_turns_no_delete
+BEFORE DELETE ON review_plan_turns
+BEGIN
+    SELECT RAISE(ABORT, 'review plan turn certificates cannot be deleted');
+END
+"""
+
+_REVIEW_COHORT_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_cohorts_no_delete
+BEFORE DELETE ON review_cohorts
+BEGIN
+    SELECT RAISE(ABORT, 'review cohorts cannot be deleted');
+END
+"""
+
+_REVIEW_COHORT_SESSION_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_cohort_sessions_no_delete
+BEFORE DELETE ON review_cohort_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'review cohort membership cannot be deleted');
+END
+"""
+
+_REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_turn_ledger_no_delete
+BEFORE DELETE ON review_turn_ledger
+BEGIN
+    SELECT RAISE(ABORT, 'review turn evidence cannot be deleted');
+END
+"""
+
+_REVIEW_SCHEMA_SQL = (
+    _REVIEW_PLANS_SQL,
+    _REVIEW_PLAN_SESSIONS_SQL,
+    _REVIEW_PLAN_FILTERS_SQL,
+    _REVIEW_PLAN_TURNS_SQL,
+    _REVIEW_COHORTS_SQL,
+    _REVIEW_COHORT_SESSIONS_SQL,
+    _REVIEW_TURN_LEDGER_SQL,
+    _REVIEW_PLANS_INDEX_SQL,
+    _REVIEW_LEDGER_INDEX_SQL,
+    _REVIEW_PLAN_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_PLAN_SESSION_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_PLAN_FILTER_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_PLAN_TURN_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_COHORT_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_COHORT_SESSION_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_LEDGER_IDENTITY_TRIGGER_SQL,
+    _REVIEW_LEDGER_REVISION_TRIGGER_SQL,
+    _REVIEW_LEDGER_TRANSITION_TRIGGER_SQL,
+    _REVIEW_PLAN_NO_DELETE_TRIGGER_SQL,
+    _REVIEW_PLAN_SESSION_NO_DELETE_TRIGGER_SQL,
+    _REVIEW_PLAN_FILTER_NO_DELETE_TRIGGER_SQL,
+    _REVIEW_PLAN_TURN_NO_DELETE_TRIGGER_SQL,
+    _REVIEW_COHORT_NO_DELETE_TRIGGER_SQL,
+    _REVIEW_COHORT_SESSION_NO_DELETE_TRIGGER_SQL,
+    _REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL,
+)
+
 _BACKFILL_COHORTS_SQL = """
 CREATE TABLE backfill_cohorts (
     cohort_id TEXT PRIMARY KEY CHECK(length(cohort_id) = 64),
@@ -1196,6 +1532,7 @@ _SCHEMA_SQL = (
     *_BACKFILL_CERTIFICATE_SCHEMA_SQL,
     *_SYNC_SCHEMA_SQL,
     *_ATOMIC_TURN_SCHEMA_SQL,
+    *_REVIEW_SCHEMA_SQL,
 )
 
 _EXPECTED_SCHEMA_SQL = {
@@ -1266,6 +1603,31 @@ _EXPECTED_SCHEMA_SQL = {
     "atomic_turn_receipts_immutable": _ATOMIC_TURN_RECEIPT_IMMUTABLE_TRIGGER_SQL,
     "atomic_turn_receipts_no_delete": _ATOMIC_TURN_RECEIPT_NO_DELETE_TRIGGER_SQL,
     "atomic_turn_attempts_no_delete": _ATOMIC_TURN_ATTEMPT_NO_DELETE_TRIGGER_SQL,
+    "review_plans": _REVIEW_PLANS_SQL,
+    "review_plan_sessions": _REVIEW_PLAN_SESSIONS_SQL,
+    "review_plan_filters": _REVIEW_PLAN_FILTERS_SQL,
+    "review_plan_turns": _REVIEW_PLAN_TURNS_SQL,
+    "review_cohorts": _REVIEW_COHORTS_SQL,
+    "review_cohort_sessions": _REVIEW_COHORT_SESSIONS_SQL,
+    "review_turn_ledger": _REVIEW_TURN_LEDGER_SQL,
+    "review_plans_project_status": _REVIEW_PLANS_INDEX_SQL,
+    "review_turn_ledger_project_status": _REVIEW_LEDGER_INDEX_SQL,
+    "review_plans_immutable": _REVIEW_PLAN_IMMUTABLE_TRIGGER_SQL,
+    "review_plan_sessions_immutable": _REVIEW_PLAN_SESSION_IMMUTABLE_TRIGGER_SQL,
+    "review_plan_filters_immutable": _REVIEW_PLAN_FILTER_IMMUTABLE_TRIGGER_SQL,
+    "review_plan_turns_immutable": _REVIEW_PLAN_TURN_IMMUTABLE_TRIGGER_SQL,
+    "review_cohorts_immutable": _REVIEW_COHORT_IMMUTABLE_TRIGGER_SQL,
+    "review_cohort_sessions_immutable": _REVIEW_COHORT_SESSION_IMMUTABLE_TRIGGER_SQL,
+    "review_turn_ledger_identity_immutable": _REVIEW_LEDGER_IDENTITY_TRIGGER_SQL,
+    "review_turn_ledger_revision_guard": _REVIEW_LEDGER_REVISION_TRIGGER_SQL,
+    "review_turn_ledger_transition_guard": _REVIEW_LEDGER_TRANSITION_TRIGGER_SQL,
+    "review_plans_no_delete": _REVIEW_PLAN_NO_DELETE_TRIGGER_SQL,
+    "review_plan_sessions_no_delete": _REVIEW_PLAN_SESSION_NO_DELETE_TRIGGER_SQL,
+    "review_plan_filters_no_delete": _REVIEW_PLAN_FILTER_NO_DELETE_TRIGGER_SQL,
+    "review_plan_turns_no_delete": _REVIEW_PLAN_TURN_NO_DELETE_TRIGGER_SQL,
+    "review_cohorts_no_delete": _REVIEW_COHORT_NO_DELETE_TRIGGER_SQL,
+    "review_cohort_sessions_no_delete": _REVIEW_COHORT_SESSION_NO_DELETE_TRIGGER_SQL,
+    "review_turn_ledger_no_delete": _REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL,
 }
 
 
@@ -1603,12 +1965,25 @@ class StateStore:
             if user_version == DB_SCHEMA_VERSION:
                 if application_id != DB_APPLICATION_ID:
                     raise StateConflictError("state database application identity is missing")
+            elif user_version == 7 and application_id == DB_APPLICATION_ID:
+                self._db.execute(
+                    """
+                    ALTER TABLE review_turn_ledger
+                    ADD COLUMN index_size INTEGER NOT NULL DEFAULT 0 CHECK(index_size >= 0)
+                    """
+                )
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
+            elif user_version == 6 and application_id == DB_APPLICATION_ID:
+                for statement in _REVIEW_SCHEMA_SQL:
+                    self._db.execute(statement)
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 2 and application_id == DB_APPLICATION_ID:
                 for statement in (
                     *_BACKFILL_SCHEMA_SQL,
                     *_BACKFILL_CERTIFICATE_SCHEMA_SQL,
                     *_SYNC_SCHEMA_SQL,
                     *_ATOMIC_TURN_SCHEMA_SQL,
+                    *_REVIEW_SCHEMA_SQL,
                 ):
                     self._db.execute(statement)
                 self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
@@ -1617,11 +1992,16 @@ class StateStore:
                     *_BACKFILL_CERTIFICATE_SCHEMA_SQL,
                     *_SYNC_SCHEMA_SQL,
                     *_ATOMIC_TURN_SCHEMA_SQL,
+                    *_REVIEW_SCHEMA_SQL,
                 ):
                     self._db.execute(statement)
                 self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 4 and application_id == DB_APPLICATION_ID:
-                for statement in (*_SYNC_SCHEMA_SQL, *_ATOMIC_TURN_SCHEMA_SQL):
+                for statement in (
+                    *_SYNC_SCHEMA_SQL,
+                    *_ATOMIC_TURN_SCHEMA_SQL,
+                    *_REVIEW_SCHEMA_SQL,
+                ):
                     self._db.execute(statement)
                 self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 5 and application_id == DB_APPLICATION_ID:
@@ -1633,6 +2013,8 @@ class StateStore:
                     """
                 )
                 for statement in _ATOMIC_TURN_SCHEMA_SQL:
+                    self._db.execute(statement)
+                for statement in _REVIEW_SCHEMA_SQL:
                     self._db.execute(statement)
                 self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 0 and application_id == 0:

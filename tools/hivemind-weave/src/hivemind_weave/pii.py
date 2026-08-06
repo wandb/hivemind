@@ -17,6 +17,7 @@ from .models import (
     MappedTurn,
 )
 from .redaction import redact_data, redact_string
+from .source_identity import is_opaque_source_coordinate
 from .utils import canonical_json, sha256_json
 
 _PII_ENGINE_REDACTOR: Any | None = None
@@ -34,6 +35,15 @@ _CORRELATION_ATTRIBUTES = {
 }
 
 _HASH_CORRELATORS = {"conversation_id"}
+_SOURCE_COORDINATE_KEYS = {
+    "agent_id",
+    "agent_session_id",
+    "atif_trajectory_id",
+    "parent_session_id",
+    "session_id",
+    "trajectory_id",
+}
+_REDACTED_SOURCE_COORDINATE = "[REDACTED_SOURCE_COORDINATE]"
 
 _KNOWN_AGENT_TYPES = {
     "claude",
@@ -50,10 +60,19 @@ _KNOWN_AGENT_TYPES = {
     "unknown",
 }
 _KNOWN_PROVIDERS = {"anthropic", "google", "openai", "unknown"}
+_KNOWN_SHORT_MODELS = {"o1", "o3", "o4"}
 _KNOWN_MODEL = re.compile(
-    r"^(?:gpt-|o[134](?:$|[-.])|claude(?:$|[-.])|gemini(?:$|[-.])|codex(?:$|[-.]))"
-    r"[a-z0-9._:/-]*$",
-    re.IGNORECASE,
+    r"^(?:"
+    r"gpt-(?=[a-z0-9._:/-]*[0-9])"
+    r"(?:(?:[0-9]+[a-z]?)|codex|mini|nano|turbo|preview|latest|chat|audio|realtime|oss)"
+    r"(?:[._:/-](?:(?:[0-9]+[a-z]?)|codex|mini|nano|turbo|preview|latest|chat|audio|realtime|oss))*|"
+    r"claude-(?:(?:haiku|sonnet|opus|instant|latest|preview)|[0-9]+)"
+    r"(?:[._:/-](?:(?:haiku|sonnet|opus|instant|latest|preview)|[0-9]+))*|"
+    r"gemini-(?:[0-9]+|flash|pro|ultra|nano|exp|experimental|preview|latest|thinking|live|image)"
+    r"(?:[._:/-](?:[0-9]+|flash|pro|ultra|nano|exp|experimental|preview|latest|thinking|live|image))*|"
+    r"codex(?:$|-(?:[0-9]+|mini|max|latest|cli)"
+    r"(?:[._:/-](?:[0-9]+|mini|max|latest|cli))*)"
+    r")$"
 )
 _CODE_DECLARATION = re.compile(
     r"(?P<prefix>^[ \t]*(?:(?:export|default|public|private|protected|internal|static|"
@@ -69,19 +88,73 @@ _SCOPED_CODE_IDENTIFIER = re.compile(
     r"\b[A-Za-z_$][A-Za-z0-9_$]*(?:::[A-Za-z_$][A-Za-z0-9_$]*)+"
     r"(?=(?:\s*\(|\b))"
 )
+_CODE_IDENTIFIER_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_$])[A-Za-z_$][A-Za-z0-9_$]*"
+    r"(?:::[A-Za-z_$][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$])"
+)
 _LIKELY_FULL_NAME_OR_LOCATION = re.compile(
     r"\b[A-Z][a-z]{1,}(?:[-'][A-Z]?[a-z]+)?\s+"
     r"[A-Z][a-z]{1,}(?:[-'][A-Z]?[a-z]+)?\b"
 )
+_LIKELY_CAMEL_CASE_NAME = re.compile(r"\b[A-Z][a-z]{1,}[A-Z][a-z]{1,}\b")
+_COORDINATE_LIKE_TEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_COORDINATE_WORD = re.compile(r"[A-Za-z]{3,}")
+_SAFE_COORDINATE_WORDS = {
+    "agent",
+    "atif",
+    "call",
+    "child",
+    "content",
+    "conversation",
+    "description",
+    "digest",
+    "ended",
+    "finish",
+    "hash",
+    "hivemind",
+    "id",
+    "index",
+    "input",
+    "manifest",
+    "message",
+    "metadata",
+    "metrics",
+    "model",
+    "name",
+    "output",
+    "parent",
+    "payload",
+    "preview",
+    "provider",
+    "reasoning",
+    "repository",
+    "result",
+    "schema",
+    "session",
+    "source",
+    "span",
+    "started",
+    "step",
+    "timestamp",
+    "tokens",
+    "tool",
+    "trace",
+    "turn",
+    "usage",
+    "user",
+    "version",
+    "warning",
+}
 _UUID = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
 _ATIF_VERSION = re.compile(r"^ATIF-v\d+\.\d+$", re.IGNORECASE)
-_TECHNICAL_ID = re.compile(
-    r"^(?:atif|step|call|trace|span|session|req|run|child|tool)[-_:][a-z0-9._:-]+$",
-    re.IGNORECASE,
+_REDACTION_PLACEHOLDER = re.compile(
+    r"^(?:\[REDACTED(?:_PII_KEY_[0-9]{4,10}|_SOURCE_COORDINATE)?\]|"
+    r"<[A-Z][A-Z0-9_]{1,63}>)$"
 )
+_PERSON_PLACEHOLDER = re.compile(r"<PERSON>", re.IGNORECASE)
 
 
 class _FullTextAnalyzer:
@@ -115,10 +188,46 @@ def _looks_like_technical_identifier(value: str) -> bool:
     return bool(
         _UUID.fullmatch(stripped)
         or _ATIF_VERSION.fullmatch(stripped)
-        or _TECHNICAL_ID.fullmatch(stripped)
-        or _KNOWN_MODEL.fullmatch(stripped)
-        or stripped.lower() in _KNOWN_AGENT_TYPES | _KNOWN_PROVIDERS
+        or _REDACTION_PLACEHOLDER.fullmatch(stripped)
     )
+
+
+def _scrub_coordinate_like_pii(value: str, engine_redactor: Any) -> str:
+    """Catch names hidden behind identifier punctuation or camel casing.
+
+    Small NER models often miss ``session-AliceJohnson`` as a whole token. A
+    generic technical-ID exemption made that miss absolute. Coordinate-like
+    content now receives a conservative component pass after credential
+    scrubbing. The pass is bounded to short standalone identifier strings, so
+    it does not multiply work across large prose or code bodies.
+    """
+    if not _COORDINATE_LIKE_TEXT.fullmatch(value):
+        return value
+    if _UUID.fullmatch(value) or _ATIF_VERSION.fullmatch(value):
+        return value
+    matches = list(_COORDINATE_WORD.finditer(value))
+    pii_indexes: set[int] = set()
+    for index, match in enumerate(matches):
+        token = match.group(0)
+        if token.lower() in _SAFE_COORDINATE_WORDS:
+            continue
+        elif _LIKELY_CAMEL_CASE_NAME.fullmatch(token):
+            pii_indexes.add(index)
+        else:
+            probe = token.title() if token.islower() else token
+            if engine_redactor(probe) != probe:
+                pii_indexes.add(index)
+    if not pii_indexes:
+        return value
+
+    # NER commonly recognizes only one half of a delimiter-separated personal
+    # name (for example ``john`` but not ``smith``). Once any component is PII,
+    # remove every non-protocol alphabetic component in that same coordinate.
+    result = value
+    for match in reversed(matches):
+        if match.group(0).lower() not in _SAFE_COORDINATE_WORDS:
+            result = f"{result[: match.start()]}[REDACTED]{result[match.end() :]}"
+    return result
 
 
 def _code_positions(value: str) -> list[bool]:
@@ -204,17 +313,53 @@ def _code_positions(value: str) -> list[bool]:
     return positions
 
 
-def _protect_declared_code_identifiers(value: str) -> tuple[str, dict[str, str]]:
+def _identifier_is_person_name(identifier: str, engine_redactor: Any) -> bool:
+    """Probe a code identifier as words without treating locations as people."""
+    expanded = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", identifier)
+    words = [word for word in re.split(r"[\s_$:]+", expanded) if word]
+    if len(words) < 2:
+        return False
+    probe = " ".join(word.title() if word.islower() or word.isupper() else word for word in words)
+    return bool(_PERSON_PLACEHOLDER.search(engine_redactor(probe)))
+
+
+def _redact_person_code_identifiers(value: str, engine_redactor: Any) -> str:
+    """Actively remove name-shaped identifiers before shielding code syntax."""
+    result = value
+    decisions: dict[str, bool] = {}
+    matches: list[re.Match[str]] = []
+    for match in _CODE_IDENTIFIER_TOKEN.finditer(value):
+        identifier = match.group(0)
+        is_person = decisions.get(identifier)
+        if is_person is None:
+            is_person = _identifier_is_person_name(identifier, engine_redactor)
+            decisions[identifier] = is_person
+        if is_person:
+            matches.append(match)
+    for match in reversed(matches):
+        result = f"{result[: match.start()]}[REDACTED]{result[match.end() :]}"
+    return result
+
+
+def _protect_declared_code_identifiers(
+    value: str,
+    engine_redactor: Any,
+) -> tuple[str, dict[str, str]]:
     positions = _code_positions(value)
     spans: list[tuple[int, int]] = []
     declared_identifiers: set[str] = set()
     for pattern in (_CODE_DECLARATION, _NEW_EXPRESSION):
         for match in pattern.finditer(value):
             start, end = match.span("identifier")
-            if start < len(positions) and positions[start]:
+            identifier = match.group("identifier")
+            if (
+                start < len(positions)
+                and positions[start]
+                and not _identifier_is_person_name(identifier, engine_redactor)
+            ):
                 spans.append((start, end))
                 if pattern is _CODE_DECLARATION:
-                    declared_identifiers.add(match.group("identifier"))
+                    declared_identifiers.add(identifier)
 
     # A declaration is only useful if later references survive too. Protect
     # exact identifier tokens outside comments and literals; those regions stay
@@ -227,7 +372,11 @@ def _protect_declared_code_identifiers(value: str) -> tuple[str, dict[str, str]]
                 spans.append((start, end))
     for match in _SCOPED_CODE_IDENTIFIER.finditer(value):
         start, end = match.span()
-        if start < len(positions) and all(positions[start:end]):
+        if (
+            start < len(positions)
+            and all(positions[start:end])
+            and not _identifier_is_person_name(match.group(0), engine_redactor)
+        ):
             spans.append((start, end))
 
     # Prefer the widest candidate when syntaxes overlap, then apply replacements
@@ -264,11 +413,18 @@ def _source_aware_redact(value: str, engine_redactor: Any) -> str:
     scrubbed = redact_string(value)
     if _looks_like_technical_identifier(scrubbed):
         return scrubbed
-    protected, replacements = _protect_declared_code_identifiers(scrubbed)
+    # Standalone identifiers and protocol coordinates are handled component by
+    # component. This preserves finite protocol vocabulary such as
+    # ``atif_trajectory_metadata`` while still removing ``alice_johnson``.
+    if _COORDINATE_LIKE_TEXT.fullmatch(scrubbed):
+        return _scrub_coordinate_like_pii(scrubbed, engine_redactor)
+    scrubbed = _redact_person_code_identifiers(scrubbed, engine_redactor)
+    protected, replacements = _protect_declared_code_identifiers(scrubbed, engine_redactor)
     # Small NER models occasionally tag only the surname of a two-token name.
     # Remove an obvious title-cased pair up front; declared/scoped identifiers
     # are already shielded above, so this remains conservative around code.
     protected = _LIKELY_FULL_NAME_OR_LOCATION.sub("[REDACTED]", protected)
+    protected = _LIKELY_CAMEL_CASE_NAME.sub("[REDACTED]", protected)
     redacted = engine_redactor(protected)
     for placeholder, identifier in replacements.items():
         redacted = redacted.replace(placeholder, identifier)
@@ -385,15 +541,23 @@ def _pii_walk(value: Any) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         redacted_key_index = 0
+        reserved_keys = {str(raw_key) for raw_key in value}
         for raw_key, raw_value in value.items():
             source_key = str(raw_key)
+            coordinate_key = source_key.rsplit(".", 1)[-1].lower()
             scrubbed_key = _redact_pii_string(source_key)
             if scrubbed_key != source_key:
-                redacted_key_index += 1
-                scrubbed_key = f"[REDACTED_PII_KEY_{redacted_key_index:04d}]"
+                while True:
+                    redacted_key_index += 1
+                    scrubbed_key = f"[REDACTED_PII_KEY_{redacted_key_index:04d}]"
+                    if scrubbed_key not in reserved_keys and scrubbed_key not in result:
+                        break
             if scrubbed_key in result:
                 raise ValueError("mapping keys collide after PII redaction")
-            result[scrubbed_key] = _pii_walk(raw_value)
+            if coordinate_key in _SOURCE_COORDINATE_KEYS:
+                result[scrubbed_key] = redact_source_coordinate(raw_value)
+            else:
+                result[scrubbed_key] = _pii_walk(raw_value)
         return result
     if isinstance(value, list):
         return [_pii_walk(item) for item in value]
@@ -418,11 +582,23 @@ def redact_agent_name(value: str) -> str:
 
 
 def redact_model_name(value: str) -> str:
-    return value if _KNOWN_MODEL.fullmatch(value.strip()) else str(redact_upload_data(value))
+    stripped = value.strip()
+    return (
+        value
+        if stripped in _KNOWN_SHORT_MODELS or _KNOWN_MODEL.fullmatch(stripped)
+        else str(redact_upload_data(value))
+    )
 
 
 def redact_provider_name(value: str) -> str:
     return value if value.strip().lower() in _KNOWN_PROVIDERS else str(redact_upload_data(value))
+
+
+def redact_source_coordinate(value: object) -> str:
+    """Preserve only contracted opaque source IDs; never hash rejected text."""
+    if value == "":
+        return ""
+    return str(value) if is_opaque_source_coordinate(value) else _REDACTED_SOURCE_COORDINATE
 
 
 def _message(item: ChatMessage) -> ChatMessage:
@@ -481,7 +657,11 @@ def _sanitize_turn(turn: MappedTurn) -> MappedTurn:
     assert isinstance(hash_context, dict)
     for key in _CORRELATION_ATTRIBUTES:
         if key in turn.attributes:
-            attributes[key] = turn.attributes[key]
+            attributes[key] = (
+                redact_source_coordinate(turn.attributes[key])
+                if key == "hivemind.session_id"
+                else turn.attributes[key]
+            )
     for key in _HASH_CORRELATORS:
         if key in turn.hash_context:
             hash_context[key] = turn.hash_context[key]
@@ -489,6 +669,8 @@ def _sanitize_turn(turn: MappedTurn) -> MappedTurn:
         hash_context["agent_name"] = redact_agent_name(str(turn.hash_context["agent_name"]))
     if "model" in turn.hash_context:
         hash_context["model"] = redact_model_name(str(turn.hash_context["model"]))
+    if "agent_id" in turn.hash_context:
+        hash_context["agent_id"] = redact_source_coordinate(turn.hash_context["agent_id"])
 
     llms = [
         replace(
@@ -522,7 +704,7 @@ def _sanitize_turn(turn: MappedTurn) -> MappedTurn:
             item,
             name=str(redact_upload_data(item.name)),
             model=redact_model_name(item.model),
-            agent_id=str(redact_upload_data(item.agent_id)),
+            agent_id=redact_source_coordinate(item.agent_id),
             description=str(redact_upload_data(item.description)),
             version=str(redact_upload_data(item.version)),
             system_instructions=[
@@ -562,7 +744,7 @@ def sanitize_mapped_conversation(conversation: MappedConversation) -> MappedConv
         conversation_name=str(redact_upload_data(conversation.conversation_name)),
         agent_name=redact_agent_name(conversation.agent_name),
         model=redact_model_name(conversation.model),
-        agent_id=str(redact_upload_data(conversation.agent_id)),
+        agent_id=redact_source_coordinate(conversation.agent_id),
         agent_version=str(redact_upload_data(conversation.agent_version)),
         turns=[_sanitize_turn(turn) for turn in conversation.turns],
     )

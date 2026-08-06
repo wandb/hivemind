@@ -43,3 +43,15 @@ class VerificationError(ImporterError):
 
 class BackfillError(ImporterError):
     """A sealed backfill plan could not be created or applied safely."""
+
+
+class ReviewMirrorError(ImporterError):
+    """The noncanonical review mirror could not proceed safely."""
+
+
+class ReviewMirrorUncertainError(ReviewMirrorError):
+    """A review root may have been emitted and requires exact reconciliation."""
+
+
+class ReviewMirrorConflictError(ReviewMirrorError):
+    """Review evidence has multiple or mismatched immutable matches."""

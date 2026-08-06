@@ -402,13 +402,11 @@ class HiveMindClient:
         safe_id = quote(session_id, safe="")
         payload = self._run(
             ["api", f"/sessions/{safe_id}", "--raw"],
-            purpose=f"fetching session summary for {session_id}",
+            purpose="fetching the selected session summary",
         )
         returned_id = payload.get("id")
         if not isinstance(returned_id, str) or returned_id != session_id:
-            raise HiveMindAPIError(
-                f"HiveMind session summary identity does not match session {session_id}"
-            )
+            raise HiveMindAPIError("HiveMind selected-session summary identity does not match")
         return payload
 
     def get_atif(self, session_id: str) -> dict[str, Any]:
@@ -427,15 +425,16 @@ class HiveMindClient:
             try:
                 payload = self._run(
                     arguments,
-                    purpose=f"fetching ATIF for session {session_id}",
+                    purpose="fetching ATIF for the selected session",
                 )
                 break
             except HiveMindAPIError as error:
                 transient = str(error).startswith(
                     (
-                        "HiveMind timed out while fetching ATIF",
-                        "HiveMind failed while fetching ATIF",
-                        "HiveMind returned invalid JSON while fetching ATIF",
+                        "HiveMind timed out while fetching ATIF for the selected session",
+                        "HiveMind failed while fetching ATIF for the selected session",
+                        "HiveMind returned invalid JSON while fetching ATIF "
+                        "for the selected session",
                     )
                 )
                 if not transient or attempt == _ATIF_FETCH_ATTEMPTS:
@@ -445,21 +444,15 @@ class HiveMindClient:
             raise AssertionError("ATIF fetch retry loop ended unexpectedly")
         trajectory = payload.get("trajectory")
         if not isinstance(trajectory, dict):
-            raise HiveMindAPIError(
-                f"HiveMind ATIF response for session {session_id} is missing trajectory"
-            )
+            raise HiveMindAPIError("HiveMind selected-session ATIF response is missing trajectory")
         wrapper_session_id = payload.get("session_id")
         if not isinstance(wrapper_session_id, str) or wrapper_session_id != session_id:
             raise HiveMindAPIError(
-                f"HiveMind ATIF response identity does not match session {session_id}"
+                "HiveMind selected-session ATIF response identity does not match"
             )
         step_count = payload.get("step_count")
         if isinstance(step_count, bool) or not isinstance(step_count, int) or step_count < 0:
-            raise HiveMindAPIError(
-                f"HiveMind ATIF response for session {session_id} has invalid step_count"
-            )
+            raise HiveMindAPIError("HiveMind selected-session ATIF response has invalid step_count")
         if not isinstance(payload.get("metadata"), dict):
-            raise HiveMindAPIError(
-                f"HiveMind ATIF response for session {session_id} has invalid metadata"
-            )
+            raise HiveMindAPIError("HiveMind selected-session ATIF response has invalid metadata")
         return payload

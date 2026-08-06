@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -211,11 +212,27 @@ def redact_string(value: str) -> str:
     return redacted
 
 
-def redact_data(value: Any, *, key: str = "") -> Any:
+def redact_data(
+    value: Any,
+    *,
+    key: str = "",
+    json_string_keys: frozenset[str] = frozenset(),
+) -> Any:
     """Return a shape-preserving copy with credentials and common PII removed."""
     if key and _is_sensitive_key(key):
         return REDACTED
     if isinstance(value, str):
+        if key in json_string_keys and value:
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise ValueError("declared JSON string field is invalid") from error
+            return json.dumps(
+                redact_data(decoded, json_string_keys=json_string_keys),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
         return redact_string(value)
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
@@ -228,8 +245,12 @@ def redact_data(value: Any, *, key: str = "") -> Any:
                 scrubbed_key = f"[REDACTED_KEY_{redacted_key_index:04d}]"
             if scrubbed_key in result:
                 raise ValueError("mapping keys collide after credential redaction")
-            result[scrubbed_key] = redact_data(item_value, key=raw_key)
+            result[scrubbed_key] = redact_data(
+                item_value,
+                key=raw_key,
+                json_string_keys=json_string_keys,
+            )
         return result
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
-        return [redact_data(item) for item in value]
+        return [redact_data(item, json_string_keys=json_string_keys) for item in value]
     return value

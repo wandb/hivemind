@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket
 from collections.abc import Callable
 from dataclasses import asdict
@@ -205,6 +206,87 @@ def test_source_coordinates_inside_preserved_atif_json_are_redacted(
     assert "[REDACTED_SOURCE_COORDINATE]" in serialized
 
 
+def test_preserved_atif_json_is_redacted_structurally_and_remains_valid(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    credential_snippet = f'OPENAI_API_KEY="{secret}"'
+    wrapper = atif_wrapper(
+        extra={
+            "credential_snippet": credential_snippet,
+            "person": "Alice Johnson",
+        }
+    )
+    wrapper["trajectory"]["steps"][0]["extra"] = {
+        "credential_snippet": credential_snippet,
+        "person": "Alice Johnson",
+    }
+    mapped = map_atif(Session.from_api(session_payload()), wrapper)
+
+    sanitized = sanitize_mapped_conversation(mapped)
+    attributes = sanitized.turns[0].attributes
+    preserved_keys = {
+        "hivemind.atif_agent_extra",
+        "hivemind.atif_trajectory_metadata",
+        "hivemind.atif_wrapper_metadata",
+    }
+    decoded = {
+        key: json.loads(value)
+        for key, value in attributes.items()
+        if key in preserved_keys and value
+    }
+    serialized = json.dumps(decoded)
+
+    assert secret not in serialized
+    assert "Alice Johnson" not in serialized
+    assert decoded["hivemind.atif_trajectory_metadata"]["extra"]["credential_snippet"]
+    for key, value in attributes.items():
+        if key in pii_module._CANONICAL_JSON_ATTRIBUTE_KEYS and value:
+            assert redact_upload_data({key: value})[key] == value
+
+
+def test_nested_json_credential_scrubbing_preserves_escaped_grammar() -> None:
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    source = json.dumps(
+        {
+            "credential_snippet": f'OPENAI_API_KEY="{secret}"',
+            "ordinary": "keep this",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    key = "hivemind.preserved_step_data"
+    redacted = redact_upload_data({key: source})[key]
+    decoded = json.loads(redacted)
+
+    assert secret not in redacted
+    assert decoded["ordinary"] == "keep this"
+    assert redact_upload_data({key: redacted})[key] == redacted
+
+
+def test_repeated_locations_converge_inside_preserved_step_data(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    source = " -> ".join(["Australia"] * 20)
+    mapped = map_atif(Session.from_api(session_payload()), atif_wrapper())
+    key = "hivemind.preserved_step_data"
+    mapped.turns[0].attributes[key] = json.dumps(
+        [{"raw_step": {"message": source}}],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    sanitized = sanitize_mapped_conversation(mapped)
+    serialized = sanitized.turns[0].attributes[key]
+    decoded = json.loads(serialized)
+
+    assert "Australia" not in decoded[0]["raw_step"]["message"]
+    assert redact_upload_data({key: serialized})[key] == serialized
+
+
 def test_coordinate_bearing_mapping_keys_fail_closed_without_hashing_names() -> None:
     source = "nonopaque-source-coordinate"
     redacted = redact_upload_data(
@@ -327,6 +409,101 @@ def test_exact_upload_redaction_is_idempotent() -> None:
     assert redact_upload_data(once) == once
 
 
+def test_repeated_contextual_locations_are_redacted_in_one_stable_result() -> None:
+    source = " -> ".join(["Australia"] * 20)
+
+    redacted = str(redact_upload_data(source))
+
+    assert "Australia" not in redacted
+    assert redacted.count("<LOCATION>") == 20
+    assert redact_upload_data(redacted) == redacted
+
+
+def test_generated_redaction_markers_cannot_change_later_ner_context() -> None:
+    engine_inputs: list[str] = []
+
+    def context_sensitive_engine(value: str) -> str:
+        engine_inputs.append(value)
+        if "<LOCATION>" in value:
+            return value.replace("ordinary.py", "<LOCATION>", 1)
+        return value.replace("seedplace", "<LOCATION>", 1)
+
+    first = pii_module._source_aware_redact(
+        "ordinary.py seedplace",
+        context_sensitive_engine,
+    )
+    second = pii_module._source_aware_redact(first, context_sensitive_engine)
+
+    assert first == "ordinary.py <LOCATION>"
+    assert second == first
+    assert all("<LOCATION>" not in value for value in engine_inputs)
+
+
+def test_redaction_marker_shields_are_collision_safe_and_reversible() -> None:
+    existing_internal_token, _ = pii_module._protect_redaction_placeholders("<LOCATION>")
+    source = f"{existing_internal_token} <LOCATION> <PERSON> <LOCATION>"
+
+    protected, replacements = pii_module._protect_redaction_placeholders(source)
+    restored = protected
+    for placeholder, marker in replacements.items():
+        assert restored.count(placeholder) == 1
+        restored = restored.replace(placeholder, marker, 1)
+
+    assert "<LOCATION>" not in protected
+    assert "<PERSON>" not in protected
+    assert len(replacements) == 3
+    assert restored == source
+
+
+def test_json_looking_chat_text_keeps_its_exact_formatting() -> None:
+    source = '{\n  "z": 1,\n  "a": "ordinary"\n}'
+
+    assert redact_upload_data(source) == source
+
+
+def test_upload_redaction_iterates_to_a_bounded_fixed_point(monkeypatch: Any) -> None:
+    transitions = {"raw": "once", "once": "stable", "stable": "stable"}
+    calls: list[str] = []
+
+    monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
+    monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
+
+    def walk(value: str) -> str:
+        calls.append(value)
+        return transitions[value]
+
+    monkeypatch.setattr(pii_module, "_pii_walk", walk)
+
+    assert redact_upload_data("raw") == "stable"
+    assert calls == ["raw", "once", "stable"]
+
+
+def test_upload_redaction_rejects_a_nonconverging_cycle(monkeypatch: Any) -> None:
+    monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
+    monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
+    monkeypatch.setattr(pii_module, "_pii_walk", lambda value: "b" if value == "a" else "a")
+
+    with pytest.raises(ValueError, match="fixed point"):
+        redact_upload_data("a")
+
+
+def test_upload_redaction_rejects_monotonic_nonconvergence(monkeypatch: Any) -> None:
+    calls = 0
+    monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
+    monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
+
+    def grow(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"{value}x"
+
+    monkeypatch.setattr(pii_module, "_pii_walk", grow)
+
+    with pytest.raises(ValueError, match="fixed point"):
+        redact_upload_data("a")
+    assert calls == pii_module._MAX_REDACTION_FIXED_POINT_PASSES
+
+
 def test_verification_signature_uses_sdk_dict_redaction_not_string_hook(
     monkeypatch: Any,
     session_payload: Callable[..., dict[str, Any]],
@@ -437,7 +614,7 @@ def test_redaction_cache_uses_only_digest_keys_and_redacted_values(monkeypatch: 
     monkeypatch.setattr(pii_module, "_redact_pii_string_uncached", fake_redactor)
     source = "private-source-value " * 500
     pii_module._REDACTION_CACHE.clear()
-    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_CHARS", 0)
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
 
     assert pii_module._redact_pii_string(source) == f"[safe:{len(source)}]"
     assert pii_module._redact_pii_string(source) == f"[safe:{len(source)}]"
@@ -453,13 +630,13 @@ def test_sanitization_keeps_large_attributes_inline_for_fail_closed_preflight(
 ) -> None:
     conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
     source = "x" * (MAX_ATTRIBUTE_VALUE_CHARS + 1)
-    conversation.turns[0].attributes["hivemind.preserved_step_data"] = source
+    conversation.turns[0].attributes["hivemind.preserved_step_data"] = json.dumps(source)
     monkeypatch.setattr("hivemind_weave.pii.redact_upload_data", lambda value: value)
 
     sanitized = sanitize_mapped_conversation(conversation)
     attributes = sanitized.turns[0].attributes
 
-    assert attributes["hivemind.preserved_step_data"] == source
+    assert json.loads(attributes["hivemind.preserved_step_data"]) == source
 
 
 def test_source_payload_hash_tracks_the_complete_pii_redacted_semantics(
@@ -485,8 +662,8 @@ def test_source_payload_hash_tracks_the_complete_pii_redacted_semantics(
 
     def mapped() -> Any:
         conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
-        conversation.turns[0].attributes["hivemind.preserved_step_data"] = "Alice " * (
-            MAX_ATTRIBUTE_VALUE_CHARS // 6 + 10
+        conversation.turns[0].attributes["hivemind.preserved_step_data"] = json.dumps(
+            "Alice " * (MAX_ATTRIBUTE_VALUE_CHARS // 6 + 10)
         )
         conversation.turns[0].finalize_hash()
         return conversation

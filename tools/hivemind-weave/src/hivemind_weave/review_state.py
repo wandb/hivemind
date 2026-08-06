@@ -26,6 +26,8 @@ _CERTIFIED_HASH_RUN = re.compile(r"[0-9a-f]{16,64}", re.IGNORECASE)
 _ERROR_CODE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
 _SPAN_ID = re.compile(r"^[0-9a-f]{16}$")
+_IMPORTER_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]{1,32})?$")
+_MAX_PLAN_SUCCESSOR_DEPTH = 256
 _LEDGER_STATES = frozenset(
     {
         "planned",
@@ -130,6 +132,13 @@ class ReviewLedgerTurn:
 
 
 @dataclass(frozen=True)
+class ReviewRetiredTurnEvidence:
+    plan_id: str
+    logical_key: str
+    proof_sha256: str
+
+
+@dataclass(frozen=True)
 class ReviewStatus:
     plans: int
     queued_sessions: int
@@ -146,6 +155,24 @@ class ReviewStatus:
 def review_plan_id(payload: dict[str, Any]) -> str:
     """Hash a caller-supplied canonical plan certificate."""
     return sha256_json({"schema": "hivemind-review-plan-v2", **payload})
+
+
+def review_successor_plan_id(
+    predecessor_plan_id: str,
+    *,
+    outcome: str,
+    resolution_proof_sha256: str,
+) -> str:
+    """Derive the next immutable attempt from one terminal predecessor."""
+    if not _SHA256.fullmatch(predecessor_plan_id) or not _SHA256.fullmatch(resolution_proof_sha256):
+        raise StateConflictError("review successor evidence is malformed")
+    if outcome not in {"retired", "revalidated"}:
+        raise StateConflictError("review successor outcome is malformed")
+    value = (
+        "hivemind-review-plan-successor-v1\0"
+        f"{outcome}\0{predecessor_plan_id}\0{resolution_proof_sha256}"
+    )
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 def review_logical_key(project: str, conversation_id: str, turn_key: str) -> str:
@@ -383,6 +410,133 @@ class ReviewStateStore:
             raise StateConflictError("review plan alias is ambiguous")
         return None if not rows else self._plan(rows[0])
 
+    def is_plan_retired(self, plan_id: str) -> bool:
+        """Return whether an exact sealed plan has an immutable retirement record."""
+        if not _SHA256.fullmatch(plan_id):
+            raise StateConflictError("review plan identity is malformed")
+        return (
+            self._db.execute(
+                "SELECT 1 FROM review_plan_retirements WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def is_plan_revalidated(self, plan_id: str) -> bool:
+        """Return whether a transient preflight drift was immutably revalidated."""
+        if not _SHA256.fullmatch(plan_id):
+            raise StateConflictError("review plan identity is malformed")
+        return (
+            self._db.execute(
+                "SELECT 1 FROM review_plan_revalidations WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def is_plan_terminal(self, plan_id: str) -> bool:
+        """Return whether a plan attempt has either immutable resolution."""
+        return self.is_plan_retired(plan_id) or self.is_plan_revalidated(plan_id)
+
+    def _successor_plan_chain(self, base_plan_id: str) -> tuple[str, ...]:
+        if not _SHA256.fullmatch(base_plan_id):
+            raise StateConflictError("review plan identity is malformed")
+        current = base_plan_id
+        chain: list[str] = []
+        seen: set[str] = set()
+        for _depth in range(_MAX_PLAN_SUCCESSOR_DEPTH):
+            if current in seen:
+                raise StateConflictError("review successor chain contains a cycle")
+            seen.add(current)
+            chain.append(current)
+            retired = self._db.execute(
+                "SELECT * FROM review_plan_retirements WHERE plan_id = ?",
+                (current,),
+            ).fetchone()
+            revalidated = self._db.execute(
+                "SELECT * FROM review_plan_revalidations WHERE plan_id = ?",
+                (current,),
+            ).fetchone()
+            if retired is not None and revalidated is not None:
+                raise StateConflictError("review plan has contradictory resolution evidence")
+            if retired is None and revalidated is None:
+                return tuple(chain)
+            resolution = retired if retired is not None else revalidated
+            assert resolution is not None
+            outcome = "retired" if retired is not None else "revalidated"
+            expected_reason = (
+                "preflight_source_drift" if outcome == "retired" else "transient_preflight_export"
+            )
+            proof_sha256 = str(resolution["proof_sha256"])
+            if (
+                str(resolution["reason"]) != expected_reason
+                or int(resolution["remote_match_count"]) != 0
+                or not _SHA256.fullmatch(proof_sha256)
+                or not _IMPORTER_VERSION.fullmatch(str(resolution["importer_version"]))
+            ):
+                raise StateConflictError("saved review resolution evidence is malformed")
+            current = review_successor_plan_id(
+                current,
+                outcome=outcome,
+                resolution_proof_sha256=proof_sha256,
+            )
+        raise StateConflictError("review successor chain exceeds its safety bound")
+
+    def successor_plan_id(self, base_plan_id: str) -> str:
+        """Resolve the deterministic writable identity after terminal attempts."""
+        return self._successor_plan_chain(base_plan_id)[-1]
+
+    def plan_id_in_successor_chain(self, base_plan_id: str, plan_id: str) -> bool:
+        """Validate a stored current or historical plan against its base certificate."""
+        if not _SHA256.fullmatch(plan_id):
+            raise StateConflictError("review plan identity is malformed")
+        return plan_id in self._successor_plan_chain(base_plan_id)
+
+    def retired_preflight_evidence(
+        self,
+        *,
+        project: str,
+        session_id: str,
+        turn_key: str,
+    ) -> tuple[ReviewRetiredTurnEvidence, ...]:
+        """Return immutable logical-key proofs overlapping a successor turn."""
+        safe_session_id = _source_id(session_id)
+        rows = self._db.execute(
+            """
+            SELECT archive.plan_id, archive.logical_key, archive.proof_sha256
+            FROM review_preflight_conflict_archive AS archive
+            LEFT JOIN review_plan_retirements AS retired
+              ON retired.plan_id = archive.plan_id
+             AND retired.project = archive.project
+             AND retired.proof_sha256 = archive.proof_sha256
+            LEFT JOIN review_plan_revalidations AS revalidated
+              ON revalidated.plan_id = archive.plan_id
+             AND revalidated.project = archive.project
+             AND revalidated.proof_sha256 = archive.proof_sha256
+            WHERE archive.project = ?
+              AND archive.session_id = ?
+              AND archive.turn_key = ?
+              AND (retired.plan_id IS NOT NULL OR revalidated.plan_id IS NOT NULL)
+            ORDER BY COALESCE(retired.retired_at, revalidated.revalidated_at), archive.plan_id
+            """,
+            (project, safe_session_id, turn_key),
+        ).fetchall()
+        result: list[ReviewRetiredTurnEvidence] = []
+        for row in rows:
+            plan_id = str(row["plan_id"])
+            logical_key = str(row["logical_key"])
+            proof_sha256 = str(row["proof_sha256"])
+            if not all(_SHA256.fullmatch(value) for value in (plan_id, logical_key, proof_sha256)):
+                raise StateConflictError("saved review retirement evidence is malformed")
+            result.append(
+                ReviewRetiredTurnEvidence(
+                    plan_id=plan_id,
+                    logical_key=logical_key,
+                    proof_sha256=proof_sha256,
+                )
+            )
+        return tuple(result)
+
     def get_sessions(self, plan_id: str) -> list[ReviewPlanSession]:
         rows = self._db.execute(
             "SELECT * FROM review_plan_sessions WHERE plan_id = ? ORDER BY ordinal",
@@ -424,6 +578,112 @@ class ReviewStateStore:
             result = [item for item in result if item.session_id in session_ids]
         return result
 
+    def completed_session_snapshots(
+        self,
+        project: str,
+    ) -> set[tuple[str, datetime, datetime]]:
+        """Return exact source revisions already completed in this project."""
+        rows = self._db.execute(
+            """
+            SELECT DISTINCT session.session_id, session.started_at, session.last_activity_at
+            FROM review_plan_sessions AS session
+            JOIN review_plans AS plan ON plan.plan_id = session.plan_id
+            WHERE plan.project = ? AND session.status = 'completed'
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_retirements AS retired
+                  WHERE retired.plan_id = plan.plan_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_revalidations AS revalidated
+                  WHERE revalidated.plan_id = plan.plan_id
+              )
+            """,
+            (project,),
+        ).fetchall()
+        return {
+            (
+                _source_id(row["session_id"]),
+                _timestamp(row["started_at"], label="completed session start"),
+                _timestamp(row["last_activity_at"], label="completed session activity"),
+            )
+            for row in rows
+        }
+
+    def terminal_session_snapshots(
+        self,
+        project: str,
+    ) -> set[tuple[str, datetime, datetime]]:
+        """Return exact source revisions that already consumed a terminal attempt."""
+        rows = self._db.execute(
+            """
+            SELECT DISTINCT session.session_id, session.started_at, session.last_activity_at
+            FROM review_plan_sessions AS session
+            JOIN review_plans AS plan ON plan.plan_id = session.plan_id
+            WHERE plan.project = ?
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM review_plan_retirements AS retired
+                      WHERE retired.plan_id = plan.plan_id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM review_plan_revalidations AS revalidated
+                      WHERE revalidated.plan_id = plan.plan_id
+                  )
+              )
+            """,
+            (project,),
+        ).fetchall()
+        return {
+            (
+                _source_id(row["session_id"]),
+                _timestamp(row["started_at"], label="terminal session start"),
+                _timestamp(row["last_activity_at"], label="terminal session activity"),
+            )
+            for row in rows
+        }
+
+    def unfinished_plan_for_window(
+        self,
+        *,
+        project: str,
+        since_utc: datetime,
+        until_utc: datetime,
+    ) -> ReviewPlan | None:
+        rows = self._db.execute(
+            """
+            SELECT * FROM review_plans
+            WHERE project = ? AND since_utc = ? AND until_utc = ? AND status != 'completed'
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_retirements AS retired
+                  WHERE retired.plan_id = review_plans.plan_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_revalidations AS revalidated
+                  WHERE revalidated.plan_id = review_plans.plan_id
+              )
+            ORDER BY created_at, plan_id LIMIT 2
+            """,
+            (project, isoformat_z(since_utc), isoformat_z(until_utc)),
+        ).fetchall()
+        if len(rows) > 1:
+            raise StateConflictError("multiple unfinished review plans share one window")
+        return None if not rows else self._plan(rows[0])
+
+    def assert_project_writes_unblocked(self, project: str) -> None:
+        unresolved = int(
+            self._db.execute(
+                """
+                SELECT COUNT(*) FROM review_turn_ledger
+                WHERE project = ? AND status IN ('uncertain', 'conflict')
+                """,
+                (project,),
+            ).fetchone()[0]
+        )
+        if unresolved:
+            raise StateConflictError(
+                "review project has unresolved turn evidence; reconcile before later writes"
+            )
+
     def create_plan(
         self,
         *,
@@ -438,6 +698,10 @@ class ReviewStateStore:
             or not _SHA256.fullmatch(plan.universe_sha256)
         ):
             raise StateConflictError("review plan identity is malformed")
+        if self.is_plan_terminal(plan.plan_id):
+            raise StateConflictError(
+                "terminal review plan identity requires a deterministic successor"
+            )
         if plan.status not in {"planned", "completed"} or plan.selector not in {
             "backlog",
             "canary",
@@ -456,6 +720,12 @@ class ReviewStateStore:
         if any(
             item.plan_id != plan.plan_id
             or item.session_id not in session_ids
+            or item.logical_key
+            != review_logical_key(
+                plan.project,
+                f"hivemind:{item.session_id}",
+                item.turn_key,
+            )
             or not all(
                 _SHA256.fullmatch(value)
                 for value in (
@@ -649,6 +919,8 @@ class ReviewStateStore:
     def get_or_create_cohort(self, plan_id: str, max_sessions: int) -> ReviewCohort | None:
         if not 1 <= max_sessions <= 10_000:
             raise ValueError("--max-sessions must be between 1 and 10000")
+        if self.is_plan_terminal(plan_id):
+            raise StateConflictError("terminal review plans cannot be applied")
         active = self._db.execute(
             """
             SELECT * FROM review_cohorts WHERE plan_id = ? AND status != 'completed'
@@ -737,6 +1009,8 @@ class ReviewStateStore:
         return [self._session(row) for row in rows]
 
     def begin_cohort(self, cohort: ReviewCohort) -> ReviewCohort:
+        if self.is_plan_terminal(cohort.plan_id):
+            raise StateConflictError("terminal review plans cannot be applied")
         if cohort.status == "blocked":
             raise StateConflictError("review cohort is blocked; reconcile it before applying")
         if cohort.status == "completed":
@@ -848,6 +1122,8 @@ class ReviewStateStore:
         return plan
 
     def resume_after_reconcile(self, plan_id: str) -> None:
+        if self.is_plan_terminal(plan_id):
+            return
         unresolved = int(
             self._db.execute(
                 """
@@ -905,6 +1181,13 @@ class ReviewStateStore:
     ) -> tuple[ReviewLedgerTurn, str]:
         if not is_opaque_source_coordinate(certificate.session_id):
             raise StateConflictError("review ledger contains an unsafe session identity")
+        expected_logical_key = review_logical_key(
+            project,
+            f"hivemind:{certificate.session_id}",
+            certificate.turn_key,
+        )
+        if certificate.logical_key != expected_logical_key:
+            raise StateConflictError("review ledger logical key is malformed")
         existing = self.get_ledger(project, certificate.session_id, certificate.turn_key)
         identity = (
             certificate.source_payload_sha256,
@@ -1130,6 +1413,459 @@ class ReviewStateStore:
             return turn
         return self._transition(turn, "conflict", error_code=error_code)
 
+    def preflight_conflicts(self, plan_id: str) -> list[ReviewLedgerTurn]:
+        """List zero-write source-drift conflicts eligible for explicit retirement."""
+        if not _SHA256.fullmatch(plan_id):
+            raise StateConflictError("review plan identity is malformed")
+        rows = self._db.execute(
+            """
+            SELECT ledger.* FROM review_plan_turns AS planned
+            JOIN review_plan_sessions AS session
+              ON session.plan_id = planned.plan_id
+             AND session.session_id = planned.session_id
+            JOIN review_plans AS plan ON plan.plan_id = planned.plan_id
+            JOIN review_turn_ledger AS ledger
+              ON ledger.project = plan.project
+             AND ledger.session_id = planned.session_id
+             AND ledger.turn_key = planned.turn_key
+            WHERE planned.plan_id = ?
+              AND plan.status = 'blocked'
+              AND ledger.status = 'conflict'
+              AND ledger.error_code IN (
+                  'preflight_session_conflict', 'preflight_source_drift'
+              )
+              AND ledger.revision = 1
+              AND ledger.chunk_refs_json = '[]'
+              AND ledger.chunk_hashes_json = '[]'
+              AND ledger.chunk_sizes_json = '[]'
+              AND ledger.index_ref = ''
+              AND ledger.index_sha256 = ''
+              AND ledger.index_size = 0
+              AND ledger.trace_id = ''
+              AND ledger.root_span_id = ''
+              AND ledger.visible_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_retirements AS retired
+                  WHERE retired.plan_id = planned.plan_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_revalidations AS revalidated
+                  WHERE revalidated.plan_id = planned.plan_id
+              )
+            ORDER BY session.ordinal, planned.ordinal
+            """,
+            (plan_id,),
+        ).fetchall()
+        return [self._ledger(row) for row in rows]
+
+    def retire_preflight_plan(
+        self,
+        plan_id: str,
+        *,
+        proof_sha256: str,
+        importer_version: str,
+    ) -> int:
+        """Archive and retire a proven zero-write source-drift plan atomically.
+
+        The caller must independently prove source stability and remote absence.
+        Only a SHA-256 proof certificate and a constrained package version are
+        accepted here; neither source nor hosted content is persisted.
+        """
+        if not _SHA256.fullmatch(plan_id):
+            raise StateConflictError("review plan identity is malformed")
+        if not _SHA256.fullmatch(proof_sha256):
+            raise StateConflictError("review retirement proof is malformed")
+        if not _IMPORTER_VERSION.fullmatch(importer_version):
+            raise StateConflictError("review importer version is malformed")
+
+        existing = self._db.execute(
+            "SELECT * FROM review_plan_retirements WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["reason"]) != "preflight_source_drift"
+                or int(existing["remote_match_count"]) != 0
+                or str(existing["proof_sha256"]) != proof_sha256
+                or str(existing["importer_version"]) != importer_version
+            ):
+                raise StateConflictError("review plan already has different retirement evidence")
+            return int(existing["archived_turn_count"])
+
+        plan = self._db.execute(
+            "SELECT plan_id, project, status, selected_count FROM review_plans WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        if plan is None:
+            raise StateConflictError("review plan was not found")
+        if str(plan["status"]) != "blocked":
+            raise StateConflictError("only a blocked review plan can be retired")
+        if int(plan["selected_count"]) != 1:
+            raise StateConflictError("multi-session review plans cannot use preflight resolution")
+
+        cohort_rows = self._db.execute(
+            """
+            SELECT status, session_count, visible_turns, skipped_turns
+            FROM review_cohorts WHERE plan_id = ? ORDER BY ordinal
+            """,
+            (plan_id,),
+        ).fetchall()
+        if len(cohort_rows) != 1 or any(
+            str(row["status"]) != "blocked"
+            or int(row["session_count"]) != 1
+            or int(row["visible_turns"]) != 0
+            or int(row["skipped_turns"]) != 0
+            for row in cohort_rows
+        ):
+            raise StateConflictError("review plan retirement requires a zero-write blocked cohort")
+
+        ledger_rows = self._db.execute(
+            """
+            SELECT ledger.* FROM review_plan_turns AS planned
+            JOIN review_plan_sessions AS session
+              ON session.plan_id = planned.plan_id
+             AND session.session_id = planned.session_id
+            JOIN review_plans AS plan ON plan.plan_id = planned.plan_id
+            JOIN review_turn_ledger AS ledger
+              ON ledger.project = plan.project
+             AND ledger.session_id = planned.session_id
+             AND ledger.turn_key = planned.turn_key
+            WHERE planned.plan_id = ?
+            ORDER BY session.ordinal, planned.ordinal
+            """,
+            (plan_id,),
+        ).fetchall()
+        if not ledger_rows:
+            raise StateConflictError("review plan retirement requires preflight conflict evidence")
+        for row in ledger_rows:
+            if not (
+                str(row["status"]) == "conflict"
+                and str(row["error_code"])
+                in {"preflight_session_conflict", "preflight_source_drift"}
+                and int(row["revision"]) == 1
+                and str(row["chunk_refs_json"]) == "[]"
+                and str(row["chunk_hashes_json"]) == "[]"
+                and str(row["chunk_sizes_json"]) == "[]"
+                and str(row["index_ref"]) == ""
+                and str(row["index_sha256"]) == ""
+                and int(row["index_size"]) == 0
+                and str(row["trace_id"]) == ""
+                and str(row["root_span_id"]) == ""
+                and row["visible_at"] is None
+            ):
+                raise StateConflictError("review plan contains non-retirable turn evidence")
+
+        project = str(plan["project"])
+        shared_ledger = self._db.execute(
+            """
+            SELECT 1
+            FROM review_plan_turns AS retiring
+            JOIN review_plan_turns AS other
+              ON other.session_id = retiring.session_id
+             AND other.turn_key = retiring.turn_key
+             AND other.plan_id != retiring.plan_id
+            JOIN review_plans AS other_plan ON other_plan.plan_id = other.plan_id
+            WHERE retiring.plan_id = ?
+              AND other_plan.project = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_retirements AS retired
+                  WHERE retired.plan_id = other.plan_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_revalidations AS revalidated
+                  WHERE revalidated.plan_id = other.plan_id
+              )
+            LIMIT 1
+            """,
+            (plan_id, project),
+        ).fetchone()
+        if shared_ledger is not None:
+            raise StateConflictError(
+                "review plan shares conflict evidence with another active plan"
+            )
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.executemany(
+                """
+                INSERT INTO review_preflight_conflict_archive (
+                    plan_id, project, session_id, turn_key,
+                    source_payload_sha256, manifest_sha256, logical_key,
+                    preview_signature, manifest_bytes, chunk_count,
+                    ledger_revision, ledger_created_at, ledger_updated_at,
+                    ledger_error_code, proof_sha256, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        plan_id,
+                        project,
+                        str(row["session_id"]),
+                        str(row["turn_key"]),
+                        str(row["source_payload_sha256"]),
+                        str(row["manifest_sha256"]),
+                        str(row["logical_key"]),
+                        str(row["preview_signature"]),
+                        int(row["manifest_bytes"]),
+                        int(row["chunk_count"]),
+                        int(row["revision"]),
+                        str(row["created_at"]),
+                        str(row["updated_at"]),
+                        str(row["error_code"]),
+                        proof_sha256,
+                        now,
+                    )
+                    for row in ledger_rows
+                ],
+            )
+            self._db.execute(
+                """
+                INSERT INTO review_plan_retirements (
+                    plan_id, project, reason, archived_turn_count,
+                    remote_match_count, proof_sha256, importer_version, retired_at
+                ) VALUES (?, ?, 'preflight_source_drift', ?, 0, ?, ?, ?)
+                """,
+                (plan_id, project, len(ledger_rows), proof_sha256, importer_version, now),
+            )
+            deleted = 0
+            for row in ledger_rows:
+                cursor = self._db.execute(
+                    """
+                    DELETE FROM review_turn_ledger
+                    WHERE project = ? AND session_id = ? AND turn_key = ?
+                      AND source_payload_sha256 = ? AND manifest_sha256 = ?
+                      AND logical_key = ? AND preview_signature = ?
+                      AND manifest_bytes = ? AND chunk_count = ?
+                      AND status = 'conflict' AND revision = ? AND error_code = ?
+                    """,
+                    (
+                        project,
+                        str(row["session_id"]),
+                        str(row["turn_key"]),
+                        str(row["source_payload_sha256"]),
+                        str(row["manifest_sha256"]),
+                        str(row["logical_key"]),
+                        str(row["preview_signature"]),
+                        int(row["manifest_bytes"]),
+                        int(row["chunk_count"]),
+                        int(row["revision"]),
+                        str(row["error_code"]),
+                    ),
+                )
+                deleted += cursor.rowcount
+            if deleted != len(ledger_rows):
+                raise StateConflictError("review conflict evidence changed during retirement")
+            self._commit()
+        except Exception:
+            self._db.rollback()
+            raise
+        return len(ledger_rows)
+
+    def revalidate_preflight_plan(
+        self,
+        plan_id: str,
+        *,
+        proof_sha256: str,
+        importer_version: str,
+    ) -> int:
+        """Terminally resolve a zero-write attempt after its source is stable again."""
+        if not _SHA256.fullmatch(plan_id):
+            raise StateConflictError("review plan identity is malformed")
+        if not _SHA256.fullmatch(proof_sha256):
+            raise StateConflictError("review revalidation proof is malformed")
+        if not _IMPORTER_VERSION.fullmatch(importer_version):
+            raise StateConflictError("review importer version is malformed")
+
+        existing = self._db.execute(
+            "SELECT * FROM review_plan_revalidations WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["reason"]) != "transient_preflight_export"
+                or int(existing["remote_match_count"]) != 0
+                or str(existing["proof_sha256"]) != proof_sha256
+                or str(existing["importer_version"]) != importer_version
+            ):
+                raise StateConflictError("review plan already has different revalidation evidence")
+            return int(existing["archived_turn_count"])
+        if self.is_plan_retired(plan_id):
+            raise StateConflictError("retired review plans cannot be revalidated")
+
+        plan = self._db.execute(
+            "SELECT plan_id, project, status, selected_count FROM review_plans WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        if plan is None:
+            raise StateConflictError("review plan was not found")
+        if str(plan["status"]) != "blocked":
+            raise StateConflictError("only a blocked review plan can be revalidated")
+        if int(plan["selected_count"]) != 1:
+            raise StateConflictError("multi-session review plans cannot use preflight resolution")
+
+        cohort_rows = self._db.execute(
+            """
+            SELECT status, session_count, visible_turns, skipped_turns
+            FROM review_cohorts WHERE plan_id = ? ORDER BY ordinal
+            """,
+            (plan_id,),
+        ).fetchall()
+        if len(cohort_rows) != 1 or any(
+            str(row["status"]) != "blocked"
+            or int(row["session_count"]) != 1
+            or int(row["visible_turns"]) != 0
+            or int(row["skipped_turns"]) != 0
+            for row in cohort_rows
+        ):
+            raise StateConflictError(
+                "review plan revalidation requires a zero-write blocked cohort"
+            )
+
+        ledger_rows = self._db.execute(
+            """
+            SELECT ledger.* FROM review_plan_turns AS planned
+            JOIN review_plan_sessions AS session
+              ON session.plan_id = planned.plan_id
+             AND session.session_id = planned.session_id
+            JOIN review_plans AS plan ON plan.plan_id = planned.plan_id
+            JOIN review_turn_ledger AS ledger
+              ON ledger.project = plan.project
+             AND ledger.session_id = planned.session_id
+             AND ledger.turn_key = planned.turn_key
+            WHERE planned.plan_id = ?
+            ORDER BY session.ordinal, planned.ordinal
+            """,
+            (plan_id,),
+        ).fetchall()
+        if not ledger_rows:
+            raise StateConflictError(
+                "review plan revalidation requires preflight conflict evidence"
+            )
+        for row in ledger_rows:
+            if not (
+                str(row["status"]) == "conflict"
+                and str(row["error_code"])
+                in {"preflight_session_conflict", "preflight_source_drift"}
+                and int(row["revision"]) == 1
+                and str(row["chunk_refs_json"]) == "[]"
+                and str(row["chunk_hashes_json"]) == "[]"
+                and str(row["chunk_sizes_json"]) == "[]"
+                and str(row["index_ref"]) == ""
+                and str(row["index_sha256"]) == ""
+                and int(row["index_size"]) == 0
+                and str(row["trace_id"]) == ""
+                and str(row["root_span_id"]) == ""
+                and row["visible_at"] is None
+            ):
+                raise StateConflictError("review plan contains non-revalidatable turn evidence")
+
+        project = str(plan["project"])
+        shared_ledger = self._db.execute(
+            """
+            SELECT 1
+            FROM review_plan_turns AS revalidating
+            JOIN review_plan_turns AS other
+              ON other.session_id = revalidating.session_id
+             AND other.turn_key = revalidating.turn_key
+             AND other.plan_id != revalidating.plan_id
+            JOIN review_plans AS other_plan ON other_plan.plan_id = other.plan_id
+            WHERE revalidating.plan_id = ?
+              AND other_plan.project = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_retirements AS retired
+                  WHERE retired.plan_id = other.plan_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_revalidations AS revalidated
+                  WHERE revalidated.plan_id = other.plan_id
+              )
+            LIMIT 1
+            """,
+            (plan_id, project),
+        ).fetchone()
+        if shared_ledger is not None:
+            raise StateConflictError(
+                "review plan shares conflict evidence with another active plan"
+            )
+
+        now = isoformat_z(datetime.now(UTC))
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.executemany(
+                """
+                INSERT INTO review_preflight_conflict_archive (
+                    plan_id, project, session_id, turn_key,
+                    source_payload_sha256, manifest_sha256, logical_key,
+                    preview_signature, manifest_bytes, chunk_count,
+                    ledger_revision, ledger_created_at, ledger_updated_at,
+                    ledger_error_code, proof_sha256, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        plan_id,
+                        project,
+                        str(row["session_id"]),
+                        str(row["turn_key"]),
+                        str(row["source_payload_sha256"]),
+                        str(row["manifest_sha256"]),
+                        str(row["logical_key"]),
+                        str(row["preview_signature"]),
+                        int(row["manifest_bytes"]),
+                        int(row["chunk_count"]),
+                        int(row["revision"]),
+                        str(row["created_at"]),
+                        str(row["updated_at"]),
+                        str(row["error_code"]),
+                        proof_sha256,
+                        now,
+                    )
+                    for row in ledger_rows
+                ],
+            )
+            self._db.execute(
+                """
+                INSERT INTO review_plan_revalidations (
+                    plan_id, project, reason, archived_turn_count,
+                    remote_match_count, proof_sha256, importer_version, revalidated_at
+                ) VALUES (?, ?, 'transient_preflight_export', ?, 0, ?, ?, ?)
+                """,
+                (plan_id, project, len(ledger_rows), proof_sha256, importer_version, now),
+            )
+            deleted = 0
+            for row in ledger_rows:
+                cursor = self._db.execute(
+                    """
+                    DELETE FROM review_turn_ledger
+                    WHERE project = ? AND session_id = ? AND turn_key = ?
+                      AND source_payload_sha256 = ? AND manifest_sha256 = ?
+                      AND logical_key = ? AND preview_signature = ?
+                      AND manifest_bytes = ? AND chunk_count = ?
+                      AND status = 'conflict' AND revision = ? AND error_code = ?
+                    """,
+                    (
+                        project,
+                        str(row["session_id"]),
+                        str(row["turn_key"]),
+                        str(row["source_payload_sha256"]),
+                        str(row["manifest_sha256"]),
+                        str(row["logical_key"]),
+                        str(row["preview_signature"]),
+                        int(row["manifest_bytes"]),
+                        int(row["chunk_count"]),
+                        int(row["revision"]),
+                        str(row["error_code"]),
+                    ),
+                )
+                deleted += cursor.rowcount
+            if deleted != len(ledger_rows):
+                raise StateConflictError("review conflict evidence changed during revalidation")
+            self._commit()
+        except Exception:
+            self._db.rollback()
+            raise
+        return len(ledger_rows)
+
     def reconcilable_turns(self, plan_id: str) -> list[ReviewLedgerTurn]:
         rows = self._db.execute(
             """
@@ -1158,17 +1894,39 @@ class ReviewStateStore:
         return counts.get("completed", 0), counts.get("pending", 0) + counts.get("blocked", 0)
 
     def status(self, project: str | None = None) -> ReviewStatus:
-        plan_where = "" if project is None else " WHERE project = ?"
         args: tuple[Any, ...] = () if project is None else (project,)
+        plan_where = "" if project is None else " AND plan.project = ?"
         plans = int(
-            self._db.execute(f"SELECT COUNT(*) FROM review_plans{plan_where}", args).fetchone()[0]
+            self._db.execute(
+                """
+                SELECT COUNT(*) FROM review_plans AS plan
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM review_plan_retirements AS retired
+                    WHERE retired.plan_id = plan.plan_id
+                )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM review_plan_revalidations AS revalidated
+                      WHERE revalidated.plan_id = plan.plan_id
+                  )
+                """
+                + plan_where,
+                args,
+            ).fetchone()[0]
         )
         session_rows = self._db.execute(
             """
             SELECT session.status, COUNT(*) AS count FROM review_plan_sessions AS session
             JOIN review_plans AS plan ON plan.plan_id = session.plan_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM review_plan_retirements AS retired
+                WHERE retired.plan_id = plan.plan_id
+            )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_revalidations AS revalidated
+                  WHERE revalidated.plan_id = plan.plan_id
+              )
             """
-            + (" WHERE plan.project = ?" if project is not None else "")
+            + (" AND plan.project = ?" if project is not None else "")
             + " GROUP BY session.status",
             args,
         ).fetchall()

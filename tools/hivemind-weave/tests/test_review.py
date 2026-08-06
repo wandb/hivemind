@@ -25,9 +25,11 @@ from hivemind_weave.review import (
     ReviewApplyConfig,
     ReviewPreviewConfig,
     ReviewReconcileConfig,
+    ReviewRecoverPreflightConfig,
     apply_review,
     preview_review,
     reconcile_review,
+    recover_preflight_review,
     review_status,
 )
 from hivemind_weave.review_manifest import ReviewManifestError
@@ -87,6 +89,7 @@ class FakeSink:
     fail_finish = False
     bad_publication = False
     reconcile_matches = 1
+    logical_matches = 0
     verify_callback: ClassVar[Callable[[], None] | None] = None
 
     def __init__(self) -> None:
@@ -99,6 +102,7 @@ class FakeSink:
         self.events: list[str] = []
         self.manifests: list[dict[str, Any]] = []
         self.find_expectations: list[dict[str, Any]] = []
+        self.logical_expectations: list[dict[str, Any]] = []
         self.__class__.instances.append(self)
 
     def start(self, project: str) -> None:
@@ -214,6 +218,25 @@ class FakeSink:
             span_count=self.reconcile_matches,
         )
 
+    def find_logical_roots(self, **expectation: Any) -> Any:
+        assert self.read_only
+        assert expectation["conversation_id"].startswith("hivemind:")
+        assert len(expectation["logical_key"]) == 64
+        self.logical_expectations.append(expectation)
+        if self.logical_matches == 0:
+            return SimpleNamespace(
+                matches=0,
+                trace_ids=(),
+                root_span_ids=(),
+                span_count=0,
+            )
+        return SimpleNamespace(
+            matches=self.logical_matches,
+            trace_ids=tuple(_trace_id(index + 1) for index in range(self.logical_matches)),
+            root_span_ids=tuple(_span_id(index + 1) for index in range(self.logical_matches)),
+            span_count=self.logical_matches,
+        )
+
     def finish(self) -> None:
         if self.read_only:
             self.events.append("finish_read_only")
@@ -236,6 +259,7 @@ def _reset_sink() -> None:
     FakeSink.fail_finish = False
     FakeSink.bad_publication = False
     FakeSink.reconcile_matches = 1
+    FakeSink.logical_matches = 0
     FakeSink.verify_callback = None
 
 
@@ -268,6 +292,7 @@ def _preview(
     client: FakeHiveMind,
     *,
     canary: bool = False,
+    next_sessions: int | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> Any:
     return preview_review(
@@ -277,11 +302,55 @@ def _preview(
             project=REVIEW_PROJECT,
             state_path=tmp_path / "private" / "state.sqlite3",
             canary=canary,
+            next_sessions=next_sessions,
             now=NOW,
             progress=progress,
         ),
         hivemind=client,  # type: ignore[arg-type]
     )
+
+
+def _terminalize_zero_write_plan(state_path: Path, plan_id: str) -> None:
+    with ReviewStateStore(state_path) as state:
+        cohort = state.get_or_create_cohort(plan_id, 1)
+        assert cohort is not None
+        cohort = state.begin_cohort(cohort)
+        plan = state.resolve_plan(plan_id)
+        assert plan is not None
+        certificates = state.get_turns(plan_id)
+        for certificate in certificates:
+            ledger, outcome = state.ensure_ledger(plan.project, certificate)
+            assert outcome == "new"
+            state.mark_conflict(ledger, "preflight_session_conflict")
+        state.finish_cohort(
+            cohort,
+            success=False,
+            visible_turns=0,
+            skipped_turns=0,
+            conflicted_turns=len(certificates),
+            failed_items=0,
+            error_code="preflight_session_conflict",
+        )
+        state.retire_preflight_plan(
+            plan_id,
+            proof_sha256=hashlib.sha256(f"terminal:{plan_id}".encode()).hexdigest(),
+            importer_version="0.4.0",
+        )
+
+
+def _complete_plan_without_upload(state_path: Path, plan_id: str) -> None:
+    with ReviewStateStore(state_path) as state:
+        cohort = state.get_or_create_cohort(plan_id, 1)
+        assert cohort is not None
+        cohort = state.begin_cohort(cohort)
+        state.finish_cohort(
+            cohort,
+            success=True,
+            visible_turns=0,
+            skipped_turns=0,
+            conflicted_turns=0,
+            failed_items=0,
+        )
 
 
 def test_preview_seals_complete_content_free_plan_and_canary(
@@ -309,6 +378,188 @@ def test_preview_seals_complete_content_free_plan_and_canary(
     assert turns
     assert all(isinstance(item.started_at, datetime) for item in turns)
     assert all(isinstance(item.ended_at, datetime) for item in turns)
+
+
+def test_next_sessions_seals_resumable_whole_session_microplans(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=3)
+
+    first = _preview(tmp_path, client, next_sessions=1)
+
+    assert first.selected_sessions == 1
+    assert first.remaining_backlog_sessions == 2
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        first_sessions = state.get_sessions(first.plan_id)
+        assert [item.session_id for item in first_sessions] == [REVIEW_SESSION_IDS[0]]
+        cohort = state.get_or_create_cohort(first.plan_id, 1)
+        assert cohort is not None
+        cohort = state.begin_cohort(cohort)
+        state.finish_cohort(
+            cohort,
+            success=True,
+            visible_turns=1,
+            skipped_turns=0,
+            conflicted_turns=0,
+            failed_items=0,
+        )
+
+    second = _preview(tmp_path, client, next_sessions=1)
+
+    assert second.plan_id != first.plan_id
+    assert second.selected_sessions == 1
+    assert second.remaining_backlog_sessions == 1
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        second_sessions = state.get_sessions(second.plan_id)
+    assert [item.session_id for item in second_sessions] == [REVIEW_SESSION_IDS[1]]
+
+
+def test_next_sessions_uses_deterministic_content_free_work_order(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=3)
+    costs = (1_000_000, 100_000, 10_000)
+    for session, input_tokens in zip(client.sessions, costs, strict=True):
+        session.update(
+            {
+                "turn_count": 1,
+                "tool_call_count": 1,
+                "input_tokens": input_tokens,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_read_tokens": 0,
+                "cached_write_tokens": 0,
+            }
+        )
+
+    report = _preview(tmp_path, client, next_sessions=1)
+
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        sessions = state.get_sessions(report.plan_id)
+    assert [item.session_id for item in sessions] == [REVIEW_SESSION_IDS[2]]
+
+
+def test_next_sessions_retries_terminal_revision_after_every_fresh_revision(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=3)
+    state_path = tmp_path / "private" / "state.sqlite3"
+    first = _preview(tmp_path, client, next_sessions=1)
+    with ReviewStateStore(state_path) as state:
+        assert [item.session_id for item in state.get_sessions(first.plan_id)] == [
+            REVIEW_SESSION_IDS[0]
+        ]
+    _terminalize_zero_write_plan(state_path, first.plan_id)
+
+    second = _preview(tmp_path, client, next_sessions=1)
+    assert second.selected_sessions + second.remaining_backlog_sessions == 3
+    assert second.remaining_backlog_sessions == 2
+    with ReviewStateStore(state_path) as state:
+        assert [item.session_id for item in state.get_sessions(second.plan_id)] == [
+            REVIEW_SESSION_IDS[1]
+        ]
+    _complete_plan_without_upload(state_path, second.plan_id)
+
+    third = _preview(tmp_path, client, next_sessions=1)
+    assert third.selected_sessions + third.remaining_backlog_sessions == 2
+    assert third.remaining_backlog_sessions == 1
+    with ReviewStateStore(state_path) as state:
+        assert [item.session_id for item in state.get_sessions(third.plan_id)] == [
+            REVIEW_SESSION_IDS[2]
+        ]
+    _complete_plan_without_upload(state_path, third.plan_id)
+
+    fourth = _preview(tmp_path, client, next_sessions=1)
+    assert fourth.remaining_backlog_sessions == 0
+    assert fourth.plan_id != first.plan_id
+    with ReviewStateStore(state_path) as state:
+        assert [item.session_id for item in state.get_sessions(fourth.plan_id)] == [
+            REVIEW_SESSION_IDS[0]
+        ]
+        assert state.successor_plan_id(first.plan_id) == fourth.plan_id
+
+
+def test_terminal_fairness_uses_exact_revision_and_does_not_change_explicit_selection(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=2)
+    state_path = tmp_path / "private" / "state.sqlite3"
+    first = _preview(tmp_path, client, next_sessions=1)
+    _terminalize_zero_write_plan(state_path, first.plan_id)
+
+    # Advancing activity creates a fresh exact revision even for the same
+    # source session ID, so it must not inherit the old revision's retry rank.
+    client.sessions[0]["last_activity_at"] = "2026-07-22T12:45:00Z"
+    client.sessions[1]["last_activity_at"] = "2026-07-23T12:45:00Z"
+    fresh = _preview(tmp_path, client, next_sessions=1)
+    with ReviewStateStore(state_path) as state:
+        assert [item.session_id for item in state.get_sessions(fresh.plan_id)] == [
+            REVIEW_SESSION_IDS[0]
+        ]
+
+    explicit_path = tmp_path / "explicit" / "state.sqlite3"
+    explicit_client = _client(session_payload, atif_wrapper, count=2)
+    explicit_first = preview_review(
+        ReviewPreviewConfig(
+            since="2026-07-16T00:00:00Z",
+            until="2026-08-06T16:00:00Z",
+            project=REVIEW_PROJECT,
+            state_path=explicit_path,
+            next_sessions=1,
+            now=NOW,
+        ),
+        hivemind=explicit_client,  # type: ignore[arg-type]
+    )
+    _terminalize_zero_write_plan(explicit_path, explicit_first.plan_id)
+    explicit = preview_review(
+        ReviewPreviewConfig(
+            since="2026-07-16T00:00:00Z",
+            until="2026-08-06T16:00:00Z",
+            project=REVIEW_PROJECT,
+            state_path=explicit_path,
+            session_ids=(REVIEW_SESSION_IDS[0],),
+            now=NOW,
+        ),
+        hivemind=explicit_client,  # type: ignore[arg-type]
+    )
+    with ReviewStateStore(explicit_path) as state:
+        assert [item.session_id for item in state.get_sessions(explicit.plan_id)] == [
+            REVIEW_SESSION_IDS[0]
+        ]
+
+
+def test_next_sessions_refuses_to_plan_past_an_unfinished_microplan(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=2)
+    first = _preview(tmp_path, client, next_sessions=1)
+
+    with pytest.raises(ReviewMirrorError, match=first.plan_id[:32]):
+        _preview(tmp_path, client, next_sessions=1)
+
+
+@pytest.mark.parametrize("count", [0, 101])
+def test_next_sessions_validates_its_bounded_budget(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+    count: int,
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        _preview(tmp_path, client, next_sessions=count)
+    assert client.fetches == []
 
 
 def test_preview_never_persists_or_reports_private_content(
@@ -380,10 +631,16 @@ def test_canary_stably_skips_a_multichunk_session_for_the_next_candidate(
         selected = state.get_sessions(report.plan_id)
     assert [item.session_id for item in selected] == [REVIEW_SESSION_IDS[1]]
     assert report.chunk_count == report.turns == 1
-    assert client.fetches == [REVIEW_SESSION_IDS[0]] * 3 + [REVIEW_SESSION_IDS[1]] * 3
+    assert client.fetches == [REVIEW_SESSION_IDS[0]] * 6 + [REVIEW_SESSION_IDS[1]] * 6
 
 
-@pytest.mark.parametrize("failure", [ReviewManifestError("too large"), ATIFSchemaError("bad ATIF")])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ReviewManifestError("review manifest requires more than the allowed chunks"),
+        ATIFSchemaError("bad ATIF"),
+    ],
+)
 def test_canary_skips_deterministically_unrepresentable_candidate(
     tmp_path: Path,
     session_payload: Callable[..., dict[str, Any]],
@@ -405,6 +662,24 @@ def test_canary_skips_deterministically_unrepresentable_candidate(
     with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
         selected = state.get_sessions(report.plan_id)
     assert [item.session_id for item in selected] == [REVIEW_SESSION_IDS[1]]
+
+
+def test_canary_aborts_on_manifest_contract_failure(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=2)
+
+    def fail_contract(*_: Any, **__: Any) -> Any:
+        raise ReviewManifestError("review manifest content does not match its hash")
+
+    monkeypatch.setattr(review_module, "_prepare_session", fail_contract)
+
+    with pytest.raises(ReviewManifestError, match="content does not match"):
+        _preview(tmp_path, client, canary=True)
+    assert not (tmp_path / "private" / "state.sqlite3").exists()
 
 
 def test_preview_rejects_canonical_destination_before_discovery(
@@ -527,11 +802,12 @@ def test_canary_summary_turn_count_skips_known_large_transcript_before_fetch(
 
     assert report.selected_sessions == 1
     assert REVIEW_SESSION_IDS[0] not in client.fetches
-    assert client.fetches == [REVIEW_SESSION_IDS[1]] * 3
+    assert client.fetches == [REVIEW_SESSION_IDS[1]] * 6
     assert progress == [
         "Canary summary preflight: 1 plausible session(s); "
         "at most 25 transcript(s) will be examined",
         "Canary transcript preflight: 1/1",
+        "Canary transcript result: 1/1 selected",
     ]
     assert REVIEW_SESSION_IDS[0] not in repr(progress)
     assert "private title" not in repr(progress)
@@ -561,7 +837,7 @@ def test_canary_summary_token_budget_skips_expensive_small_turn_transcript(
 
     assert report.selected_sessions == 1
     assert REVIEW_SESSION_IDS[0] not in client.fetches
-    assert client.fetches == [REVIEW_SESSION_IDS[1]] * 3
+    assert client.fetches == [REVIEW_SESSION_IDS[1]] * 6
 
 
 def test_uuidv7_session_survives_redaction_and_seals_end_to_end(
@@ -837,6 +1113,338 @@ def test_entire_cohort_is_preflighted_before_its_first_upload(
     assert saved_plan is not None and saved_plan.status == "blocked"
     assert status.visible == 0
     assert status.conflicted == 1
+
+
+def test_preview_rejects_an_unstable_atif_export_before_sealing_state(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    original = client.transcripts[REVIEW_SESSION_IDS[0]]
+    changed_steps = list(original["trajectory"]["steps"])
+    changed_steps[-1] = {**changed_steps[-1], "message": "A later exporter view."}
+    alternate = atif_wrapper(
+        wrapper_session_id=REVIEW_SESSION_IDS[0],
+        session_id=f"atif-{REVIEW_SESSION_IDS[0]}",
+        steps=changed_steps,
+    )
+    exports = iter((original, alternate))
+    client.get_atif = lambda _session_id: next(exports)  # type: ignore[method-assign]
+    state_path = tmp_path / "private" / "state.sqlite3"
+
+    with pytest.raises(ReviewMirrorError, match="export was not stable"):
+        _preview(tmp_path, client, next_sessions=1)
+
+    assert not state_path.exists()
+    assert FakeSink.instances == []
+
+
+def test_preview_and_apply_map_the_same_authoritative_detail_snapshot(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    summary_get = client.get_session
+
+    def detail_get(session_id: str) -> dict[str, Any]:
+        detail = summary_get(session_id)
+        detail.update(
+            {
+                "title": "authoritative detail title",
+                "git_repo": "wandb/authoritative-detail",
+                "git_branch": "detail-snapshot",
+            }
+        )
+        return detail
+
+    client.get_session = detail_get  # type: ignore[method-assign]
+    preview = _preview(tmp_path, client, next_sessions=1)
+    applied = apply_review(
+        ReviewApplyConfig(
+            plan_id=preview.plan_id[:32],
+            confirm_project=REVIEW_PROJECT,
+            state_path=tmp_path / "private" / "state.sqlite3",
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        sink_factory=FakeSink,
+    )
+
+    assert applied.visible_turns == 1
+    assert FakeSink.instances[-1].submitted == 1
+
+
+def test_zero_write_source_drift_is_explicitly_retired_then_replanned_once(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    original_transcript = client.transcripts[REVIEW_SESSION_IDS[0]]
+    first = _preview(tmp_path, client, next_sessions=1)
+    changed_steps = list(client.transcripts[REVIEW_SESSION_IDS[0]]["trajectory"]["steps"])
+    changed_steps[-1] = {
+        **changed_steps[-1],
+        "message": "Created the requested file and verified it.",
+    }
+    client.transcripts[REVIEW_SESSION_IDS[0]] = atif_wrapper(
+        wrapper_session_id=REVIEW_SESSION_IDS[0],
+        session_id=f"atif-{REVIEW_SESSION_IDS[0]}",
+        steps=changed_steps,
+    )
+
+    with pytest.raises(ReviewMirrorConflictError, match="sealed review turn changed"):
+        apply_review(
+            ReviewApplyConfig(
+                plan_id=first.plan_id[:32],
+                confirm_project=REVIEW_PROJECT,
+                state_path=tmp_path / "private" / "state.sqlite3",
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            sink_factory=FakeSink,
+        )
+    assert FakeSink.instances == []
+
+    recovered = recover_preflight_review(
+        ReviewRecoverPreflightConfig(
+            plan_id=first.plan_id[:32],
+            confirm_project=REVIEW_PROJECT,
+            state_path=tmp_path / "private" / "state.sqlite3",
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        sink_factory=FakeSink,
+    )
+    assert recovered.status == "retired"
+    assert len(FakeSink.instances) == 1
+    assert len(FakeSink.instances[0].logical_expectations) == 2
+    assert FakeSink.instances[0].submitted == 0
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        assert state.is_plan_retired(first.plan_id)
+        assert state.status(REVIEW_PROJECT).conflicted == 0
+        assert state.status(REVIEW_PROJECT).queued_sessions == 0
+
+    # The exporter can later return to byte-identical canonical content. The
+    # immutable retired attempt must still force a fresh deterministic ID.
+    client.transcripts[REVIEW_SESSION_IDS[0]] = original_transcript
+    second = _preview(tmp_path, client, next_sessions=1)
+    assert second.plan_id != first.plan_id
+    with pytest.raises(ReviewMirrorError, match=second.plan_id[:32]):
+        _preview(tmp_path, client, next_sessions=1)
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        assert state.successor_plan_id(first.plan_id) == second.plan_id
+        assert state._db.execute("SELECT COUNT(*) FROM review_plans").fetchone()[0] == 2
+    applied = apply_review(
+        ReviewApplyConfig(
+            plan_id=second.plan_id[:32],
+            confirm_project=REVIEW_PROJECT,
+            state_path=tmp_path / "private" / "state.sqlite3",
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        sink_factory=FakeSink,
+    )
+    assert applied.visible_turns == 1
+    assert len(FakeSink.instances) == 3
+    successor_probe, upload = FakeSink.instances[-2:]
+    assert len(successor_probe.logical_expectations) == 1
+    assert successor_probe.submitted == 0
+    assert upload.submitted == 1
+
+    instances_before_replay = len(FakeSink.instances)
+    replay = apply_review(
+        ReviewApplyConfig(
+            plan_id=second.plan_id[:32],
+            confirm_project=REVIEW_PROJECT,
+            state_path=tmp_path / "private" / "state.sqlite3",
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        sink_factory=FakeSink,
+    )
+    assert replay.visible_turns == 0
+    assert len(FakeSink.instances) == instances_before_replay
+
+
+def test_successor_positive_logical_root_probe_blocks_before_any_publication(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    original_transcript = client.transcripts[REVIEW_SESSION_IDS[0]]
+    first = _preview(tmp_path, client, next_sessions=1)
+    changed_steps = list(original_transcript["trajectory"]["steps"])
+    changed_steps[-1] = {
+        **changed_steps[-1],
+        "message": "A stable alternate exporter view.",
+    }
+    client.transcripts[REVIEW_SESSION_IDS[0]] = atif_wrapper(
+        wrapper_session_id=REVIEW_SESSION_IDS[0],
+        session_id=f"atif-{REVIEW_SESSION_IDS[0]}",
+        steps=changed_steps,
+    )
+
+    with pytest.raises(ReviewMirrorConflictError, match="sealed review turn changed"):
+        apply_review(
+            ReviewApplyConfig(
+                plan_id=first.plan_id[:32],
+                confirm_project=REVIEW_PROJECT,
+                state_path=tmp_path / "private" / "state.sqlite3",
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            sink_factory=FakeSink,
+        )
+    recovered = recover_preflight_review(
+        ReviewRecoverPreflightConfig(
+            plan_id=first.plan_id[:32],
+            confirm_project=REVIEW_PROJECT,
+            state_path=tmp_path / "private" / "state.sqlite3",
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        sink_factory=FakeSink,
+    )
+    assert recovered.status == "retired"
+
+    client.transcripts[REVIEW_SESSION_IDS[0]] = original_transcript
+    successor = _preview(tmp_path, client, next_sessions=1)
+    instances_before_apply = len(FakeSink.instances)
+    FakeSink.logical_matches = 1
+
+    with pytest.raises(ReviewMirrorConflictError, match="already occupies"):
+        apply_review(
+            ReviewApplyConfig(
+                plan_id=successor.plan_id[:32],
+                confirm_project=REVIEW_PROJECT,
+                state_path=tmp_path / "private" / "state.sqlite3",
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            sink_factory=FakeSink,
+        )
+
+    assert len(FakeSink.instances) == instances_before_apply + 1
+    probe = FakeSink.instances[-1]
+    assert probe.events == ["start_read_only", "finish_read_only"]
+    assert len(probe.logical_expectations) == 1
+    assert probe.published == 0
+    assert probe.submitted == 0
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        certificate = state.get_turns(successor.plan_id)[0]
+        assert (
+            state.get_ledger(
+                REVIEW_PROJECT,
+                certificate.session_id,
+                certificate.turn_key,
+            )
+            is None
+        )
+
+
+def test_preflight_recovery_refuses_any_hosted_logical_root(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    preview = _preview(tmp_path, client, next_sessions=1)
+    changed_steps = list(client.transcripts[REVIEW_SESSION_IDS[0]]["trajectory"]["steps"])
+    changed_steps[-1] = {**changed_steps[-1], "message": "A changed stable export."}
+    client.transcripts[REVIEW_SESSION_IDS[0]] = atif_wrapper(
+        wrapper_session_id=REVIEW_SESSION_IDS[0],
+        session_id=f"atif-{REVIEW_SESSION_IDS[0]}",
+        steps=changed_steps,
+    )
+    with pytest.raises(ReviewMirrorConflictError):
+        apply_review(
+            ReviewApplyConfig(
+                plan_id=preview.plan_id[:32],
+                confirm_project=REVIEW_PROJECT,
+                state_path=tmp_path / "private" / "state.sqlite3",
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            sink_factory=FakeSink,
+        )
+
+    FakeSink.logical_matches = 1
+    with pytest.raises(ReviewMirrorConflictError, match="already occupies"):
+        recover_preflight_review(
+            ReviewRecoverPreflightConfig(
+                plan_id=preview.plan_id[:32],
+                confirm_project=REVIEW_PROJECT,
+                state_path=tmp_path / "private" / "state.sqlite3",
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            sink_factory=FakeSink,
+        )
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        assert not state.is_plan_retired(preview.plan_id)
+        assert state.status(REVIEW_PROJECT).conflicted == 1
+
+
+def test_transient_source_drift_revalidates_then_applies_a_successor_attempt(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    stable_transcript = client.transcripts[REVIEW_SESSION_IDS[0]]
+    preview = _preview(tmp_path, client, next_sessions=1)
+    changed_steps = list(stable_transcript["trajectory"]["steps"])
+    changed_steps[-1] = {**changed_steps[-1], "message": "A transient exporter view."}
+    client.transcripts[REVIEW_SESSION_IDS[0]] = atif_wrapper(
+        wrapper_session_id=REVIEW_SESSION_IDS[0],
+        session_id=f"atif-{REVIEW_SESSION_IDS[0]}",
+        steps=changed_steps,
+    )
+    with pytest.raises(ReviewMirrorConflictError):
+        apply_review(
+            ReviewApplyConfig(
+                plan_id=preview.plan_id[:32],
+                confirm_project=REVIEW_PROJECT,
+                state_path=tmp_path / "private" / "state.sqlite3",
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            sink_factory=FakeSink,
+        )
+
+    client.transcripts[REVIEW_SESSION_IDS[0]] = stable_transcript
+    recovered = recover_preflight_review(
+        ReviewRecoverPreflightConfig(
+            plan_id=preview.plan_id[:32],
+            confirm_project=REVIEW_PROJECT,
+            state_path=tmp_path / "private" / "state.sqlite3",
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        sink_factory=FakeSink,
+    )
+    assert recovered.status == "revalidated"
+    assert recovered.remaining_sessions == 0
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        assert state.is_plan_revalidated(preview.plan_id)
+        assert not state.is_plan_retired(preview.plan_id)
+        assert state.status(REVIEW_PROJECT).conflicted == 0
+        assert state.status(REVIEW_PROJECT).plans == 0
+
+    successor = _preview(tmp_path, client, next_sessions=1)
+    assert successor.plan_id != preview.plan_id
+    with pytest.raises(ReviewMirrorError, match=successor.plan_id[:32]):
+        _preview(tmp_path, client, next_sessions=1)
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        assert state.successor_plan_id(preview.plan_id) == successor.plan_id
+        assert state.status(REVIEW_PROJECT).plans == 1
+        assert state._db.execute("SELECT COUNT(*) FROM review_plans").fetchone()[0] == 2
+    applied = apply_review(
+        ReviewApplyConfig(
+            plan_id=successor.plan_id[:32],
+            confirm_project=REVIEW_PROJECT,
+            state_path=tmp_path / "private" / "state.sqlite3",
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        sink_factory=FakeSink,
+    )
+    assert applied.visible_turns == 1
+    successor_probe, upload = FakeSink.instances[-2:]
+    assert len(successor_probe.logical_expectations) == 1
+    assert successor_probe.submitted == 0
+    assert upload.submitted == 1
 
 
 def test_changed_login_must_own_the_complete_sealed_session_universe(

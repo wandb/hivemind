@@ -22,9 +22,11 @@ from .review import (
     ReviewApplyConfig,
     ReviewPreviewConfig,
     ReviewReconcileConfig,
+    ReviewRecoverPreflightConfig,
     apply_review,
     preview_review,
     reconcile_review,
+    recover_preflight_review,
     review_status,
 )
 from .scheduled_sync import (
@@ -208,6 +210,15 @@ def build_parser() -> argparse.ArgumentParser:
     review_preview.add_argument("--session-id", action="append", default=[])
     review_preview.add_argument("--exclude-subagents", action="store_true")
     review_preview.add_argument("--canary", action="store_true")
+    review_preview.add_argument(
+        "--next-sessions",
+        type=int,
+        metavar="N",
+        help=(
+            "seal only the next 1-100 whole session revisions not already completed "
+            "in this private project"
+        ),
+    )
     review_preview.add_argument("--state-path", type=Path, default=review_state_default)
 
     review_apply = review_subparsers.add_parser(
@@ -231,6 +242,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_reconcile.add_argument("--plan", dest="plan_id", required=True)
     review_reconcile.add_argument("--state-path", type=Path, default=review_state_default)
+
+    review_recover = review_subparsers.add_parser(
+        "recover-preflight",
+        help="retire a proven zero-write source-drift plan without uploading",
+    )
+    review_recover.add_argument("--plan", dest="plan_id", required=True)
+    review_recover.add_argument("--confirm-project", required=True)
+    review_recover.add_argument("--state-path", type=Path, default=review_state_default)
 
     auth_parser = subparsers.add_parser(
         "auth",
@@ -412,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
                         project=args.project,
                         state_path=args.state_path,
                         canary=args.canary,
+                        next_sessions=args.next_sessions,
                         agents=tuple(args.agent),
                         repositories=tuple(args.repo),
                         session_ids=tuple(args.session_id),
@@ -447,6 +467,23 @@ def main(argv: list[str] | None = None) -> int:
                 report = reconcile_review(
                     ReviewReconcileConfig(
                         plan_id=args.plan_id,
+                        state_path=args.state_path,
+                    )
+                )
+                rendered = report.render()
+            elif args.review_command == "recover-preflight":
+                if args.confirm_project != REVIEW_PROJECT:
+                    raise ValueError(
+                        f"review recover-preflight requires --confirm-project {REVIEW_PROJECT}"
+                    )
+                print(
+                    f"Weave destination (read-only preflight recovery): {REVIEW_PROJECT}",
+                    flush=True,
+                )
+                report = recover_preflight_review(
+                    ReviewRecoverPreflightConfig(
+                        plan_id=args.plan_id,
+                        confirm_project=args.confirm_project,
                         state_path=args.state_path,
                     )
                 )

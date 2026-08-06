@@ -12,6 +12,7 @@ import pytest
 
 from hivemind_weave.atif import map_atif
 from hivemind_weave.models import ChatMessage, MappedConversation, Session
+from hivemind_weave.pii import redact_upload_data
 from hivemind_weave.review_manifest import (
     MAX_REVIEW_CHUNK_BYTES,
     MAX_REVIEW_CHUNKS,
@@ -21,6 +22,7 @@ from hivemind_weave.review_manifest import (
     REVIEW_PREVIEW_CHARACTERS,
     REVIEW_PREVIEW_SCHEMA,
     ReviewManifestError,
+    _stable_preview_text,
     build_review_manifest,
     reconstruct_review_manifest,
 )
@@ -150,6 +152,17 @@ def test_manifest_preserves_complete_turn_metadata_and_marked_previews(
     assert hashlib.sha256(preview_bytes).hexdigest() == bundle.preview_signature
     assert payload["preview_signature"] == bundle.preview_signature
     assert json.loads(bundle.manifest_json) == payload
+
+
+def test_preview_redaction_expansion_stays_bounded_and_stable() -> None:
+    source = " -> ".join(["Australia"] * 600)
+
+    preview, source_character_count = _stable_preview_text(source)
+
+    assert len(preview) <= REVIEW_PREVIEW_CHARACTERS
+    assert source_character_count < REVIEW_PREVIEW_CHARACTERS
+    assert "Australia" not in preview
+    assert redact_upload_data(preview) == preview
 
 
 def test_chunks_and_index_are_deterministic_content_addressed_and_utf8_safe(

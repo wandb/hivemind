@@ -1,9 +1,11 @@
 """Lossless, deterministic review manifests for already-redacted turns.
 
-This module is deliberately transport-agnostic.  It does not redact, persist,
-or upload content: callers must pass the final already-redacted mapped
-conversation and turn.  The resulting content-addressed bundle can be reviewed
-or handed to a later storage layer without changing its canonical bytes.
+This module is deliberately transport-agnostic. It does not persist or upload
+content: callers must pass the final already-redacted mapped conversation and
+turn. Preview slicing is treated as a new PII-context boundary and stabilized
+with the same local redactor. The resulting content-addressed bundle can be
+reviewed or handed to a later storage layer without changing its canonical
+bytes.
 """
 
 from __future__ import annotations
@@ -383,7 +385,7 @@ def _preview_payload(
     label: str,
     collection_path: str,
 ) -> dict[str, Any]:
-    preview = content[:REVIEW_PREVIEW_CHARACTERS]
+    preview, source_character_count = _stable_preview_text(content)
     return {
         "kind": "preview",
         "label": label,
@@ -395,8 +397,39 @@ def _preview_payload(
         "preview_character_count": len(preview),
         "original_character_count": len(content),
         "limit_characters": REVIEW_PREVIEW_CHARACTERS,
-        "truncated": len(content) > REVIEW_PREVIEW_CHARACTERS,
+        "truncated": len(content) > source_character_count,
     }
+
+
+def _stable_preview_text(content: str) -> tuple[str, int]:
+    """Return a redacted fixed-point preview within the exact UI budget.
+
+    Cutting text changes NER context, and typed replacements can be longer than
+    their source phrase. Start with the largest permitted source prefix, debit
+    any observed expansion, then halve only if that exact adjustment still does
+    not fit. The loop is bounded by the 4,096-character source window.
+    """
+    from .pii import redact_upload_data
+
+    source_character_count = min(len(content), REVIEW_PREVIEW_CHARACTERS)
+    adjusted_for_expansion = False
+    while True:
+        try:
+            preview = redact_upload_data(content[:source_character_count])
+        except Exception as error:
+            raise ReviewManifestError("review preview redaction failed") from error
+        if not isinstance(preview, str):
+            raise ReviewManifestError("review preview redaction changed the text type")
+        if len(preview) <= REVIEW_PREVIEW_CHARACTERS:
+            return preview, source_character_count
+        if source_character_count == 0:  # pragma: no cover - empty text cannot expand.
+            raise ReviewManifestError("review preview cannot fit its character budget")
+        overflow = len(preview) - REVIEW_PREVIEW_CHARACTERS
+        if not adjusted_for_expansion:
+            source_character_count = max(0, source_character_count - max(1, overflow))
+            adjusted_for_expansion = True
+        else:
+            source_character_count //= 2
 
 
 def _split_utf8(content: bytes, *, max_chunk_bytes: int) -> tuple[bytes, ...]:

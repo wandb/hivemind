@@ -7,10 +7,11 @@ deliberately **noncanonical**: it writes only to the fixed private project
 does not replace the atomic historical-turn contract required for the eventual
 canonical v2 import.
 
-> **Rollout status:** no live review upload or real-chat backfill is claimed by
-> this branch. Preview, state, manifest, and transport behavior must pass review
-> before the first synthetic apply. The abandoned partial experiment in
-> `wandb/hivemind-chats` remains read-only and is not repaired or reused.
+> **Rollout status:** live rollout is intentionally incremental. Synthetic
+> large-turn validation and the first bounded real-session cohorts have passed;
+> the remaining 21-day backlog is not claimed complete. The abandoned partial
+> experiment in `wandb/hivemind-chats` remains read-only and is not repaired or
+> reused.
 
 > **State reset required:** experimental SQLite state created by any unreleased
 > pre-0.4 build must be discarded according to the machine's secure local-data
@@ -32,9 +33,10 @@ The project must already exist, be private, and be writable by the authenticated
 principal. The importer checks those properties without creating a project,
 changing its visibility, or writing a probe object. `review preview` requires
 the explicit project spelling, `review apply` requires the same spelling through
-`--confirm-project`, and any other value is rejected. `review status` and
-`review reconcile` derive the destination from the sealed review state and do
-not accept a project override.
+`--confirm-project`, and any other value is rejected. Explicit preflight
+recovery requires the same confirmation. `review status` and `review
+reconcile` derive the destination from the sealed review state and do not
+accept a project override.
 
 The review mirror is not a staging alias for either
 `wandb/hivemind-chats-v2` or `wandb/hivemind-chats`. Nothing automatically
@@ -50,8 +52,8 @@ are used.
 - Python 3.11 or 3.12;
 - the exact lock in this directory;
 - an installed HiveMind CLI authenticated with `hivemind login`; and
-- `WANDB_API_KEY` already present in the process environment for apply or
-  reconcile.
+- `WANDB_API_KEY` already present in the process environment for apply,
+  reconcile, or preflight recovery.
 
 HiveMind credentials remain inside the HiveMind CLI. The importer does not open,
 source, parse, copy, or print any `.env` file. Supply `WANDB_API_KEY` through the
@@ -131,6 +133,13 @@ serialization. An SDK/schema mismatch therefore fails before source discovery,
 plan mutation, or object publication. Preview does not upload manifests,
 objects, roots, or other content.
 
+Because HiveMind exposes neither a transcript snapshot cursor nor a completion
+event, every selected transcript is exported, redacted, serialized, and
+certified twice. The first mapped transcript is released before the second is
+loaded, so this stability check does not double peak transcript memory. A
+summary-stable but export-unstable session is rejected before a plan is sealed
+and can be retried in a later one-session microplan.
+
 ```text
 hivemind-weave review preview
     --since RFC3339
@@ -141,6 +150,7 @@ hivemind-weave review preview
     [--session-id ID ...]
     [--exclude-subagents]
     [--canary]
+    [--next-sessions N]
     [--state-path PATH]
 ```
 
@@ -173,6 +183,33 @@ At most 25 plausible transcripts are examined in one canary invocation; a miss
 fails with the explicit-session suggestion instead of turning a one-chat test
 into an unbounded source scan. It does not loosen limits to manufacture a
 candidate.
+
+`--next-sessions N` is the resumable backlog path. It seals only the next
+1–100 whole session revisions in a deterministic least-known-work order using
+content-free summary counts, with `(last_activity_at, session_id)` as the stable
+tie-breaker, after excluding exact revisions already completed in the
+destination project. This lets early rollout cohorts exercise ordinary chats
+before the largest transcripts without omitting those larger revisions from
+the backlog.
+The report always prints the remaining unplanned backlog count. It cannot be
+combined with `--canary` or `--session-id`, and it refuses to create a later
+microplan while an earlier plan for the same window is unfinished. If a
+previously completed session's activity timestamp advances, that new revision
+re-enters planning so appended turns can be imported and changed historical
+turns can conflict normally.
+
+The live rollout uses `--next-sessions 1`. Larger microplans remain useful for
+offline planning and future cohorts, but explicit zero-write recovery is
+deliberately limited to an isolated one-session plan. This keeps a drifting
+HiveMind export from stranding or obscuring work that already completed in the
+same plan.
+
+An exact session revision that already ended in a terminal zero-write
+retirement or revalidation sorts behind every untouched revision. It is not
+filtered out and remains in the reported backlog; after fresh work is drained,
+it is retried deterministically. A later activity timestamp is a new revision
+and enters the fresh tier immediately. Explicit `--session-id` selection is
+unchanged by this fairness rule.
 
 ### Apply
 
@@ -232,6 +269,32 @@ becomes `visible`; no authoritative match remains `uncertain`; multiple or
 mismatched evidence becomes `conflict`. An unresolved uncertainty or conflict
 keeps the cohort and all later writes blocked.
 
+### Recover a zero-write preflight conflict
+
+This command is only for a sealed plan that detected changed HiveMind source
+during apply **before** any object or root attempt. It is not ordinary root
+reconciliation and cannot clear publication-stage, uncertain, visible, or
+empty-transcript conflicts.
+
+```text
+hivemind-weave review recover-preflight
+    --plan PLAN_ID
+    --confirm-project wandb/hivemind-chats-review
+    [--state-path PATH]
+```
+
+Recovery performs no upload and accepts only a one-session plan. It requires
+revision-one zero-write ledger evidence, two complete read-only hosted queries
+showing no root at every old logical key, and two matching current HiveMind
+export certificates. The old attempt is terminal either way: a source that
+again equals the seal is recorded as revalidated, while different stable
+content is recorded as retired. The next preview derives a fresh deterministic
+successor attempt from the immutable resolution proof. This also handles a
+source that oscillates between two stable exports without reopening or erasing
+an earlier attempt. Successor apply repeats the broad hosted-absence query
+immediately before its first object publication. A positive, malformed, or
+unavailable query leaves work blocked; no root is retried or inferred away.
+
 ## Full manifests and root-only previews
 
 After final redaction, every mapped turn becomes canonical UTF-8 JSON containing
@@ -270,11 +333,17 @@ The rollout is intentionally sequential:
    references, root previews, and reconstruction;
 2. preview and apply one real `--canary` session, inspect it manually, then
    confirm an identical rerun emits nothing;
-3. seal one immutable plan for the trailing 21-day window using an explicit
-   captured cutoff;
-4. apply the plan in whole-session cohorts of 1, then 5, then 20; and
-5. only after each cohort is fully visible and reviewed, apply the remainder in
-   another explicitly bounded cohort.
+3. using the same explicit trailing-21-day bounds, seal a
+   `--next-sessions 1` microplan and apply it completely;
+4. after status and UI inspection, keep repeating one-session preview/apply
+   transactions; and
+5. stop on any unresolved attempt before selecting another session. Never
+   preflight or upload the entire backlog as one failure domain.
+
+Each microplan still performs complete mapping, redaction, exact wire
+serialization, and source-revision certification before its first upload. The
+full eligible-universe digest is sealed into every microplan, while only the
+bounded whole sessions and their turn certificates are retained as membership.
 
 Stop at the first uncertain response, conflict, privacy/permission failure,
 reference mismatch, manifest reconstruction error, count mismatch, or other
@@ -417,13 +486,17 @@ Live tests remain opt-in, must use fresh private state, and must target only the
 fixed review project.
 
 The opt-in live test uses only an in-memory synthetic transcript. It requires a
-new bounded run ID and a caller-created persistent directory with mode `0700`;
-it never reads HiveMind chats:
+globally fresh bounded run ID and a caller-created persistent directory with
+mode `0700`; preserve that directory after any uncertain result. The API key
+must already be present in the process environment; never source an `.env`
+file. The test never reads HiveMind chats, and its payload forces multi-chunk
+publication and reconstruction:
 
 ```bash
+install -d -m 700 /absolute/private/path
 HIVEMIND_WEAVE_LIVE=1 \
 HIVEMIND_WEAVE_LIVE_CONFIRM_PROJECT=wandb/hivemind-chats-review \
 HIVEMIND_WEAVE_LIVE_RUN_ID=synthetic-YYYYMMDD-N \
 HIVEMIND_WEAVE_LIVE_STATE_PATH=/absolute/private/path/state.sqlite3 \
-uv run --offline --locked pytest -q tests/test_live.py
+uv run --offline --locked pytest -q -o addopts= -m live tests/test_live.py
 ```

@@ -27,7 +27,7 @@ _FIXTURE_NOW = datetime(2026, 8, 3, tzinfo=UTC)
 _FIXTURE_SINCE = "2026-08-01T00:00:00Z"
 _FIXTURE_UNTIL = "2026-08-02T00:00:00Z"
 _LARGE_BLOCK_BYTES = 64 * 1024
-_LARGE_BLOCK_COUNT = 32
+_LARGE_BLOCK_COUNT = 144
 
 
 class SyntheticHiveMind:
@@ -42,8 +42,10 @@ class SyntheticHiveMind:
                 version=4,
             )
         )
-        block_line = "const deterministicArchiveValue = 'synthetic';\n"
-        block = (block_line * ((_LARGE_BLOCK_BYTES // len(block_line)) + 1))[:_LARGE_BLOCK_BYTES]
+        # Keep the transport fixture large without turning the smoke into a
+        # pathological NER benchmark over thousands of repeated declarations.
+        # The content is intentionally inert and already contains no PII.
+        block = "x" * _LARGE_BLOCK_BYTES
         large_result = {
             "fixture": "hivemind-review-large-v1",
             "chunks": [block] * _LARGE_BLOCK_COUNT,
@@ -202,7 +204,7 @@ def test_fixed_project_synthetic_review_is_idempotent() -> None:
             until=_FIXTURE_UNTIL,
             project=REVIEW_PROJECT,
             state_path=state_path,
-            canary=True,
+            session_ids=(client.session["id"],),
             now=_FIXTURE_NOW,
         ),
         hivemind=client,  # type: ignore[arg-type]
@@ -210,7 +212,8 @@ def test_fixed_project_synthetic_review_is_idempotent() -> None:
     assert preview.ok, preview.render()
     assert preview.selected_sessions == 1
     assert preview.turns == 1
-    assert preview.manifest_bytes > 1024 * 1024
+    assert preview.manifest_bytes > 8 * 1024 * 1024
+    assert preview.max_chunks_per_turn >= 2
 
     apply_config = ReviewApplyConfig(
         plan_id=preview.plan_id,

@@ -355,6 +355,56 @@ def test_review_apply_requires_fixed_confirmation_and_passes_session_budget(
     )
 
 
+def test_review_preflight_recovery_requires_explicit_project_confirmation(
+    monkeypatch: Any,
+    tmp_path: Path,
+    capsys: Any,
+) -> None:
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        cli,
+        "recover_preflight_review",
+        lambda config: captured.append(config) or _review_report(phase="recover-preflight"),
+    )
+    state_path = tmp_path / "state.sqlite3"
+    assert (
+        cli.main(
+            [
+                "review",
+                "recover-preflight",
+                "--plan",
+                "c" * 12,
+                "--confirm-project",
+                REVIEW_PROJECT,
+                "--state-path",
+                str(state_path),
+            ]
+        )
+        == 0
+    )
+    assert captured[0].plan_id == "c" * 12
+    assert captured[0].confirm_project == REVIEW_PROJECT
+    assert captured[0].state_path == state_path
+    assert capsys.readouterr().out.startswith(
+        f"Weave destination (read-only preflight recovery): {REVIEW_PROJECT}\n"
+    )
+
+    assert (
+        cli.main(
+            [
+                "review",
+                "recover-preflight",
+                "--plan",
+                "c" * 12,
+                "--confirm-project",
+                "wandb/hivemind-chats-v2",
+            ]
+        )
+        == 1
+    )
+    assert len(captured) == 1
+
+
 def test_review_reconcile_and_status_use_the_fixed_project_without_confirmation(
     monkeypatch: Any,
     tmp_path: Path,

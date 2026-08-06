@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from collections.abc import Callable
@@ -158,6 +159,203 @@ def test_reconcile_by_stable_custom_attributes() -> None:
     assert "custom_attrs_string.hivemind.payload_sha256" in serialized
     assert "parent_span_id" in serialized
     assert seen_query[0]["group_by"][1]["key"] == "span_id"
+
+
+def test_logical_root_probe_is_broad_content_free_and_root_only() -> None:
+    trace_id = "1" * 32
+    root_span_id = "2" * 16
+    logical_key = "a" * 64
+    seen: list[tuple[str, dict[str, Any], float]] = []
+
+    def transport(
+        url: str, payload: dict[str, Any], headers: dict[str, str], timeout: float
+    ) -> dict[str, Any]:
+        del headers
+        seen.append((url, payload, timeout))
+        return {
+            "groups": [
+                {
+                    "group_keys": {
+                        "trace_id": trace_id,
+                        "span_id": root_span_id,
+                    },
+                    "span_count": 1,
+                }
+            ],
+            "total_count": 1,
+        }
+
+    verifier = WeaveVerifier(project="e/p", api_key="secret", transport=transport)
+    result = verifier.logical_root_matches(
+        conversation_id="hivemind:s",
+        turn_key=f"review:{logical_key}",
+        request_timeout=7.5,
+    )
+
+    assert result == ReconcileResult(
+        matches=1,
+        trace_ids=[trace_id],
+        root_span_ids=[root_span_id],
+        span_count=1,
+    )
+    assert len(seen) == 1
+    url, payload, timeout = seen[0]
+    assert url.endswith("/agents/spans/query")
+    assert timeout == 7.5
+    assert payload["project_id"] == "e/p"
+    assert payload["include_details"] is False
+    assert payload["limit"] == 2
+    assert payload["offset"] == 0
+    assert payload["group_by"] == [
+        {"source": "field", "key": "trace_id", "alias": "trace_id"},
+        {"source": "field", "key": "span_id", "alias": "span_id"},
+    ]
+    serialized_query = json.dumps(payload["query"], sort_keys=True)
+    assert "conversation_id" in serialized_query
+    assert "invoke_agent" in serialized_query
+    assert "parent_span_id" in serialized_query
+    assert "custom_attrs_string.hivemind.turn_key" in serialized_query
+    assert "custom_attrs_string.hivemind.review.logical_key" in serialized_query
+    assert f"review:{logical_key}" in serialized_query
+    assert "payload_sha256" not in serialized_query
+    assert "manifest" not in serialized_query
+    assert "index" not in serialized_query
+
+
+def test_logical_root_probe_returns_strict_absence_without_secondary_queries() -> None:
+    calls = 0
+
+    def transport(
+        url: str, payload: dict[str, Any], headers: dict[str, str], timeout: float
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del url, payload, headers, timeout
+        calls += 1
+        return {"groups": [], "total_count": 0}
+
+    verifier = WeaveVerifier(project="e/p", api_key="secret", transport=transport)
+    result = verifier.logical_root_matches(
+        conversation_id="hivemind:s",
+        turn_key=f"review:{'a' * 64}",
+    )
+
+    assert result == ReconcileResult(matches=0, trace_ids=[], span_count=0)
+    assert calls == 1
+
+
+def test_logical_root_probe_preserves_conflict_count_beyond_query_limit() -> None:
+    groups = [
+        {
+            "group_keys": {"trace_id": "1" * 32, "span_id": "2" * 16},
+            "span_count": 1,
+        },
+        {
+            "group_keys": {"trace_id": "3" * 32, "span_id": "4" * 16},
+            "span_count": 1,
+        },
+    ]
+
+    verifier = WeaveVerifier(
+        project="e/p",
+        api_key="secret",
+        transport=lambda *_args: {"groups": groups, "total_count": 9},
+    )
+    result = verifier.logical_root_matches(
+        conversation_id="hivemind:s",
+        turn_key=f"review:{'a' * 64}",
+    )
+
+    assert result.matches == 9
+    assert result.span_count == 9
+    assert result.trace_ids == ["1" * 32, "3" * 32]
+    assert result.root_span_ids == ["2" * 16, "4" * 16]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"groups": [], "total_count": True},
+        {"groups": [], "total_count": 1},
+        {"groups": "not-a-list", "total_count": 0},
+        {
+            "groups": [
+                {
+                    "group_keys": {"trace_id": "1" * 32, "span_id": "2" * 16},
+                    "span_count": 2,
+                }
+            ],
+            "total_count": 1,
+        },
+        {
+            "groups": [
+                {
+                    "group_keys": {"trace_id": "A" * 32, "span_id": "2" * 16},
+                    "span_count": 1,
+                }
+            ],
+            "total_count": 1,
+        },
+        {
+            "groups": [
+                {
+                    "group_keys": {"trace_id": "1" * 32, "span_id": "2" * 16},
+                    "span_count": 1,
+                },
+                {
+                    "group_keys": {"trace_id": "1" * 32, "span_id": "3" * 16},
+                    "span_count": 1,
+                },
+            ],
+            "total_count": 2,
+        },
+    ],
+)
+def test_logical_root_probe_rejects_malformed_or_ambiguous_schema(
+    response: dict[str, Any],
+) -> None:
+    verifier = WeaveVerifier(
+        project="e/p",
+        api_key="secret",
+        transport=lambda *_args: response,
+    )
+
+    with pytest.raises(VerificationError, match="logical root query"):
+        verifier.logical_root_matches(
+            conversation_id="hivemind:s",
+            turn_key=f"review:{'a' * 64}",
+        )
+
+
+@pytest.mark.parametrize(
+    ("conversation_id", "turn_key", "request_timeout"),
+    [
+        ("", f"review:{'a' * 64}", 30.0),
+        ("hivemind:s", "a" * 64, 30.0),
+        ("hivemind:s", f"review:{'A' * 64}", 30.0),
+        ("hivemind:s", f"review:{'a' * 63}", 30.0),
+        ("hivemind:s", f"review:{'a' * 64}", 0.0),
+    ],
+)
+def test_logical_root_probe_rejects_malformed_expectations_before_transport(
+    conversation_id: str,
+    turn_key: str,
+    request_timeout: float,
+) -> None:
+    def forbidden_transport(*_args: Any) -> dict[str, Any]:
+        raise AssertionError("transport must not run")
+
+    verifier = WeaveVerifier(
+        project="e/p",
+        api_key="secret",
+        transport=forbidden_transport,
+    )
+
+    with pytest.raises(VerificationError, match="expectation is malformed"):
+        verifier.logical_root_matches(
+            conversation_id=conversation_id,
+            turn_key=turn_key,
+            request_timeout=request_timeout,
+        )
 
 
 @pytest.mark.parametrize(

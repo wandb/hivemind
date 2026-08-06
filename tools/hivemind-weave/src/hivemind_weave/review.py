@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -55,7 +55,7 @@ from .review_state import (
     valid_review_trace_id,
 )
 from .source_identity import is_opaque_source_coordinate
-from .utils import isoformat_z
+from .utils import isoformat_z, sha256_json
 
 REVIEW_PROJECT = "wandb/hivemind-chats-review"
 REVIEW_SETTLE_MINUTES = 60
@@ -84,6 +84,7 @@ class ReviewPreviewConfig:
     state_path: Path
     until: str | None = None
     canary: bool = False
+    next_sessions: int | None = None
     agents: tuple[str, ...] = ()
     repositories: tuple[str, ...] = ()
     session_ids: tuple[str, ...] = ()
@@ -107,6 +108,13 @@ class ReviewReconcileConfig:
 
 
 @dataclass(frozen=True)
+class ReviewRecoverPreflightConfig:
+    plan_id: str
+    confirm_project: str
+    state_path: Path
+
+
+@dataclass(frozen=True)
 class ReviewReport:
     phase: str
     project: str
@@ -122,6 +130,7 @@ class ReviewReport:
     selected_sessions: int = 0
     completed_sessions: int = 0
     remaining_sessions: int = 0
+    remaining_backlog_sessions: int = 0
     turns: int = 0
     visible_turns: int = 0
     skipped_turns: int = 0
@@ -168,6 +177,7 @@ class ReviewReport:
                     f"  eligible sessions:    {self.eligible}",
                     f"  deferred sessions:    {self.deferred}",
                     f"  invalid summaries:    {self.invalid}",
+                    f"  unplanned backlog:    {self.remaining_backlog_sessions}",
                     f"  certified turns:      {self.turns}",
                     f"  manifest bytes:       {self.manifest_bytes}",
                     f"  max manifest bytes:   {self.max_manifest_bytes}",
@@ -265,17 +275,23 @@ def _prepare_session(
     # fixed point, so validate the state-bearing source coordinate itself.
     _validate_session_coordinates(session)
     before = Session.from_api(client.get_session(session.id))
+    _validate_session_coordinates(before)
     if not _same_session_snapshot(session, before):
         raise ReviewMirrorError(
             "a selected session changed before review preparation; no content was uploaded"
         )
     transcript = client.get_atif(session.id)
     after = Session.from_api(client.get_session(session.id))
-    if not _same_session_snapshot(session, after):
+    _validate_session_coordinates(after)
+    if before != after:
         raise ReviewMirrorError(
-            "a selected session changed during review preparation; no content was uploaded"
+            "a selected session detail changed during review preparation; no content was uploaded"
         )
-    conversation = sanitize_mapped_conversation(map_atif(session, transcript))
+    # The paginated summary is a discovery/filter coordinate.  Both preview
+    # and apply map the same authoritative detail snapshot so harmless field
+    # shape differences between list and detail endpoints cannot manufacture
+    # a wire-certificate conflict.
+    conversation = sanitize_mapped_conversation(map_atif(before, transcript))
     # This pure, credential-free pass validates every bundle's active redaction
     # fixed point and compact root structure.  The caller cannot upload turn 0
     # until every turn in this session has passed.
@@ -285,28 +301,78 @@ def _prepare_session(
             build_review_manifest(conversation, turn),
             _runtime=active_runtime,
         )
-    return _PreparedSession(session=session, conversation=conversation)
+    return _PreparedSession(session=before, conversation=conversation)
 
 
-def _canary_qualifies(prepared: _PreparedSession, *, now: datetime) -> bool:
+def _prepare_session_stable(
+    client: HiveMindClient,
+    session: Session,
+    *,
+    project: str,
+    runtime: ReviewRuntime,
+) -> _PreparedSession:
+    """Require two consecutive exports to produce the same redacted wire certificate.
+
+    HiveMind has no immutable transcript snapshot or completion cursor.  A
+    session summary can therefore remain unchanged while its ATIF export is
+    still converging.  Sealing only a repeated certificate keeps that
+    transient source state out of an immutable plan.
+    """
+    first = _prepare_session(client, session, runtime=runtime)
+    first_certificate = _certificate_payload(project=project, prepared=first)
+    # Retain only the content-free certificate between reads so stability
+    # checking never doubles peak memory for a large transcript.
+    del first
+    second = _prepare_session(client, session, runtime=runtime)
+    if first_certificate != _certificate_payload(
+        project=project,
+        prepared=second,
+    ):
+        raise ReviewMirrorError(
+            "a selected session export was not stable across repeated preparation; "
+            "no content was uploaded"
+        )
+    return second
+
+
+def _canary_rejection_reason(prepared: _PreparedSession, *, now: datetime) -> str | None:
     if now - prepared.session.last_activity_at < timedelta(hours=24):
-        return False
-    if prepared.session.parent_session_id or not 1 <= len(prepared.conversation.turns) <= 3:
-        return False
+        return "not_inactive_24h"
+    if prepared.session.parent_session_id:
+        return "child_session"
+    if not 1 <= len(prepared.conversation.turns) <= 3:
+        return "turn_budget"
     for turn in prepared.conversation.turns:
         physical_source_spans = 1 + len(turn.llms) + len(turn.tools) + len(turn.subagents)
         if physical_source_spans > 4:
-            return False
+            return "span_budget"
         warnings = turn.attributes.get("hivemind.mapping_warnings", [])
         if warnings:
-            return False
-        try:
-            bundle = build_review_manifest(prepared.conversation, turn)
-        except ReviewManifestError:
-            return False
+            return "mapping_warning"
+        # Preparation already built and validated this exact manifest. A
+        # second failure is an importer invariant violation, not a reason to
+        # silently advance to another candidate.
+        bundle = build_review_manifest(prepared.conversation, turn)
         if len(bundle.chunks) != 1 or bundle.chunks[0].byte_count > MAX_REVIEW_CHUNK_BYTES:
-            return False
-    return True
+            return "wire_budget"
+    return None
+
+
+def _canary_preparation_rejection(error: Exception) -> str | None:
+    """Classify only candidate-specific failures; propagate importer defects."""
+    if isinstance(error, ATIFSchemaError):
+        return "atif_schema"
+    message = str(error)
+    if isinstance(error, ReviewMirrorError):
+        if "not stable" in message:
+            return "source_unstable"
+        return "source_changed" if "changed" in message else None
+    if isinstance(error, ReviewManifestError):
+        if "requires more than the allowed chunks" in message:
+            return "manifest_size"
+        if "contains a non-JSON value" in message or "contains invalid Unicode" in message:
+            return "source_serialization"
+    return None
 
 
 def _certificate_payload(
@@ -438,7 +504,7 @@ def _saved_certificate_payload(item: ReviewTurnCertificate) -> dict[str, Any]:
 def _assert_sealed_plan_identity(state: ReviewStateStore, plan: ReviewPlan) -> None:
     sessions = state.get_sessions(plan.plan_id)
     turns = state.get_turns(plan.plan_id)
-    expected_plan_id = review_plan_id(
+    base_plan_id = review_plan_id(
         _sealed_plan_hash_payload(
             project=plan.project,
             since_utc=plan.since_utc,
@@ -453,7 +519,10 @@ def _assert_sealed_plan_identity(state: ReviewStateStore, plan: ReviewPlan) -> N
             certificate_payloads=[_saved_certificate_payload(item) for item in turns],
         )
     )
-    if expected_plan_id != plan.plan_id or len(sessions) != plan.selected_count:
+    if (
+        not state.plan_id_in_successor_chain(base_plan_id, plan.plan_id)
+        or len(sessions) != plan.selected_count
+    ):
         raise ReviewMirrorConflictError(
             "sealed review plan identity does not match its immutable evidence"
         )
@@ -513,6 +582,28 @@ def _canary_summary_cannot_fit(raw: dict[str, Any]) -> bool:
     return False
 
 
+def _summary_work_order(raw: dict[str, Any], session: Session) -> tuple[Any, ...]:
+    """Prefer bounded cohorts with the least known mapping/redaction work."""
+    values = [raw.get(key) for key in (*_CANARY_TOKEN_FIELDS, "tool_call_count", "turn_count")]
+    unknown = sum(type(value) is not int or value < 0 for value in values)
+    token_values = values[: len(_CANARY_TOKEN_FIELDS)]
+    token_total = (
+        sum(token_values)
+        if all(type(value) is int and value >= 0 for value in token_values)
+        else 2**63 - 1
+    )
+    tool_count = raw.get("tool_call_count")
+    turn_count = raw.get("turn_count")
+    return (
+        unknown,
+        token_total,
+        tool_count if type(tool_count) is int and tool_count >= 0 else 2**63 - 1,
+        turn_count if type(turn_count) is int and turn_count >= 0 else 2**63 - 1,
+        session.last_activity_at,
+        session.id,
+    )
+
+
 def preview_review(
     config: ReviewPreviewConfig,
     *,
@@ -523,6 +614,13 @@ def preview_review(
     _validate_review_bound(config.since, label="--since")
     if config.until is not None:
         _validate_review_bound(config.until, label="--until")
+    if config.next_sessions is not None:
+        if not 1 <= config.next_sessions <= 100:
+            raise ValueError("--next-sessions must be between 1 and 100")
+        if config.canary:
+            raise ValueError("--next-sessions cannot be combined with --canary")
+        if config.session_ids:
+            raise ValueError("--next-sessions cannot be combined with --session-id")
     # A moving or incompatible Weave install is a run-level failure, not a
     # canary-candidate defect. Prove the exact local SDK contract before HiveMind
     # discovery or any sealed-plan mutation.
@@ -585,7 +683,59 @@ def preview_review(
     selected_sessions: list[tuple[str, datetime, datetime]] = []
     certificate_payloads: list[dict[str, Any]] = []
     stats = _empty_report_stats()
+    planning_sessions = selection.sessions
+    remaining_backlog_sessions = 0
+    if config.next_sessions is not None:
+        completed_snapshots: set[tuple[str, datetime, datetime]] = set()
+        terminal_snapshots: set[tuple[str, datetime, datetime]] = set()
+        state_path = config.state_path.expanduser()
+        if state_path.exists():
+            with ReviewStateStore(state_path) as state:
+                unfinished = state.unfinished_plan_for_window(
+                    project=config.project,
+                    since_utc=window.since_utc,
+                    until_utc=window.until_utc,
+                )
+                if unfinished is not None:
+                    raise ReviewMirrorError(
+                        "an unfinished review plan already exists for this window; "
+                        f"apply or reconcile plan {unfinished.plan_id[:32]}"
+                    )
+                completed_snapshots = state.completed_session_snapshots(config.project)
+                terminal_snapshots = state.terminal_session_snapshots(config.project)
+        pending_sessions = [
+            session
+            for session in selection.sessions
+            if (session.id, session.started_at, session.last_activity_at) not in completed_snapshots
+        ]
+        pending_sessions.sort(
+            key=lambda session: (
+                (
+                    session.id,
+                    session.started_at,
+                    session.last_activity_at,
+                )
+                in terminal_snapshots,
+                _summary_work_order(
+                    summaries_by_id.get(session.id, {}),
+                    session,
+                ),
+            )
+        )
+        planning_sessions = pending_sessions[: config.next_sessions]
+        remaining_backlog_sessions = len(pending_sessions) - len(planning_sessions)
     if config.canary:
+        canary_rejections: dict[str, int] = {}
+
+        def report_canary_result(*, ordinal: int, total: int, result: str) -> None:
+            if result != "selected":
+                canary_rejections[result] = canary_rejections.get(result, 0) + 1
+            if config.progress is not None:
+                config.progress(
+                    f"Canary transcript result: {ordinal}/{total} "
+                    + ("selected" if result == "selected" else f"rejected ({result})")
+                )
+
         plausible_count = sum(
             1
             for session in selection.sessions
@@ -620,12 +770,29 @@ def preview_review(
                     f"{examined_transcripts}/{min(plausible_count, _CANARY_TRANSCRIPT_BUDGET)}"
                 )
             try:
-                prepared = _prepare_session(client, session, runtime=runtime)
-            except (ReviewMirrorError, ATIFSchemaError, ReviewManifestError):
-                # A deterministic mapping/size failure disqualifies this
-                # candidate; canary limits are never loosened automatically.
+                prepared = _prepare_session_stable(
+                    client,
+                    session,
+                    project=config.project,
+                    runtime=runtime,
+                )
+            except (ReviewMirrorError, ATIFSchemaError, ReviewManifestError) as error:
+                reason = _canary_preparation_rejection(error)
+                if reason is None:
+                    raise
+                report_canary_result(
+                    ordinal=examined_transcripts,
+                    total=min(plausible_count, _CANARY_TRANSCRIPT_BUDGET),
+                    result=reason,
+                )
                 continue
-            if _canary_qualifies(prepared, now=captured_now):
+            rejection_reason = _canary_rejection_reason(prepared, now=captured_now)
+            if rejection_reason is None:
+                report_canary_result(
+                    ordinal=examined_transcripts,
+                    total=min(plausible_count, _CANARY_TRANSCRIPT_BUDGET),
+                    result="selected",
+                )
                 selected_sessions.append(
                     (
                         prepared.session.id,
@@ -642,15 +809,36 @@ def preview_review(
                 )
                 del prepared
                 break
+            report_canary_result(
+                ordinal=examined_transcripts,
+                total=min(plausible_count, _CANARY_TRANSCRIPT_BUDGET),
+                result=rejection_reason,
+            )
             del prepared
         if not selected_sessions:
+            if config.progress is not None and canary_rejections:
+                config.progress(
+                    "Canary rejection summary: "
+                    + ", ".join(
+                        f"{reason}={count}" for reason, count in sorted(canary_rejections.items())
+                    )
+                )
             raise ReviewMirrorError(
                 "no session qualified within the bounded deterministic review canary; "
                 "use an exact --session-id after inspecting the source"
             )
     else:
-        for session in selection.sessions:
-            prepared = _prepare_session(client, session, runtime=runtime)
+        for ordinal, session in enumerate(planning_sessions, start=1):
+            if config.next_sessions is not None and config.progress is not None:
+                config.progress(
+                    f"Microplan transcript preflight: {ordinal}/{len(planning_sessions)}"
+                )
+            prepared = _prepare_session_stable(
+                client,
+                session,
+                project=config.project,
+                runtime=runtime,
+            )
             selected_sessions.append(
                 (
                     prepared.session.id,
@@ -665,11 +853,15 @@ def preview_review(
                     stats=stats,
                 )
             )
+            if config.next_sessions is not None and config.progress is not None:
+                config.progress(
+                    f"Microplan transcript result: {ordinal}/{len(planning_sessions)} certified"
+                )
             # A 21-day backlog may contain very large transcripts.  Only the
             # content-free certificate survives into the next iteration.
             del prepared
 
-    plan_id = review_plan_id(
+    base_plan_id = review_plan_id(
         _plan_hash_payload(
             config=config,
             window=window,
@@ -679,26 +871,27 @@ def preview_review(
             certificate_payloads=certificate_payloads,
         )
     )
-    certificates = _certificates(plan_id, certificate_payloads)
-    initial_status = "completed" if not selected_sessions else "planned"
-    expected_plan = ReviewPlan(
-        plan_id=plan_id,
-        project=config.project,
-        source_scope_sha256=REVIEW_SOURCE_SCOPE_SHA256,
-        since_utc=window.since_utc,
-        until_utc=window.until_utc,
-        timezone_name=window.timezone_name,
-        selector="canary" if config.canary else "backlog",
-        universe_sha256=selection.universe_sha256,
-        status=initial_status,
-        discovered_count=selection.discovered,
-        eligible_count=selection.eligible,
-        deferred_count=selection.deferred,
-        invalid_count=selection.invalid,
-        selected_count=len(selected_sessions),
-        last_error_code="",
-    )
     with ReviewStateStore(config.state_path) as state:
+        plan_id = state.successor_plan_id(base_plan_id)
+        certificates = _certificates(plan_id, certificate_payloads)
+        initial_status = "completed" if not selected_sessions else "planned"
+        expected_plan = ReviewPlan(
+            plan_id=plan_id,
+            project=config.project,
+            source_scope_sha256=REVIEW_SOURCE_SCOPE_SHA256,
+            since_utc=window.since_utc,
+            until_utc=window.until_utc,
+            timezone_name=window.timezone_name,
+            selector="canary" if config.canary else "backlog",
+            universe_sha256=selection.universe_sha256,
+            status=initial_status,
+            discovered_count=selection.discovered,
+            eligible_count=selection.eligible,
+            deferred_count=selection.deferred,
+            invalid_count=selection.invalid,
+            selected_count=len(selected_sessions),
+            last_error_code="",
+        )
         plan = state.create_plan(
             plan=expected_plan,
             sessions=selected_sessions,
@@ -721,6 +914,7 @@ def preview_review(
         selected_sessions=plan.selected_count,
         completed_sessions=completed,
         remaining_sessions=remaining,
+        remaining_backlog_sessions=remaining_backlog_sessions,
         **stats,
     )
 
@@ -1057,6 +1251,84 @@ def _new_sink(factory: Callable[[], Any] | None) -> Any:
     return HostedReviewSink()
 
 
+def _require_logical_root_absence(
+    sink: Any,
+    *,
+    conversation_id: str,
+    logical_key: str,
+) -> None:
+    """Accept only a complete, internally consistent zero-match root query."""
+    try:
+        result = sink.find_logical_roots(
+            conversation_id=conversation_id,
+            logical_key=logical_key,
+        )
+    except Exception as error:
+        raise ReviewMirrorError(
+            "hosted logical-root absence could not be established; no content was uploaded"
+        ) from error
+    matches = getattr(result, "matches", None)
+    span_count = getattr(result, "span_count", None)
+    raw_trace_ids = getattr(result, "trace_ids", ())
+    raw_root_span_ids = getattr(result, "root_span_ids", ())
+    if (
+        type(matches) is not int
+        or matches < 0
+        or type(span_count) is not int
+        or span_count < 0
+        or not isinstance(raw_trace_ids, Sequence)
+        or isinstance(raw_trace_ids, (str, bytes, bytearray))
+        or not isinstance(raw_root_span_ids, Sequence)
+        or isinstance(raw_root_span_ids, (str, bytes, bytearray))
+    ):
+        raise ReviewMirrorError(
+            "hosted logical-root absence returned malformed evidence; no content was uploaded"
+        )
+    trace_ids = tuple(raw_trace_ids)
+    root_span_ids = tuple(raw_root_span_ids)
+    if matches != 0 or span_count != 0 or trace_ids or root_span_ids:
+        raise ReviewMirrorConflictError(
+            "a hosted root already occupies the resolved logical key; no content was uploaded"
+        )
+
+
+def _recheck_resolved_logical_absence(
+    *,
+    state: ReviewStateStore,
+    project: str,
+    certificate: ReviewTurnCertificate,
+    sink_factory: Callable[[], Any] | None,
+) -> None:
+    """Re-prove a terminal attempt's key is absent before its successor write."""
+    resolved = state.retired_preflight_evidence(
+        project=project,
+        session_id=certificate.session_id,
+        turn_key=certificate.turn_key,
+    )
+    if not resolved:
+        return
+    logical_keys = {item.logical_key for item in resolved}
+    if logical_keys != {certificate.logical_key}:
+        raise ReviewMirrorConflictError(
+            "resolved review evidence does not match the successor logical key"
+        )
+    probe = _new_sink(sink_factory)
+    try:
+        probe.start_read_only(project)
+        _require_logical_root_absence(
+            probe,
+            conversation_id=f"hivemind:{certificate.session_id}",
+            logical_key=certificate.logical_key,
+        )
+    finally:
+        try:
+            probe.finish()
+        except Exception as error:
+            raise ReviewMirrorError(
+                "hosted logical-root absence probe did not close cleanly; no content was uploaded"
+            ) from error
+
+
 def _apply_prepared_turn(
     *,
     state: ReviewStateStore,
@@ -1071,6 +1343,13 @@ def _apply_prepared_turn(
     bundle = build_review_manifest(session.prepared.conversation, turn)
     prepared_turn = _PreparedTurn(turn=turn, bundle=bundle)
     certificate = session.certificates[ordinal]
+    if state.get_ledger(project, certificate.session_id, certificate.turn_key) is None:
+        _recheck_resolved_logical_absence(
+            state=state,
+            project=project,
+            certificate=certificate,
+            sink_factory=sink_factory,
+        )
     ledger, disposition = state.ensure_ledger(project, certificate)
     if disposition == "conflict" or ledger.status == "conflict":
         raise ReviewMirrorConflictError(
@@ -1197,6 +1476,7 @@ def apply_review(
             raise ReviewMirrorError("review plan was not found in private state")
         if plan.project != config.confirm_project:
             raise ReviewMirrorError("--confirm-project does not match the sealed review plan")
+        state.assert_project_writes_unblocked(plan.project)
         _assert_sealed_plan_identity(state, plan)
         plan_sessions = state.get_sessions(plan.plan_id)
         cohort = state.get_or_create_cohort(plan.plan_id, config.max_sessions)
@@ -1395,6 +1675,207 @@ def _ledger_matches_certificate(
             )
         )
     )
+
+
+def recover_preflight_review(
+    config: ReviewRecoverPreflightConfig,
+    *,
+    hivemind: HiveMindClient | None = None,
+    sink_factory: Callable[[], Any] | None = None,
+) -> ReviewReport:
+    """Resolve one proven zero-write attempt after stable source and remote absence.
+
+    This is deliberately separate from ordinary root reconciliation.  It can
+    change planner eligibility, so it requires an explicit project
+    confirmation and never submits a root or publishes an object.
+    """
+    _validate_review_project(config.confirm_project)
+    if not _PLAN_REFERENCE.fullmatch(config.plan_id):
+        raise ValueError("review plan reference must be 32 to 64 lowercase hex characters")
+    runtime = preflight_review_runtime()
+    client = hivemind or HiveMindClient()
+    with ReviewStateStore(config.state_path) as state:
+        plan = state.resolve_plan(config.plan_id)
+        if plan is None:
+            raise ReviewMirrorError("review plan was not found in private state")
+        if plan.project != config.confirm_project:
+            raise ReviewMirrorError("--confirm-project does not match the sealed review plan")
+        _assert_sealed_plan_identity(state, plan)
+        if state.is_plan_retired(plan.plan_id):
+            return ReviewReport(
+                phase="recover-preflight",
+                project=plan.project,
+                plan_id=plan.plan_id,
+                status="retired",
+                since_utc=plan.since_utc,
+                until_utc=plan.until_utc,
+                selector=plan.selector,
+                selected_sessions=plan.selected_count,
+            )
+        if state.is_plan_revalidated(plan.plan_id):
+            return ReviewReport(
+                phase="recover-preflight",
+                project=plan.project,
+                plan_id=plan.plan_id,
+                status="revalidated",
+                since_utc=plan.since_utc,
+                until_utc=plan.until_utc,
+                selector=plan.selector,
+                selected_sessions=plan.selected_count,
+                completed_sessions=0,
+                remaining_sessions=0,
+            )
+        if plan.selected_count != 1:
+            raise ReviewMirrorError(
+                "preflight recovery requires an isolated one-session review plan"
+            )
+
+        conflicts = state.preflight_conflicts(plan.plan_id)
+        if not conflicts:
+            raise ReviewMirrorError(
+                "plan has no zero-write preflight conflict eligible for explicit recovery"
+            )
+        conflict_session_ids = {item.session_id for item in conflicts}
+        planned_sessions = {
+            item.session_id: item
+            for item in state.get_sessions(plan.plan_id)
+            if item.session_id in conflict_session_ids
+        }
+        expected_turns = state.get_turns(
+            plan.plan_id,
+            session_ids=conflict_session_ids,
+        )
+        if set(planned_sessions) != conflict_session_ids or {
+            (item.session_id, item.turn_key) for item in conflicts
+        } != {(item.session_id, item.turn_key) for item in expected_turns}:
+            raise ReviewMirrorConflictError(
+                "preflight conflict evidence does not cover complete sealed sessions"
+            )
+
+        client.preflight()
+        probe = _new_sink(sink_factory)
+        current_certificate_digests: list[str] = []
+        current_matches_sealed = True
+        try:
+            probe.start_read_only(plan.project)
+            # The two absence sweeps bracket repeated source preparation.  A
+            # positive, partial, or unavailable poll leaves every local row
+            # untouched and the plan blocked.
+            for ledger in conflicts:
+                _require_logical_root_absence(
+                    probe,
+                    conversation_id=f"hivemind:{ledger.session_id}",
+                    logical_key=ledger.logical_key,
+                )
+
+            for session_id in sorted(conflict_session_ids):
+                planned = planned_sessions[session_id]
+                try:
+                    observed = Session.from_api(client.get_session(session_id))
+                    _validate_session_coordinates(observed)
+                except Exception as error:
+                    raise ReviewMirrorError(
+                        "the conflicted HiveMind session could not be read safely"
+                    ) from error
+                if (
+                    observed.started_at != planned.started_at
+                    or observed.last_activity_at != planned.last_activity_at
+                    or not observed.last_activity_known
+                ):
+                    raise ReviewMirrorConflictError(
+                        "the conflicted HiveMind session summary changed; plan remains blocked"
+                    )
+                current = _prepare_session_stable(
+                    client,
+                    observed,
+                    project=plan.project,
+                    runtime=runtime,
+                )
+                current_payload = _certificate_payload(project=plan.project, prepared=current)
+                actual = _certificates(plan.plan_id, current_payload)
+                expected = [item for item in expected_turns if item.session_id == session_id]
+                if [_certificate_identity(item) for item in actual] != [
+                    _certificate_identity(item) for item in expected
+                ]:
+                    current_matches_sealed = False
+                current_certificate_digests.append(
+                    sha256_json(
+                        [
+                            {
+                                "ordinal": item.ordinal,
+                                "source_payload_sha256": item.source_payload_sha256,
+                                "manifest_sha256": item.manifest_sha256,
+                                "index_sha256": item.index_sha256,
+                                "logical_key": item.logical_key,
+                                "preview_signature": item.preview_signature,
+                            }
+                            for item in actual
+                        ]
+                    )
+                )
+                del current
+
+            for ledger in conflicts:
+                _require_logical_root_absence(
+                    probe,
+                    conversation_id=f"hivemind:{ledger.session_id}",
+                    logical_key=ledger.logical_key,
+                )
+        finally:
+            try:
+                probe.finish()
+            except Exception as error:
+                raise ReviewMirrorError(
+                    "preflight recovery query transport did not close cleanly; plan remains blocked"
+                ) from error
+
+        proof_sha256 = sha256_json(
+            {
+                "schema": "hivemind-review-preflight-resolution-v1",
+                "outcome": "revalidated" if current_matches_sealed else "retired",
+                "plan_id": plan.plan_id,
+                "project": plan.project,
+                "remote_absence_sweeps": 2,
+                "old_turns": [
+                    {
+                        "logical_key": item.logical_key,
+                        "source_payload_sha256": item.source_payload_sha256,
+                        "manifest_sha256": item.manifest_sha256,
+                        "preview_signature": item.preview_signature,
+                    }
+                    for item in conflicts
+                ],
+                "current_session_certificates": current_certificate_digests,
+            }
+        )
+        if current_matches_sealed:
+            state.revalidate_preflight_plan(
+                plan.plan_id,
+                proof_sha256=proof_sha256,
+                importer_version=__version__,
+            )
+            status = "revalidated"
+            completed, remaining = 0, 0
+        else:
+            state.retire_preflight_plan(
+                plan.plan_id,
+                proof_sha256=proof_sha256,
+                importer_version=__version__,
+            )
+            status = "retired"
+            completed, remaining = 0, 0
+        return ReviewReport(
+            phase="recover-preflight",
+            project=plan.project,
+            plan_id=plan.plan_id,
+            status=status,
+            since_utc=plan.since_utc,
+            until_utc=plan.until_utc,
+            selector=plan.selector,
+            selected_sessions=plan.selected_count,
+            completed_sessions=completed,
+            remaining_sessions=remaining,
+        )
 
 
 def reconcile_review(

@@ -901,6 +901,124 @@ class WeaveVerifier:
             root_span_ids=sorted(str(item) for item in root_span_ids),
         )
 
+    def logical_root_matches(
+        self,
+        *,
+        conversation_id: str,
+        turn_key: str,
+        request_timeout: float = 30.0,
+    ) -> ReconcileResult:
+        """Find roots for one logical review key without inspecting content.
+
+        This deliberately omits payload hashes and review-object references. It
+        is the broad, read-only probe used before retiring a plan that failed
+        local preflight: *any* root carrying either currently emitted logical
+        key attribute is evidence that remote absence has not been proved.
+
+        The query is limited to trace-root ``invoke_agent`` spans. A limit of
+        two is sufficient because callers distinguish only zero, exactly one,
+        and conflict; the response is nevertheless validated against the
+        service's complete ``total_count`` before it is trusted.
+        """
+        logical_prefix = "review:"
+        if (
+            not isinstance(conversation_id, str)
+            or not conversation_id
+            or not isinstance(turn_key, str)
+            or not turn_key.startswith(logical_prefix)
+            or request_timeout <= 0
+        ):
+            raise VerificationError("logical root query expectation is malformed")
+        logical_key = turn_key.removeprefix(logical_prefix)
+        if len(logical_key) != 64 or any(
+            character not in "0123456789abcdef" for character in logical_key
+        ):
+            raise VerificationError("logical root query expectation is malformed")
+
+        payload = self._post(
+            "/agents/spans/query",
+            {
+                "project_id": self.project,
+                "query": {
+                    "$expr": {
+                        "$and": [
+                            _equals("conversation_id", conversation_id),
+                            _equals("operation_name", "invoke_agent"),
+                            _equals("parent_span_id", ""),
+                            {
+                                "$or": [
+                                    _equals(
+                                        "custom_attrs_string.hivemind.turn_key",
+                                        turn_key,
+                                    ),
+                                    _equals(
+                                        "custom_attrs_string.hivemind.review.logical_key",
+                                        logical_key,
+                                    ),
+                                ]
+                            },
+                        ]
+                    }
+                },
+                "group_by": [
+                    {"source": "field", "key": "trace_id", "alias": "trace_id"},
+                    {"source": "field", "key": "span_id", "alias": "span_id"},
+                ],
+                "include_details": False,
+                "limit": 2,
+                "offset": 0,
+            },
+            timeout=request_timeout,
+        )
+        groups = payload.get("groups")
+        total_count = payload.get("total_count")
+        if (
+            not isinstance(groups, list)
+            or isinstance(total_count, bool)
+            or not isinstance(total_count, int)
+            or total_count < 0
+            or len(groups) != min(total_count, 2)
+        ):
+            raise VerificationError("Weave logical root query returned an invalid response")
+
+        trace_ids: list[str] = []
+        root_span_ids: list[str] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(
+                group_keys := group.get("group_keys"), dict
+            ):
+                raise VerificationError("Weave logical root query returned an invalid group")
+            trace_id = group_keys.get("trace_id")
+            span_id = group_keys.get("span_id")
+            span_count = group.get("span_count")
+            if (
+                not isinstance(trace_id, str)
+                or len(trace_id) != 32
+                or trace_id == "0" * 32
+                or any(character not in "0123456789abcdef" for character in trace_id)
+                or not isinstance(span_id, str)
+                or len(span_id) != 16
+                or span_id == "0" * 16
+                or any(character not in "0123456789abcdef" for character in span_id)
+                or span_count != 1
+                or isinstance(span_count, bool)
+                or (trace_id, span_id) in seen_pairs
+                or trace_id in trace_ids
+                or span_id in root_span_ids
+            ):
+                raise VerificationError("Weave logical root query returned an invalid group")
+            seen_pairs.add((trace_id, span_id))
+            trace_ids.append(trace_id)
+            root_span_ids.append(span_id)
+
+        return ReconcileResult(
+            matches=total_count,
+            trace_ids=sorted(trace_ids),
+            root_span_ids=sorted(root_span_ids),
+            span_count=total_count,
+        )
+
     def attribute_trace_matches_many(
         self,
         *,

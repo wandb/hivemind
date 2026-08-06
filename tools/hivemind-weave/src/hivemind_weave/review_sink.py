@@ -317,6 +317,14 @@ class HostedProjectGuard:
 class RootVerifier(Protocol):
     """The query-only subset of :class:`WeaveVerifier` used by this sink."""
 
+    def logical_root_matches(
+        self,
+        *,
+        conversation_id: str,
+        turn_key: str,
+        request_timeout: float = 30.0,
+    ) -> Any: ...
+
     def reconcile(
         self,
         *,
@@ -2602,6 +2610,48 @@ class HostedReviewSink:
         except Exception as error:
             raise ReviewRootUncertainError(
                 "hosted review root query could not establish exact remote evidence"
+            ) from error
+        return _validated_root_query_result(result)
+
+    def find_logical_roots(
+        self,
+        *,
+        conversation_id: str,
+        logical_key: str,
+        timeout_seconds: float = 30.0,
+    ) -> RootQueryResult:
+        """Broadly probe for an existing root using only its logical identity.
+
+        This read-only query is intentionally independent of object refs,
+        payload hashes, previews, and timestamps. It is suitable only for
+        proving that a preflight-conflicted logical key has no hosted root; a
+        positive or malformed response blocks recovery and cannot submit one.
+        """
+        if not self._query_authorized:
+            raise ReviewRootUncertainError(
+                "hosted review query was not authorized for the private destination"
+            )
+        if self.root_verifier is None:
+            raise ReviewRootUncertainError(
+                "a logical-key root verifier is required for hosted review"
+            )
+        if timeout_seconds <= 0:
+            raise ValueError("root query timeout must be positive")
+        if (
+            _review_conversation_session_id(conversation_id) is None
+            or not isinstance(logical_key, str)
+            or not _SHA256.fullmatch(logical_key)
+        ):
+            raise ReviewRootConflictError("hosted review logical root expectation is malformed")
+        try:
+            result = self.root_verifier.logical_root_matches(
+                conversation_id=conversation_id,
+                turn_key=f"review:{logical_key}",
+                request_timeout=timeout_seconds,
+            )
+        except Exception as error:
+            raise ReviewRootUncertainError(
+                "hosted review logical root absence could not be established"
             ) from error
         return _validated_root_query_result(result)
 

@@ -7,6 +7,7 @@ import json
 import re
 import threading
 from collections import OrderedDict
+from copy import copy
 from dataclasses import replace
 from functools import lru_cache
 from typing import Any
@@ -22,9 +23,15 @@ from .utils import canonical_json, sha256_json
 
 _PII_ENGINE_REDACTOR: Any | None = None
 _REDACTION_CACHE: OrderedDict[tuple[int, str], str] = OrderedDict()
-_REDACTION_CACHE_CHARS = 0
-_MAX_REDACTION_CACHE_ENTRY_CHARS = 256 * 1024
-_MAX_REDACTION_CACHE_CHARS = 32 * 1024 * 1024
+_REDACTION_CACHE_BYTES = 0
+# ATIF-derived LLM contexts repeat the same already-redacted message and tool
+# fields across later inferred calls. Retaining bounded redacted values (never
+# raw cache keys) prevents Presidio work from growing quadratically on large
+# sessions while capping UTF-8 redacted-value storage at 128 MiB. Values are
+# transient process memory and are cleared whenever the PII engine is reset.
+_MAX_REDACTION_CACHE_ENTRY_BYTES = 8 * 1024 * 1024
+_MAX_REDACTION_CACHE_BYTES = 128 * 1024 * 1024
+_MAX_REDACTION_FIXED_POINT_PASSES = 8
 _CORRELATION_ATTRIBUTES = {
     "hivemind.session_id",
     "hivemind.parent_session_id",
@@ -34,6 +41,28 @@ _CORRELATION_ATTRIBUTES = {
     "hivemind.atif_schema_version",
     "hivemind.importer_version",
 }
+
+# The mapper preserves these ATIF structures as canonical JSON strings so they
+# remain searchable attributes without losing source fields. Parse them before
+# applying any text regexes: credential syntax embedded in a JSON string (for
+# example, a quoted ``OPENAI_API_KEY=...`` snippet) can legitimately span JSON
+# escape characters and make a text-level replacement syntactically invalid.
+# Structured redaction followed by canonical serialization is both lossless and
+# substantially cheaper than asking Presidio to analyze one large JSON blob.
+_CANONICAL_JSON_ATTRIBUTE_KEYS = frozenset(
+    {
+        "hivemind.atif_agent_extra",
+        "hivemind.atif_final_metrics",
+        "hivemind.atif_tool_definitions",
+        "hivemind.atif_trajectory_extra",
+        "hivemind.atif_trajectory_metadata",
+        "hivemind.atif_wrapper_extra",
+        "hivemind.atif_wrapper_metadata",
+        "hivemind.preserved_step_data",
+        "hivemind.trailing_copied_step_data",
+        "hivemind.unreferenced_subagent_trajectories",
+    }
+)
 
 _HASH_CORRELATORS = {"conversation_id"}
 _SOURCE_COORDINATE_KEYS = {
@@ -156,11 +185,18 @@ _NAME_BASED_UUID = re.compile(
     re.IGNORECASE,
 )
 _ATIF_VERSION = re.compile(r"^ATIF-v\d+\.\d+$", re.IGNORECASE)
-_REDACTION_PLACEHOLDER = re.compile(
-    r"^(?:\[REDACTED(?:_PII_KEY_[0-9]{4,10}|_SOURCE_COORDINATE)?\]|"
-    r"<[A-Z][A-Z0-9_]{1,63}>)$"
-)
+_REDACTION_MARKER_PATTERN = r"(?:\[REDACTED(?:_[A-Z0-9]{1,32})*\]|<[A-Z][A-Z0-9_]{1,63}>)"
+_REDACTION_PLACEHOLDER = re.compile(rf"^{_REDACTION_MARKER_PATTERN}$")
+_EMBEDDED_REDACTION_PLACEHOLDER = re.compile(_REDACTION_MARKER_PATTERN)
+_INTERNAL_MARKER_NAMESPACE = 0xE010
+_INTERNAL_CODE_NAMESPACE = 0xE011
+_INTERNAL_PROTECTION_TOKEN = re.compile("\ue000[\ue010\ue011][\ue100-\ue1ff]{8}\ue001")
 _PERSON_PLACEHOLDER = re.compile(r"<PERSON>", re.IGNORECASE)
+_CONTEXTUAL_ENTITY_TYPES = frozenset({"LOCATION", "NRP", "ORGANIZATION", "PERSON"})
+_REPEATABLE_CONTEXT_ENTITY = re.compile(
+    r"[^\W\d_]+(?:[ '\N{RIGHT SINGLE QUOTATION MARK}-][^\W\d_]+)*",
+    re.UNICODE,
+)
 
 
 class _FullTextAnalyzer:
@@ -187,6 +223,72 @@ class _FullTextAnalyzer:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._analyzer, name)
+
+
+def _internal_protection_token(namespace: int, number: int) -> str:
+    """Return a fixed-width, linguistically inert private-use token."""
+    ordinal = number.to_bytes(8, byteorder="big", signed=False)
+    return "\ue000" + chr(namespace) + "".join(chr(0xE100 + byte) for byte in ordinal) + "\ue001"
+
+
+def _expand_contextual_entity_repetitions(value: str, results: list[Any]) -> list[Any]:
+    """Apply a recognized name/location phrase to its exact repeated tokens.
+
+    Statistical NER can recognize only the boundary instances of a long list
+    of the same entity. Re-running NER after anonymization then makes the typed
+    marker itself a context feature, producing slow one-at-a-time closure. For
+    contextual alphabetic entities only, copy an already-supported result to
+    every exact whole-token occurrence before the anonymizer runs. Punctuation-
+    bearing code and filenames are deliberately excluded; generated markers
+    are separately shielded from feedback below.
+    """
+    expanded = list(results)
+    seen = {(int(result.start), int(result.end), str(result.entity_type)) for result in results}
+    templates: dict[tuple[str, str], Any] = {}
+    for result in results:
+        start = int(result.start)
+        end = int(result.end)
+        entity_type = str(result.entity_type)
+        if not (0 <= start < end <= len(value)) or entity_type not in _CONTEXTUAL_ENTITY_TYPES:
+            continue
+        phrase = value[start:end]
+        if len(phrase) < 2 or _REPEATABLE_CONTEXT_ENTITY.fullmatch(phrase) is None:
+            continue
+        templates.setdefault((entity_type, phrase), result)
+
+    for (entity_type, phrase), template in templates.items():
+        offset = 0
+        while True:
+            start = value.find(phrase, offset)
+            if start < 0:
+                break
+            end = start + len(phrase)
+            offset = end
+            left_is_word = start > 0 and (value[start - 1].isalnum() or value[start - 1] == "_")
+            right_is_word = end < len(value) and (value[end].isalnum() or value[end] == "_")
+            identity = (start, end, entity_type)
+            if not left_is_word and not right_is_word and identity not in seen:
+                repeated = copy(template)
+                repeated.start = start
+                repeated.end = end
+                expanded.append(repeated)
+                seen.add(identity)
+    return expanded
+
+
+def _exclude_internal_protection_tokens(value: str, results: list[Any]) -> list[Any]:
+    """Discard analyzer spans touching temporary private-use shields."""
+    protected_spans = [match.span() for match in _INTERNAL_PROTECTION_TOKEN.finditer(value)]
+    if not protected_spans:
+        return results
+    return [
+        result
+        for result in results
+        if not any(
+            int(result.start) < protected_end and protected_start < int(result.end)
+            for protected_start, protected_end in protected_spans
+        )
+    ]
 
 
 def _looks_like_technical_identifier(value: str) -> bool:
@@ -395,17 +497,59 @@ def _protect_declared_code_identifiers(
     protected = value
     placeholder_offset = 0
     while any(
-        f"hm_code_identifier_{placeholder_offset + number:06d}_zx" in value
+        _internal_protection_token(
+            _INTERNAL_CODE_NAMESPACE,
+            placeholder_offset + number,
+        )
+        in value
         for number in range(len(selected))
     ):
         placeholder_offset += max(1, len(selected))
     for number, (start, end) in enumerate(sorted(selected, reverse=True)):
-        # Keep this lowercase and underscore-delimited: title-cased opaque
-        # tokens are themselves classified as names by small English NER.
-        token = f"hm_code_identifier_{placeholder_offset + number:06d}_zx"
+        token = _internal_protection_token(
+            _INTERNAL_CODE_NAMESPACE,
+            placeholder_offset + number,
+        )
         replacements[token] = value[start:end]
         protected = f"{protected[:start]}{token}{protected[end:]}"
     return (protected, replacements)
+
+
+def _protect_redaction_placeholders(value: str) -> tuple[str, dict[str, str]]:
+    """Hide semantic redaction markers from later Presidio passes.
+
+    Presidio emits typed markers such as ``<LOCATION>``. Feeding those markers
+    back into the NER model changes the linguistic context around neighboring
+    text and can reveal one new false-positive entity per pass. Replace every
+    already-redacted marker with a collision-safe opaque token while NER runs,
+    then restore the marker byte-for-byte. Real surrounding text still receives
+    complete analysis.
+    """
+    matches = list(_EMBEDDED_REDACTION_PLACEHOLDER.finditer(value))
+    if not matches:
+        return value, {}
+
+    placeholder_offset = 0
+    while any(
+        _internal_protection_token(
+            _INTERNAL_MARKER_NAMESPACE,
+            placeholder_offset + number,
+        )
+        in value
+        for number in range(len(matches))
+    ):
+        placeholder_offset += len(matches)
+
+    protected = value
+    replacements: dict[str, str] = {}
+    for number, match in enumerate(reversed(matches)):
+        placeholder = _internal_protection_token(
+            _INTERNAL_MARKER_NAMESPACE,
+            placeholder_offset + number,
+        )
+        replacements[placeholder] = match.group(0)
+        protected = f"{protected[: match.start()]}{placeholder}{protected[match.end() :]}"
+    return protected, replacements
 
 
 def _source_aware_redact(value: str, engine_redactor: Any) -> str:
@@ -435,9 +579,16 @@ def _source_aware_redact(value: str, engine_redactor: Any) -> str:
     # are already shielded above, so this remains conservative around code.
     protected = _LIKELY_FULL_NAME_OR_LOCATION.sub("[REDACTED]", protected)
     protected = _LIKELY_CAMEL_CASE_NAME.sub("[REDACTED]", protected)
+    protected, redaction_markers = _protect_redaction_placeholders(protected)
     redacted = engine_redactor(protected)
+    for placeholder, marker in redaction_markers.items():
+        if redacted.count(placeholder) != 1:
+            raise ValueError("PII engine altered an internal redaction-marker token")
+        redacted = redacted.replace(placeholder, marker, 1)
     for placeholder, identifier in replacements.items():
-        redacted = redacted.replace(placeholder, identifier)
+        if redacted.count(placeholder) != 1:
+            raise ValueError("PII engine altered an internal code-identifier token")
+        redacted = redacted.replace(placeholder, identifier, 1)
     return redacted
 
 
@@ -456,16 +607,9 @@ def configure_weave_pii() -> None:
     from presidio_anonymizer import AnonymizerEngine
     from weave.utils import pii_redaction
 
-    global _PII_ENGINE_REDACTOR, _REDACTION_CACHE_CHARS
+    global _PII_ENGINE_REDACTOR, _REDACTION_CACHE_BYTES
     _REDACTION_CACHE.clear()
-    _REDACTION_CACHE_CHARS = 0
-    engine_redactor = getattr(
-        pii_redaction,
-        "_hivemind_engine_redactor",
-        pii_redaction.redact_pii_string,
-    )
-    _PII_ENGINE_REDACTOR = engine_redactor
-    pii_redaction._hivemind_engine_redactor = engine_redactor
+    _REDACTION_CACHE_BYTES = 0
 
     # Presidio's email recognizer uses tldextract, whose module-level default
     # fetches the public-suffix list on first use. The package ships a snapshot,
@@ -492,6 +636,22 @@ def configure_weave_pii() -> None:
     def supported_redaction_entities() -> list[str]:
         return [entity for entity in requested if entity in supported]
 
+    def engine_redactor(value: str) -> str:
+        if not value:
+            return value
+        analyzer, anonymizer = offline_engines()
+        results = analyzer.analyze(
+            text=value,
+            language="en",
+            entities=supported_redaction_entities(),
+        )
+        results = _exclude_internal_protection_tokens(value, results)
+        expanded = _expand_contextual_entity_repetitions(value, results)
+        return str(anonymizer.anonymize(text=value, analyzer_results=expanded).text)
+
+    _PII_ENGINE_REDACTOR = engine_redactor
+    pii_redaction._hivemind_engine_redactor = engine_redactor
+
     # Weave's cross-country default contains a few recognizers Presidio does
     # not ship for English. Filtering those avoids a warning for every string;
     # all locally available Weave-requested entities remain enabled.
@@ -507,12 +667,6 @@ def configure_weave_pii() -> None:
 
 
 def _redact_pii_string_uncached(value: str) -> str:
-    try:
-        decoded = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        decoded = None
-    if isinstance(decoded, (dict, list)):
-        return canonical_json(_pii_walk(redact_data(decoded)))
     # Call the captured engine directly. Importing the mutable Weave hook here
     # made cached/reconfigured test and long-running processes intermittently
     # bypass the source-aware wrapper.
@@ -525,28 +679,36 @@ def _redact_pii_string_uncached(value: str) -> str:
 
 def _redact_pii_string(value: str) -> str:
     """Cache by digest only; raw pre-redaction text is never retained as a key."""
-    if len(value) > _MAX_REDACTION_CACHE_ENTRY_CHARS:
+    encoded_value = value.encode("utf-8")
+    if len(encoded_value) > _MAX_REDACTION_CACHE_ENTRY_BYTES:
         return _redact_pii_string_uncached(value)
 
-    global _REDACTION_CACHE_CHARS
-    cache_key = (len(value), hashlib.sha256(value.encode("utf-8")).hexdigest())
+    global _REDACTION_CACHE_BYTES
+    cache_key = (len(encoded_value), hashlib.sha256(encoded_value).hexdigest())
     cached = _REDACTION_CACHE.get(cache_key)
     if cached is not None:
         _REDACTION_CACHE.move_to_end(cache_key)
         return cached
 
     redacted = _redact_pii_string_uncached(value)
-    if len(redacted) <= _MAX_REDACTION_CACHE_ENTRY_CHARS:
+    redacted_bytes = len(redacted.encode("utf-8"))
+    if redacted_bytes <= _MAX_REDACTION_CACHE_ENTRY_BYTES:
         _REDACTION_CACHE[cache_key] = redacted
-        _REDACTION_CACHE_CHARS += len(redacted)
-        while _REDACTION_CACHE_CHARS > _MAX_REDACTION_CACHE_CHARS:
+        _REDACTION_CACHE_BYTES += redacted_bytes
+        while _REDACTION_CACHE_BYTES > _MAX_REDACTION_CACHE_BYTES:
             _, evicted = _REDACTION_CACHE.popitem(last=False)
-            _REDACTION_CACHE_CHARS -= len(evicted)
+            _REDACTION_CACHE_BYTES -= len(evicted.encode("utf-8"))
     return redacted
 
 
-def _pii_walk(value: Any) -> Any:
+def _pii_walk(value: Any, *, key: str = "") -> Any:
     if isinstance(value, str):
+        if key in _CANONICAL_JSON_ATTRIBUTE_KEYS and value:
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise ValueError("mapped ATIF JSON attribute is invalid") from error
+            return canonical_json(_pii_walk(decoded))
         return _redact_pii_string(value)
     if isinstance(value, dict):
         result: dict[str, Any] = {}
@@ -567,7 +729,7 @@ def _pii_walk(value: Any) -> Any:
             if coordinate_key in _SOURCE_COORDINATE_KEYS:
                 result[scrubbed_key] = redact_source_coordinate(raw_value)
             else:
-                result[scrubbed_key] = _pii_walk(raw_value)
+                result[scrubbed_key] = _pii_walk(raw_value, key=source_key)
         return result
     if isinstance(value, list):
         return [_pii_walk(item) for item in value]
@@ -584,7 +746,22 @@ def redact_upload_data(value: Any) -> Any:
     makes the guarantee testable against the exact payload handed to the SDK.
     """
     configure_weave_pii()
-    return _pii_walk(redact_data(value))
+
+    def redact_once(candidate: Any) -> Any:
+        return _pii_walk(
+            redact_data(
+                candidate,
+                json_string_keys=_CANONICAL_JSON_ATTRIBUTE_KEYS,
+            )
+        )
+
+    current = value
+    for _ in range(_MAX_REDACTION_FIXED_POINT_PASSES):
+        redacted = redact_once(current)
+        if redacted == current:
+            return redacted
+        current = redacted
+    raise ValueError("credential and PII redaction did not reach a fixed point")
 
 
 def redact_agent_name(value: str) -> str:
@@ -660,14 +837,52 @@ def _verification_signature(turn: MappedTurn) -> str:
     )
 
 
+def _sanitize_turn_attributes(source: dict[str, Any]) -> dict[str, Any]:
+    """Redact preserved ATIF JSON as data, never as an opaque text blob."""
+    ordinary = dict(source)
+    structured: dict[str, str] = {}
+    for key in _CANONICAL_JSON_ATTRIBUTE_KEYS:
+        if key not in ordinary:
+            continue
+        raw = ordinary.pop(key)
+        if raw == "":
+            structured[key] = ""
+            continue
+        if not isinstance(raw, str):
+            raise ValueError("mapped ATIF JSON attribute is not text")
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ValueError("mapped ATIF JSON attribute is invalid") from error
+        # Prove both representations: first redact the decoded source shape,
+        # then make its canonical JSON text a fixed point of the same final
+        # defense pass that will later see the complete manifest.
+        try:
+            serialized = canonical_json(redact_upload_data(decoded))
+            verified = redact_upload_data({key: serialized})
+        except ValueError as error:
+            raise ValueError(f"mapped ATIF JSON attribute {key} failed redaction") from error
+        if not isinstance(verified, dict):  # pragma: no cover - dict invariant.
+            raise ValueError("mapped ATIF JSON attribute wrapper changed type")
+        final_text = verified.get(key)
+        if not isinstance(final_text, str):  # pragma: no cover - string invariant.
+            raise ValueError("mapped ATIF JSON attribute changed type during redaction")
+        structured[key] = final_text
+
+    redacted = redact_upload_data(ordinary)
+    if not isinstance(redacted, dict):  # pragma: no cover - dict shape invariant.
+        raise ValueError("mapped turn attributes changed shape during redaction")
+    redacted.update(structured)
+    return redacted
+
+
 def _sanitize_turn(turn: MappedTurn) -> MappedTurn:
     # Build the complete destination-safe semantic payload before deriving any
     # durable content identity. Hashing raw names or locations would retain a
     # low-entropy equality oracle even though the transcript itself was later
     # redacted.
-    attributes = redact_upload_data(turn.attributes)
+    attributes = _sanitize_turn_attributes(turn.attributes)
     hash_context = redact_upload_data(turn.hash_context)
-    assert isinstance(attributes, dict)
     assert isinstance(hash_context, dict)
     for key in _CORRELATION_ATTRIBUTES:
         if key in turn.attributes:

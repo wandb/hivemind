@@ -250,11 +250,23 @@ class FakeVerifier:
             span_count=1,
         )
         self.calls: list[dict[str, Any]] = []
+        self.logical_response = SimpleNamespace(
+            matches=0,
+            trace_ids=[],
+            root_span_ids=[],
+            span_count=0,
+        )
+        self.logical_calls: list[dict[str, Any]] = []
 
     def reconcile(self, **query: Any) -> SimpleNamespace:
         self.events.append(("query", query["turn_key"], query["payload_sha256"]))
         self.calls.append(query)
         return self.response
+
+    def logical_root_matches(self, **query: Any) -> SimpleNamespace:
+        self.events.append(("logical_query", query["turn_key"]))
+        self.logical_calls.append(query)
+        return self.logical_response
 
 
 def _private_access(**updates: Any) -> ProjectAccess:
@@ -1226,6 +1238,121 @@ def test_query_only_reconciliation_detects_multiple_roots_without_writing() -> N
 
     assert evidence.matches == 2
     assert all(event[0] == "query" for event in events)
+    assert fake.logged == []
+
+
+def test_logical_root_probe_is_read_only_and_uses_no_content_certificate() -> None:
+    sink, fake, verifier, events = _sink()
+    logical_key = "a" * 64
+    sink.start_read_only("wandb/hivemind-chats-review")
+    events.clear()
+
+    evidence = sink.find_logical_roots(
+        conversation_id=f"hivemind:{_SESSION_ID}",
+        logical_key=logical_key,
+        timeout_seconds=11.0,
+    )
+
+    assert evidence.matches == 0
+    assert evidence.trace_ids == ()
+    assert evidence.root_span_ids == ()
+    assert evidence.span_count == 0
+    assert events == [("logical_query", f"review:{logical_key}")]
+    assert verifier.logical_calls == [
+        {
+            "conversation_id": f"hivemind:{_SESSION_ID}",
+            "turn_key": f"review:{logical_key}",
+            "request_timeout": 11.0,
+        }
+    ]
+    assert fake.init_call is None
+    assert fake.logged == []
+    assert fake.publish_attempts == 0
+
+
+def test_logical_root_probe_returns_positive_evidence_without_uploading() -> None:
+    sink, fake, verifier, events = _sink()
+    verifier.logical_response = SimpleNamespace(
+        matches=1,
+        trace_ids=[_TRACE_ID],
+        root_span_ids=[_ROOT_SPAN_ID],
+        span_count=1,
+    )
+    sink.start_read_only("wandb/hivemind-chats-review")
+    events.clear()
+
+    evidence = sink.find_logical_roots(
+        conversation_id=f"hivemind:{_SESSION_ID}",
+        logical_key="a" * 64,
+    )
+
+    assert evidence.matches == 1
+    assert evidence.trace_ids == (_TRACE_ID,)
+    assert evidence.root_span_ids == (_ROOT_SPAN_ID,)
+    assert evidence.span_count == 1
+    assert [event[0] for event in events] == ["logical_query"]
+    assert fake.init_call is None
+    assert fake.logged == []
+    assert fake.publish_attempts == 0
+
+
+def test_logical_root_probe_fails_closed_on_query_or_response_error() -> None:
+    sink, fake, verifier, events = _sink()
+    sink.start_read_only("wandb/hivemind-chats-review")
+    verifier.logical_response = SimpleNamespace(
+        matches=0,
+        trace_ids=[_TRACE_ID],
+        root_span_ids=[],
+        span_count=0,
+    )
+
+    with pytest.raises(ReviewRootConflictError, match="contradictory"):
+        sink.find_logical_roots(
+            conversation_id=f"hivemind:{_SESSION_ID}",
+            logical_key="a" * 64,
+        )
+
+    def failed_query(**_query: Any) -> Any:
+        raise RuntimeError("transport failed")
+
+    verifier.logical_root_matches = failed_query  # type: ignore[method-assign]
+    with pytest.raises(ReviewRootUncertainError, match="absence could not be established"):
+        sink.find_logical_roots(
+            conversation_id=f"hivemind:{_SESSION_ID}",
+            logical_key="a" * 64,
+        )
+
+    assert fake.init_call is None
+    assert fake.logged == []
+    assert fake.publish_attempts == 0
+    assert [event[0] for event in events].count("logical_query") == 1
+
+
+@pytest.mark.parametrize(
+    ("conversation_id", "logical_key"),
+    [
+        ("not-hivemind", "a" * 64),
+        (f"hivemind:{_SESSION_ID}", "A" * 64),
+        (f"hivemind:{_SESSION_ID}", "a" * 63),
+    ],
+)
+def test_logical_root_probe_rejects_malformed_local_identity_before_query(
+    conversation_id: str,
+    logical_key: str,
+) -> None:
+    sink, fake, verifier, events = _sink()
+    sink.start_read_only("wandb/hivemind-chats-review")
+    events.clear()
+
+    with pytest.raises(ReviewRootConflictError, match="expectation is malformed"):
+        sink.find_logical_roots(
+            conversation_id=conversation_id,
+            logical_key=logical_key,
+        )
+
+    assert verifier.logical_calls == []
+    assert events == []
+    assert fake.init_call is None
     assert fake.logged == []
 
 

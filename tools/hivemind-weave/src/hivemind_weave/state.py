@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - the importer targets macOS/Linux.
 
 
 DB_APPLICATION_ID = 0x484D5756
-DB_SCHEMA_VERSION = 8
+DB_SCHEMA_VERSION = 11
 RUN_SCHEMA_VERSION = "2"
 _HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ATOMIC_EVIDENCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
@@ -991,6 +991,58 @@ CREATE TABLE review_turn_ledger (
 )
 """
 
+_REVIEW_PREFLIGHT_CONFLICT_ARCHIVE_SQL = """
+CREATE TABLE review_preflight_conflict_archive (
+    plan_id TEXT NOT NULL,
+    project TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_key TEXT NOT NULL,
+    source_payload_sha256 TEXT NOT NULL CHECK(length(source_payload_sha256) = 64),
+    manifest_sha256 TEXT NOT NULL CHECK(length(manifest_sha256) = 64),
+    logical_key TEXT NOT NULL CHECK(length(logical_key) = 64),
+    preview_signature TEXT NOT NULL CHECK(length(preview_signature) = 64),
+    manifest_bytes INTEGER NOT NULL CHECK(manifest_bytes > 0),
+    chunk_count INTEGER NOT NULL CHECK(chunk_count BETWEEN 1 AND 64),
+    ledger_revision INTEGER NOT NULL CHECK(ledger_revision = 1),
+    ledger_created_at TEXT NOT NULL,
+    ledger_updated_at TEXT NOT NULL,
+    ledger_error_code TEXT NOT NULL CHECK(
+        ledger_error_code IN ('preflight_session_conflict', 'preflight_source_drift')
+    ),
+    proof_sha256 TEXT NOT NULL CHECK(length(proof_sha256) = 64),
+    archived_at TEXT NOT NULL,
+    PRIMARY KEY (plan_id, session_id, turn_key),
+    FOREIGN KEY (plan_id, session_id, turn_key)
+        REFERENCES review_plan_turns(plan_id, session_id, turn_key)
+)
+"""
+
+_REVIEW_PLAN_RETIREMENTS_SQL = """
+CREATE TABLE review_plan_retirements (
+    plan_id TEXT PRIMARY KEY REFERENCES review_plans(plan_id),
+    project TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason = 'preflight_source_drift'),
+    archived_turn_count INTEGER NOT NULL CHECK(archived_turn_count > 0),
+    remote_match_count INTEGER NOT NULL CHECK(remote_match_count = 0),
+    proof_sha256 TEXT NOT NULL CHECK(length(proof_sha256) = 64),
+    importer_version TEXT NOT NULL CHECK(length(importer_version) BETWEEN 1 AND 64),
+    retired_at TEXT NOT NULL
+)
+"""
+
+_REVIEW_PLAN_REVALIDATIONS_SQL = """
+CREATE TABLE review_plan_revalidations (
+    plan_id TEXT PRIMARY KEY REFERENCES review_plans(plan_id),
+    project TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason = 'transient_preflight_export'),
+    archived_turn_count INTEGER NOT NULL CHECK(archived_turn_count > 0),
+    remote_match_count INTEGER NOT NULL CHECK(remote_match_count = 0),
+    proof_sha256 TEXT NOT NULL CHECK(length(proof_sha256) = 64),
+    importer_version TEXT NOT NULL CHECK(length(importer_version) BETWEEN 1 AND 64),
+    revalidated_at TEXT NOT NULL
+)
+"""
+
 _REVIEW_PLANS_INDEX_SQL = """
 CREATE INDEX review_plans_project_status ON review_plans(project, status)
 """
@@ -1140,13 +1192,330 @@ BEGIN
 END
 """
 
+# The review ledger predates attempt lineage and is globally keyed by source
+# turn.  Until a future schema migration keys it by plan attempt, an archived
+# row may authorize deletion only when no nonterminal plan owns the exact turn
+# certificate.  This prevents an old archive from matching a later identical
+# revision-1 conflict.
 _REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL = """
 CREATE TRIGGER review_turn_ledger_no_delete
 BEFORE DELETE ON review_turn_ledger
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM review_preflight_conflict_archive AS archive
+    WHERE archive.project = OLD.project
+      AND archive.session_id = OLD.session_id
+      AND archive.turn_key = OLD.turn_key
+      AND archive.source_payload_sha256 = OLD.source_payload_sha256
+      AND archive.manifest_sha256 = OLD.manifest_sha256
+      AND archive.logical_key = OLD.logical_key
+      AND archive.preview_signature = OLD.preview_signature
+      AND archive.manifest_bytes = OLD.manifest_bytes
+      AND archive.chunk_count = OLD.chunk_count
+      AND archive.ledger_revision = OLD.revision
+      AND archive.ledger_error_code = OLD.error_code
+      AND archive.ledger_created_at = OLD.created_at
+      AND archive.ledger_updated_at = OLD.updated_at
+      AND (
+          EXISTS (
+              SELECT 1 FROM review_plan_retirements AS retirement
+              WHERE retirement.plan_id = archive.plan_id
+                AND retirement.project = archive.project
+                AND retirement.proof_sha256 = archive.proof_sha256
+          )
+          OR EXISTS (
+              SELECT 1 FROM review_plan_revalidations AS revalidation
+              WHERE revalidation.plan_id = archive.plan_id
+                AND revalidation.project = archive.project
+                AND revalidation.proof_sha256 = archive.proof_sha256
+          )
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM review_plan_turns AS active_turn
+          JOIN review_plans AS active_plan
+            ON active_plan.plan_id = active_turn.plan_id
+          WHERE active_plan.project = OLD.project
+            AND active_turn.session_id = OLD.session_id
+            AND active_turn.turn_key = OLD.turn_key
+            AND active_turn.source_payload_sha256 = OLD.source_payload_sha256
+            AND active_turn.manifest_sha256 = OLD.manifest_sha256
+            AND active_turn.logical_key = OLD.logical_key
+            AND active_turn.preview_signature = OLD.preview_signature
+            AND active_turn.manifest_bytes = OLD.manifest_bytes
+            AND active_turn.chunk_count = OLD.chunk_count
+            AND NOT EXISTS (
+                SELECT 1 FROM review_plan_retirements AS active_retirement
+                WHERE active_retirement.plan_id = active_turn.plan_id
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM review_plan_revalidations AS active_revalidation
+                WHERE active_revalidation.plan_id = active_turn.plan_id
+            )
+      )
+)
 BEGIN
     SELECT RAISE(ABORT, 'review turn evidence cannot be deleted');
 END
 """
+
+_REVIEW_PREFLIGHT_ARCHIVE_INSERT_GUARD_SQL = """
+CREATE TRIGGER review_preflight_conflict_archive_insert_guard
+BEFORE INSERT ON review_preflight_conflict_archive
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM review_turn_ledger AS ledger
+    JOIN review_plans AS plan ON plan.plan_id = NEW.plan_id
+    JOIN review_plan_turns AS planned
+      ON planned.plan_id = NEW.plan_id
+     AND planned.session_id = NEW.session_id
+     AND planned.turn_key = NEW.turn_key
+    WHERE ledger.project = NEW.project
+      AND ledger.session_id = NEW.session_id
+      AND ledger.turn_key = NEW.turn_key
+      AND plan.project = NEW.project
+      AND plan.status = 'blocked'
+      AND ledger.status = 'conflict'
+      AND ledger.error_code IN ('preflight_session_conflict', 'preflight_source_drift')
+      AND ledger.chunk_refs_json = '[]'
+      AND ledger.chunk_hashes_json = '[]'
+      AND ledger.chunk_sizes_json = '[]'
+      AND ledger.index_ref = ''
+      AND ledger.index_sha256 = ''
+      AND ledger.index_size = 0
+      AND ledger.trace_id = ''
+      AND ledger.root_span_id = ''
+      AND ledger.visible_at IS NULL
+      AND ledger.revision = 1
+      AND ledger.source_payload_sha256 = NEW.source_payload_sha256
+      AND ledger.manifest_sha256 = NEW.manifest_sha256
+      AND ledger.logical_key = NEW.logical_key
+      AND ledger.preview_signature = NEW.preview_signature
+      AND ledger.manifest_bytes = NEW.manifest_bytes
+      AND ledger.chunk_count = NEW.chunk_count
+      AND ledger.revision = NEW.ledger_revision
+      AND ledger.created_at = NEW.ledger_created_at
+      AND ledger.updated_at = NEW.ledger_updated_at
+      AND ledger.error_code = NEW.ledger_error_code
+)
+BEGIN
+    SELECT RAISE(ABORT, 'review preflight archive lacks exact zero-write evidence');
+END
+"""
+
+_REVIEW_PREFLIGHT_ARCHIVE_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER review_preflight_conflict_archive_immutable
+BEFORE UPDATE ON review_preflight_conflict_archive
+BEGIN
+    SELECT RAISE(ABORT, 'review preflight conflict archives are immutable');
+END
+"""
+
+_REVIEW_PREFLIGHT_ARCHIVE_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_preflight_conflict_archive_no_delete
+BEFORE DELETE ON review_preflight_conflict_archive
+BEGIN
+    SELECT RAISE(ABORT, 'review preflight conflict archives cannot be deleted');
+END
+"""
+
+_REVIEW_PLAN_RETIREMENT_INSERT_GUARD_SQL = """
+CREATE TRIGGER review_plan_retirements_insert_guard
+BEFORE INSERT ON review_plan_retirements
+WHEN NOT (
+    EXISTS (
+        SELECT 1 FROM review_plans
+        WHERE plan_id = NEW.plan_id
+          AND project = NEW.project
+          AND status = 'blocked'
+          AND selected_count = 1
+    )
+    AND NEW.archived_turn_count = (
+        SELECT COUNT(*) FROM review_preflight_conflict_archive
+        WHERE plan_id = NEW.plan_id AND project = NEW.project
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM review_plan_revalidations
+        WHERE plan_id = NEW.plan_id
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM review_plan_turns AS planned
+        JOIN review_plans AS plan ON plan.plan_id = planned.plan_id
+        JOIN review_turn_ledger AS ledger
+          ON ledger.project = plan.project
+         AND ledger.session_id = planned.session_id
+         AND ledger.turn_key = planned.turn_key
+        WHERE planned.plan_id = NEW.plan_id
+          AND ledger.status IN (
+              'objects_publishing', 'objects_verified', 'root_submitting',
+              'visible', 'uncertain'
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM review_plan_turns AS planned
+        JOIN review_plans AS plan ON plan.plan_id = planned.plan_id
+        JOIN review_turn_ledger AS ledger
+          ON ledger.project = plan.project
+         AND ledger.session_id = planned.session_id
+         AND ledger.turn_key = planned.turn_key
+        WHERE planned.plan_id = NEW.plan_id
+          AND NOT EXISTS (
+              SELECT 1
+              FROM review_preflight_conflict_archive AS archive
+              WHERE archive.plan_id = NEW.plan_id
+                AND archive.project = NEW.project
+                AND archive.session_id = ledger.session_id
+                AND archive.turn_key = ledger.turn_key
+                AND archive.source_payload_sha256 = ledger.source_payload_sha256
+                AND archive.manifest_sha256 = ledger.manifest_sha256
+                AND archive.logical_key = ledger.logical_key
+                AND archive.preview_signature = ledger.preview_signature
+                AND archive.ledger_revision = ledger.revision
+                AND archive.ledger_error_code = ledger.error_code
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM review_cohorts
+        WHERE plan_id = NEW.plan_id
+          AND (
+              status != 'blocked' OR session_count != 1
+              OR visible_turns != 0 OR skipped_turns != 0
+          )
+    )
+    AND 1 = (SELECT COUNT(*) FROM review_cohorts WHERE plan_id = NEW.plan_id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'review plan retirement lacks complete preflight-only evidence');
+END
+"""
+
+_REVIEW_PLAN_RETIREMENT_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER review_plan_retirements_immutable
+BEFORE UPDATE ON review_plan_retirements
+BEGIN
+    SELECT RAISE(ABORT, 'review plan retirements are immutable');
+END
+"""
+
+_REVIEW_PLAN_RETIREMENT_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_plan_retirements_no_delete
+BEFORE DELETE ON review_plan_retirements
+BEGIN
+    SELECT RAISE(ABORT, 'review plan retirements cannot be deleted');
+END
+"""
+
+_REVIEW_PLAN_REVALIDATION_INSERT_GUARD_SQL = """
+CREATE TRIGGER review_plan_revalidations_insert_guard
+BEFORE INSERT ON review_plan_revalidations
+WHEN NOT (
+    EXISTS (
+        SELECT 1 FROM review_plans
+        WHERE plan_id = NEW.plan_id
+          AND project = NEW.project
+          AND status = 'blocked'
+          AND selected_count = 1
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM review_plan_retirements
+        WHERE plan_id = NEW.plan_id
+    )
+    AND EXISTS (
+        SELECT 1 FROM review_preflight_conflict_archive
+        WHERE plan_id = NEW.plan_id AND project = NEW.project
+    )
+    AND NEW.archived_turn_count = (
+        SELECT COUNT(*) FROM review_preflight_conflict_archive
+        WHERE plan_id = NEW.plan_id AND project = NEW.project
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM review_plan_turns AS planned
+        JOIN review_plans AS plan ON plan.plan_id = planned.plan_id
+        JOIN review_turn_ledger AS ledger
+          ON ledger.project = plan.project
+         AND ledger.session_id = planned.session_id
+         AND ledger.turn_key = planned.turn_key
+        WHERE planned.plan_id = NEW.plan_id
+          AND ledger.status IN (
+              'objects_publishing', 'objects_verified', 'root_submitting',
+              'visible', 'uncertain'
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM review_plan_turns AS planned
+        JOIN review_plans AS plan ON plan.plan_id = planned.plan_id
+        JOIN review_turn_ledger AS ledger
+          ON ledger.project = plan.project
+         AND ledger.session_id = planned.session_id
+         AND ledger.turn_key = planned.turn_key
+        WHERE planned.plan_id = NEW.plan_id
+          AND NOT EXISTS (
+              SELECT 1
+              FROM review_preflight_conflict_archive AS archive
+              WHERE archive.plan_id = NEW.plan_id
+                AND archive.project = NEW.project
+                AND archive.session_id = ledger.session_id
+                AND archive.turn_key = ledger.turn_key
+                AND archive.source_payload_sha256 = ledger.source_payload_sha256
+                AND archive.manifest_sha256 = ledger.manifest_sha256
+                AND archive.logical_key = ledger.logical_key
+                AND archive.preview_signature = ledger.preview_signature
+                AND archive.ledger_revision = ledger.revision
+                AND archive.ledger_error_code = ledger.error_code
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM review_cohorts
+        WHERE plan_id = NEW.plan_id
+          AND (
+              status != 'blocked' OR session_count != 1
+              OR visible_turns != 0 OR skipped_turns != 0
+          )
+    )
+    AND 1 = (SELECT COUNT(*) FROM review_cohorts WHERE plan_id = NEW.plan_id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'review plan revalidation lacks complete preflight-only evidence');
+END
+"""
+
+_REVIEW_PLAN_REVALIDATION_IMMUTABLE_TRIGGER_SQL = """
+CREATE TRIGGER review_plan_revalidations_immutable
+BEFORE UPDATE ON review_plan_revalidations
+BEGIN
+    SELECT RAISE(ABORT, 'review plan revalidations are immutable');
+END
+"""
+
+_REVIEW_PLAN_REVALIDATION_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_plan_revalidations_no_delete
+BEFORE DELETE ON review_plan_revalidations
+BEGIN
+    SELECT RAISE(ABORT, 'review plan revalidations cannot be deleted');
+END
+"""
+
+_REVIEW_PREFLIGHT_RECOVERY_SCHEMA_SQL = (
+    _REVIEW_PREFLIGHT_CONFLICT_ARCHIVE_SQL,
+    _REVIEW_PLAN_RETIREMENTS_SQL,
+    _REVIEW_PREFLIGHT_ARCHIVE_INSERT_GUARD_SQL,
+    _REVIEW_PREFLIGHT_ARCHIVE_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_PREFLIGHT_ARCHIVE_NO_DELETE_TRIGGER_SQL,
+    _REVIEW_PLAN_RETIREMENT_INSERT_GUARD_SQL,
+    _REVIEW_PLAN_RETIREMENT_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_PLAN_RETIREMENT_NO_DELETE_TRIGGER_SQL,
+)
+
+_REVIEW_REVALIDATION_SCHEMA_SQL = (
+    _REVIEW_PLAN_REVALIDATIONS_SQL,
+    _REVIEW_PLAN_REVALIDATION_INSERT_GUARD_SQL,
+    _REVIEW_PLAN_REVALIDATION_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_PLAN_REVALIDATION_NO_DELETE_TRIGGER_SQL,
+)
 
 _REVIEW_SCHEMA_SQL = (
     _REVIEW_PLANS_SQL,
@@ -1156,6 +1525,9 @@ _REVIEW_SCHEMA_SQL = (
     _REVIEW_COHORTS_SQL,
     _REVIEW_COHORT_SESSIONS_SQL,
     _REVIEW_TURN_LEDGER_SQL,
+    _REVIEW_PREFLIGHT_CONFLICT_ARCHIVE_SQL,
+    _REVIEW_PLAN_RETIREMENTS_SQL,
+    _REVIEW_PLAN_REVALIDATIONS_SQL,
     _REVIEW_PLANS_INDEX_SQL,
     _REVIEW_LEDGER_INDEX_SQL,
     _REVIEW_PLAN_IMMUTABLE_TRIGGER_SQL,
@@ -1164,6 +1536,15 @@ _REVIEW_SCHEMA_SQL = (
     _REVIEW_PLAN_TURN_IMMUTABLE_TRIGGER_SQL,
     _REVIEW_COHORT_IMMUTABLE_TRIGGER_SQL,
     _REVIEW_COHORT_SESSION_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_PREFLIGHT_ARCHIVE_INSERT_GUARD_SQL,
+    _REVIEW_PREFLIGHT_ARCHIVE_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_PREFLIGHT_ARCHIVE_NO_DELETE_TRIGGER_SQL,
+    _REVIEW_PLAN_RETIREMENT_INSERT_GUARD_SQL,
+    _REVIEW_PLAN_RETIREMENT_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_PLAN_RETIREMENT_NO_DELETE_TRIGGER_SQL,
+    _REVIEW_PLAN_REVALIDATION_INSERT_GUARD_SQL,
+    _REVIEW_PLAN_REVALIDATION_IMMUTABLE_TRIGGER_SQL,
+    _REVIEW_PLAN_REVALIDATION_NO_DELETE_TRIGGER_SQL,
     _REVIEW_LEDGER_IDENTITY_TRIGGER_SQL,
     _REVIEW_LEDGER_REVISION_TRIGGER_SQL,
     _REVIEW_LEDGER_TRANSITION_TRIGGER_SQL,
@@ -1612,6 +1993,9 @@ _EXPECTED_SCHEMA_SQL = {
     "review_cohorts": _REVIEW_COHORTS_SQL,
     "review_cohort_sessions": _REVIEW_COHORT_SESSIONS_SQL,
     "review_turn_ledger": _REVIEW_TURN_LEDGER_SQL,
+    "review_preflight_conflict_archive": _REVIEW_PREFLIGHT_CONFLICT_ARCHIVE_SQL,
+    "review_plan_retirements": _REVIEW_PLAN_RETIREMENTS_SQL,
+    "review_plan_revalidations": _REVIEW_PLAN_REVALIDATIONS_SQL,
     "review_plans_project_status": _REVIEW_PLANS_INDEX_SQL,
     "review_turn_ledger_project_status": _REVIEW_LEDGER_INDEX_SQL,
     "review_plans_immutable": _REVIEW_PLAN_IMMUTABLE_TRIGGER_SQL,
@@ -1620,6 +2004,19 @@ _EXPECTED_SCHEMA_SQL = {
     "review_plan_turns_immutable": _REVIEW_PLAN_TURN_IMMUTABLE_TRIGGER_SQL,
     "review_cohorts_immutable": _REVIEW_COHORT_IMMUTABLE_TRIGGER_SQL,
     "review_cohort_sessions_immutable": _REVIEW_COHORT_SESSION_IMMUTABLE_TRIGGER_SQL,
+    "review_preflight_conflict_archive_insert_guard": (_REVIEW_PREFLIGHT_ARCHIVE_INSERT_GUARD_SQL),
+    "review_preflight_conflict_archive_immutable": (
+        _REVIEW_PREFLIGHT_ARCHIVE_IMMUTABLE_TRIGGER_SQL
+    ),
+    "review_preflight_conflict_archive_no_delete": (
+        _REVIEW_PREFLIGHT_ARCHIVE_NO_DELETE_TRIGGER_SQL
+    ),
+    "review_plan_retirements_insert_guard": _REVIEW_PLAN_RETIREMENT_INSERT_GUARD_SQL,
+    "review_plan_retirements_immutable": _REVIEW_PLAN_RETIREMENT_IMMUTABLE_TRIGGER_SQL,
+    "review_plan_retirements_no_delete": _REVIEW_PLAN_RETIREMENT_NO_DELETE_TRIGGER_SQL,
+    "review_plan_revalidations_insert_guard": _REVIEW_PLAN_REVALIDATION_INSERT_GUARD_SQL,
+    "review_plan_revalidations_immutable": _REVIEW_PLAN_REVALIDATION_IMMUTABLE_TRIGGER_SQL,
+    "review_plan_revalidations_no_delete": _REVIEW_PLAN_REVALIDATION_NO_DELETE_TRIGGER_SQL,
     "review_turn_ledger_identity_immutable": _REVIEW_LEDGER_IDENTITY_TRIGGER_SQL,
     "review_turn_ledger_revision_guard": _REVIEW_LEDGER_REVISION_TRIGGER_SQL,
     "review_turn_ledger_transition_guard": _REVIEW_LEDGER_TRANSITION_TRIGGER_SQL,
@@ -1967,6 +2364,30 @@ class StateStore:
             if user_version == DB_SCHEMA_VERSION:
                 if application_id != DB_APPLICATION_ID:
                     raise StateConflictError("state database application identity is missing")
+            elif user_version == 10 and application_id == DB_APPLICATION_ID:
+                self._db.execute("DROP TRIGGER review_turn_ledger_no_delete")
+                self._db.execute("DROP TRIGGER review_plan_retirements_insert_guard")
+                self._db.execute("DROP TRIGGER review_plan_revalidations_insert_guard")
+                self._db.execute(_REVIEW_PLAN_RETIREMENT_INSERT_GUARD_SQL)
+                self._db.execute(_REVIEW_PLAN_REVALIDATION_INSERT_GUARD_SQL)
+                self._db.execute(_REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL)
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
+            elif user_version == 9 and application_id == DB_APPLICATION_ID:
+                self._db.execute("DROP TRIGGER review_turn_ledger_no_delete")
+                self._db.execute("DROP TRIGGER review_plan_retirements_insert_guard")
+                for statement in _REVIEW_REVALIDATION_SCHEMA_SQL:
+                    self._db.execute(statement)
+                self._db.execute(_REVIEW_PLAN_RETIREMENT_INSERT_GUARD_SQL)
+                self._db.execute(_REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL)
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
+            elif user_version == 8 and application_id == DB_APPLICATION_ID:
+                self._db.execute("DROP TRIGGER review_turn_ledger_no_delete")
+                for statement in _REVIEW_PREFLIGHT_RECOVERY_SCHEMA_SQL:
+                    self._db.execute(statement)
+                for statement in _REVIEW_REVALIDATION_SCHEMA_SQL:
+                    self._db.execute(statement)
+                self._db.execute(_REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL)
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 7 and application_id == DB_APPLICATION_ID:
                 self._db.execute(
                     """
@@ -1974,6 +2395,12 @@ class StateStore:
                     ADD COLUMN index_size INTEGER NOT NULL DEFAULT 0 CHECK(index_size >= 0)
                     """
                 )
+                self._db.execute("DROP TRIGGER review_turn_ledger_no_delete")
+                for statement in _REVIEW_PREFLIGHT_RECOVERY_SCHEMA_SQL:
+                    self._db.execute(statement)
+                for statement in _REVIEW_REVALIDATION_SCHEMA_SQL:
+                    self._db.execute(statement)
+                self._db.execute(_REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL)
                 self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 6 and application_id == DB_APPLICATION_ID:
                 for statement in _REVIEW_SCHEMA_SQL:

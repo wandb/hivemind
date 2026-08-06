@@ -46,6 +46,7 @@ from .review_state import (
     ReviewPlan,
     ReviewPlanSession,
     ReviewStateStore,
+    ReviewStatus,
     ReviewTurnCertificate,
     review_filter_summary,
     review_logical_key,
@@ -1484,8 +1485,27 @@ def reconcile_review(
 
 def review_status(state_path: Path, *, project: str = REVIEW_PROJECT) -> str:
     _validate_review_project(project)
-    with ReviewStateStore(state_path) as state:
-        status = state.status(project)
+    try:
+        state_path.lstat()
+    except FileNotFoundError:
+        # Status is observational. An empty machine must not acquire a lock,
+        # create a private directory, or materialize a new SQLite journal just
+        # to report that no review work exists yet.
+        status = ReviewStatus(
+            plans=0,
+            queued_sessions=0,
+            completed_sessions=0,
+            planned_turns=0,
+            objects_publishing=0,
+            objects_verified=0,
+            root_submitting=0,
+            visible=0,
+            uncertain=0,
+            conflicted=0,
+        )
+    else:
+        with ReviewStateStore(state_path) as state:
+            status = state.status(project)
     return "\n".join(
         [
             "Review mirror status:",

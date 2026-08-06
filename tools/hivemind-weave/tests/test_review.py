@@ -678,6 +678,17 @@ def test_apply_publishes_one_root_then_identical_rerun_emits_nothing(
     assert ledger.index_sha256 != certificate.index_sha256
 
 
+def test_review_status_without_state_is_read_only(tmp_path: Path) -> None:
+    state_path = tmp_path / "missing-private-directory" / "state.sqlite3"
+
+    status = review_status(state_path)
+
+    assert "sealed plans:         0" in status
+    assert "visible turns:        0" in status
+    assert "uncertain turns:      0" in status
+    assert not state_path.parent.exists()
+
+
 def test_apply_sdk_failure_does_not_begin_or_poison_a_sealed_cohort(
     tmp_path: Path,
     monkeypatch: Any,

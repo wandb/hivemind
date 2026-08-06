@@ -32,7 +32,7 @@ from hivemind_weave.review import (
 )
 from hivemind_weave.review_manifest import ReviewManifestError
 from hivemind_weave.review_state import ReviewStateStore, review_logical_key
-from hivemind_weave.utils import parse_datetime
+from hivemind_weave.utils import canonical_json, isoformat_z, parse_datetime
 
 NOW = datetime(2026, 8, 6, 16, 0, tzinfo=UTC)
 REVIEW_USER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -97,6 +97,7 @@ class FakeSink:
         self.active = False
         self.read_only = False
         self.events: list[str] = []
+        self.manifests: list[dict[str, Any]] = []
         self.find_expectations: list[dict[str, Any]] = []
         self.__class__.instances.append(self)
 
@@ -117,6 +118,7 @@ class FakeSink:
     def publish_objects(self, bundle: Any) -> Any:
         assert self.project and self.active
         payload = json.loads(bundle.manifest_json)
+        self.manifests.append(payload)
         conversation_id = payload["conversation"]["conversation_id"]
         source_turn_key = payload["turn"]["key"]
         started_at = parse_datetime(payload["turn"]["started_at"])
@@ -266,6 +268,7 @@ def _preview(
     client: FakeHiveMind,
     *,
     canary: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> Any:
     return preview_review(
         ReviewPreviewConfig(
@@ -275,6 +278,7 @@ def _preview(
             state_path=tmp_path / "private" / "state.sqlite3",
             canary=canary,
             now=NOW,
+            progress=progress,
         ),
         hivemind=client,  # type: ignore[arg-type]
     )
@@ -509,6 +513,57 @@ def test_preview_default_until_is_captured_now_and_exclusive(
     assert not client.fetches
 
 
+def test_canary_summary_turn_count_skips_known_large_transcript_before_fetch(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=2)
+    client.sessions[0]["turn_count"] = 500
+    client.sessions[1]["turn_count"] = 1
+
+    progress: list[str] = []
+    report = _preview(tmp_path, client, canary=True, progress=progress.append)
+
+    assert report.selected_sessions == 1
+    assert REVIEW_SESSION_IDS[0] not in client.fetches
+    assert client.fetches == [REVIEW_SESSION_IDS[1]] * 3
+    assert progress == [
+        "Canary summary preflight: 1 plausible session(s); "
+        "at most 25 transcript(s) will be examined",
+        "Canary transcript preflight: 1/1",
+    ]
+    assert REVIEW_SESSION_IDS[0] not in repr(progress)
+    assert "private title" not in repr(progress)
+
+
+def test_canary_summary_token_budget_skips_expensive_small_turn_transcript(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=2)
+    for session in client.sessions:
+        session.update(
+            {
+                "turn_count": 1,
+                "tool_call_count": 1,
+                "input_tokens": 10,
+                "output_tokens": 10,
+                "reasoning_tokens": 10,
+                "cached_read_tokens": 10,
+                "cached_write_tokens": 10,
+            }
+        )
+    client.sessions[0]["input_tokens"] = 100_001
+
+    report = _preview(tmp_path, client, canary=True)
+
+    assert report.selected_sessions == 1
+    assert REVIEW_SESSION_IDS[0] not in client.fetches
+    assert client.fetches == [REVIEW_SESSION_IDS[1]] * 3
+
+
 def test_uuidv7_session_survives_redaction_and_seals_end_to_end(
     tmp_path: Path,
     session_payload: Callable[..., dict[str, Any]],
@@ -529,6 +584,52 @@ def test_uuidv7_session_survives_redaction_and_seals_end_to_end(
         assert state.get_sessions(report.plan_id)[0].session_id == uuid_v7
 
 
+def test_uuidv5_internal_session_survives_end_to_end_but_untrusted_v5_is_redacted(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    source = "11111111-1111-5111-8111-111111111111"
+    parent = "22222222-2222-5222-8222-222222222222"
+    untrusted = "33333333-3333-5333-8333-333333333333"
+    client = _client(session_payload, atif_wrapper)
+    old_id = REVIEW_SESSION_IDS[0]
+    client.sessions[0].update(
+        {
+            "id": source,
+            "parent_session_id": parent,
+            "agent_session_id": untrusted,
+        }
+    )
+    transcript = client.transcripts.pop(old_id)
+    transcript["session_id"] = source
+    transcript["metadata"] = {"session_id": untrusted}
+    steps = transcript["trajectory"]["steps"]
+    steps[1]["message"] = f"Inspect coordinate {untrusted}"
+    steps[2]["tool_calls"][0]["arguments"]["session_id"] = untrusted
+    client.transcripts[source] = transcript
+
+    preview = _preview(tmp_path, client)
+    report = apply_review(
+        ReviewApplyConfig(
+            plan_id=preview.plan_id[:32],
+            confirm_project=REVIEW_PROJECT,
+            state_path=tmp_path / "private" / "state.sqlite3",
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        sink_factory=FakeSink,
+    )
+
+    assert report.visible_turns == 1
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        assert state.get_sessions(preview.plan_id)[0].session_id == source
+    payload = FakeSink.instances[-1].manifests[0]
+    assert payload["conversation"]["conversation_id"] == f"hivemind:{source}"
+    assert payload["session"]["session_id"] == source
+    assert payload["session"]["parent_session_id"] == parent
+    assert untrusted not in canonical_json(payload)
+
+
 def test_apply_publishes_one_root_then_identical_rerun_emits_nothing(
     tmp_path: Path,
     session_payload: Callable[..., dict[str, Any]],
@@ -537,7 +638,7 @@ def test_apply_publishes_one_root_then_identical_rerun_emits_nothing(
     client = _client(session_payload, atif_wrapper)
     preview = _preview(tmp_path, client)
     config = ReviewApplyConfig(
-        plan_id=preview.plan_id[:12],
+        plan_id=preview.plan_id[:32],
         confirm_project=REVIEW_PROJECT,
         state_path=tmp_path / "private" / "state.sqlite3",
         max_sessions=1,
@@ -593,7 +694,7 @@ def test_apply_sdk_failure_does_not_begin_or_poison_a_sealed_cohort(
     with pytest.raises(ReviewMirrorError, match="reviewed commit"):
         apply_review(
             ReviewApplyConfig(
-                plan_id=preview.plan_id[:12],
+                plan_id=preview.plan_id[:32],
                 confirm_project=REVIEW_PROJECT,
                 state_path=tmp_path / "private" / "state.sqlite3",
                 max_sessions=1,
@@ -634,7 +735,7 @@ def test_appended_turn_skips_visible_history_and_imports_only_the_append(
     first_plan = _preview(tmp_path, client)
     first_apply = apply_review(
         ReviewApplyConfig(
-            plan_id=first_plan.plan_id[:12],
+            plan_id=first_plan.plan_id[:32],
             confirm_project=REVIEW_PROJECT,
             state_path=tmp_path / "private" / "state.sqlite3",
         ),
@@ -670,7 +771,7 @@ def test_appended_turn_skips_visible_history_and_imports_only_the_append(
 
     second_apply = apply_review(
         ReviewApplyConfig(
-            plan_id=second_plan.plan_id[:12],
+            plan_id=second_plan.plan_id[:32],
             confirm_project=REVIEW_PROJECT,
             state_path=tmp_path / "private" / "state.sqlite3",
         ),
@@ -688,7 +789,7 @@ def test_appended_turn_skips_visible_history_and_imports_only_the_append(
     assert status.conflicted == 0
 
 
-def test_each_whole_session_is_preflighted_before_its_first_upload(
+def test_entire_cohort_is_preflighted_before_its_first_upload(
     tmp_path: Path,
     session_payload: Callable[..., dict[str, Any]],
     atif_wrapper: Callable[..., dict[str, Any]],
@@ -710,7 +811,7 @@ def test_each_whole_session_is_preflighted_before_its_first_upload(
     with pytest.raises(ReviewMirrorError, match="sealed review turn changed"):
         apply_review(
             ReviewApplyConfig(
-                plan_id=preview.plan_id[:12],
+                plan_id=preview.plan_id[:32],
                 confirm_project=REVIEW_PROJECT,
                 state_path=tmp_path / "private" / "state.sqlite3",
                 max_sessions=2,
@@ -718,37 +819,192 @@ def test_each_whole_session_is_preflighted_before_its_first_upload(
             hivemind=client,  # type: ignore[arg-type]
             sink_factory=FakeSink,
         )
-    assert len(FakeSink.instances) == 1
-    assert FakeSink.instances[0].published == 1
-    assert FakeSink.instances[0].submitted == 1
-    assert FakeSink.instances[0].events == [
-        "start",
-        "publish",
-        "submit",
-        "finish",
-        "verify",
-    ]
+    assert FakeSink.instances == []
     with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
         status = state.status(REVIEW_PROJECT)
-        plan = state.resolve_plan(preview.plan_id[:12])
-        assert plan is not None and plan.status == "blocked"
-        assert status.visible == 1
-        assert status.conflicted == 1
+        saved_plan = state.resolve_plan(preview.plan_id[:32])
+    assert saved_plan is not None and saved_plan.status == "blocked"
+    assert status.visible == 0
+    assert status.conflicted == 1
 
-    # The deterministic source conflict is durable; apply does not retry either
-    # the visible root or the changed session on a later invocation.
-    with pytest.raises(ReviewMirrorError, match="cohort is blocked"):
+
+def test_changed_login_must_own_the_complete_sealed_session_universe(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=2)
+    preview = _preview(tmp_path, client)
+    client.fetches.clear()
+    client.user_id = "another-authenticated-account"
+    removed = client.sessions.pop()
+    client.transcripts.pop(str(removed["id"]))
+
+    with pytest.raises(ReviewMirrorConflictError, match="source universe"):
         apply_review(
             ReviewApplyConfig(
-                plan_id=preview.plan_id[:12],
+                plan_id=preview.plan_id[:32],
                 confirm_project=REVIEW_PROJECT,
                 state_path=tmp_path / "private" / "state.sqlite3",
-                max_sessions=2,
+                max_sessions=1,
             ),
             hivemind=client,  # type: ignore[arg-type]
             sink_factory=FakeSink,
         )
-    assert len(FakeSink.instances) == 1
+
+    assert FakeSink.instances == []
+    assert client.fetches == []
+
+
+def test_changed_account_label_with_the_exact_source_universe_is_allowed(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    preview = _preview(tmp_path, client)
+    client.user_id = "renamed-authenticated-account"
+
+    report = apply_review(
+        ReviewApplyConfig(
+            plan_id=preview.plan_id[:32],
+            confirm_project=REVIEW_PROJECT,
+            state_path=tmp_path / "private" / "state.sqlite3",
+            max_sessions=1,
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        sink_factory=FakeSink,
+    )
+
+    assert report.visible_turns == 1
+
+
+def test_unrelated_legacy_source_coordinates_do_not_block_a_sealed_plan(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    preview = _preview(tmp_path, client)
+    client.sessions.append(
+        session_payload(
+            id="legacy-AliceJohnson",
+            parent_session_id="child-JohnSmith",
+            started_at="2026-01-01T00:00:00Z",
+            last_activity_at="2026-01-01T00:01:00Z",
+        )
+    )
+
+    report = apply_review(
+        ReviewApplyConfig(
+            plan_id=preview.plan_id[:32],
+            confirm_project=REVIEW_PROJECT,
+            state_path=tmp_path / "private" / "state.sqlite3",
+            max_sessions=1,
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        sink_factory=FakeSink,
+    )
+
+    assert report.visible_turns == 1
+
+
+def test_tampered_valid_session_and_certificates_cannot_reuse_a_plan_id(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    original_client = _client(session_payload, atif_wrapper)
+    original = _preview(tmp_path / "original", original_client)
+
+    replacement_client = _client(session_payload, atif_wrapper)
+    old_session_id = str(replacement_client.sessions[0]["id"])
+    replacement_session_id = "33333333-3333-4333-8333-333333333333"
+    replacement_client.sessions[0]["id"] = replacement_session_id
+    replacement_transcript = replacement_client.transcripts.pop(old_session_id)
+    replacement_transcript["session_id"] = replacement_session_id
+    replacement_client.transcripts[replacement_session_id] = replacement_transcript
+    replacement = _preview(tmp_path / "replacement", replacement_client)
+    with ReviewStateStore(
+        tmp_path / "replacement" / "private" / "state.sqlite3"
+    ) as replacement_state:
+        replacement_session = replacement_state.get_sessions(replacement.plan_id)[0]
+        replacement_turn = replacement_state.get_turns(replacement.plan_id)[0]
+    replacement_client.fetches.clear()
+
+    state_path = tmp_path / "original" / "private" / "state.sqlite3"
+    with sqlite3.connect(state_path) as database:
+        immutable_triggers = database.execute(
+            """
+            SELECT name, sql
+            FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name IN ('review_plan_sessions_immutable', 'review_plan_turns_immutable')
+            ORDER BY name
+            """
+        ).fetchall()
+        assert len(immutable_triggers) == 2
+        database.execute("DROP TRIGGER review_plan_sessions_immutable")
+        database.execute("DROP TRIGGER review_plan_turns_immutable")
+        database.execute(
+            """
+            UPDATE review_plan_sessions
+            SET session_id = ?, started_at = ?, last_activity_at = ?
+            WHERE plan_id = ?
+            """,
+            (
+                replacement_session.session_id,
+                isoformat_z(replacement_session.started_at),
+                isoformat_z(replacement_session.last_activity_at),
+                original.plan_id,
+            ),
+        )
+        database.execute(
+            """
+            UPDATE review_plan_turns
+            SET session_id = ?, ordinal = ?, turn_key = ?, source_payload_sha256 = ?,
+                manifest_sha256 = ?, index_sha256 = ?, logical_key = ?,
+                preview_signature = ?, started_at = ?, ended_at = ?, manifest_bytes = ?,
+                chunk_count = ?, max_chunk_bytes = ?, index_bytes = ?, atif_schema_version = ?
+            WHERE plan_id = ?
+            """,
+            (
+                replacement_turn.session_id,
+                replacement_turn.ordinal,
+                replacement_turn.turn_key,
+                replacement_turn.source_payload_sha256,
+                replacement_turn.manifest_sha256,
+                replacement_turn.index_sha256,
+                replacement_turn.logical_key,
+                replacement_turn.preview_signature,
+                isoformat_z(replacement_turn.started_at),
+                isoformat_z(replacement_turn.ended_at),
+                replacement_turn.manifest_bytes,
+                replacement_turn.chunk_count,
+                replacement_turn.max_chunk_bytes,
+                replacement_turn.index_bytes,
+                replacement_turn.atif_schema_version,
+                original.plan_id,
+            ),
+        )
+        for _name, sql in immutable_triggers:
+            assert isinstance(sql, str)
+            database.execute(sql)
+
+    with pytest.raises(ReviewMirrorConflictError, match="immutable evidence"):
+        apply_review(
+            ReviewApplyConfig(
+                plan_id=original.plan_id[:32],
+                confirm_project=REVIEW_PROJECT,
+                state_path=state_path,
+                max_sessions=1,
+            ),
+            hivemind=replacement_client,  # type: ignore[arg-type]
+            sink_factory=FakeSink,
+        )
+
+    assert replacement_client.fetches == []
+    assert FakeSink.instances == []
 
 
 def test_turn_n_transport_preflight_failure_uploads_zero_from_its_session(
@@ -794,7 +1050,7 @@ def test_turn_n_transport_preflight_failure_uploads_zero_from_its_session(
     with pytest.raises(ReviewMirrorConflictError, match="deterministic apply preflight"):
         apply_review(
             ReviewApplyConfig(
-                plan_id=preview.plan_id[:12],
+                plan_id=preview.plan_id[:32],
                 confirm_project=REVIEW_PROJECT,
                 state_path=tmp_path / "private" / "state.sqlite3",
             ),
@@ -826,7 +1082,7 @@ def test_manifest_error_during_apply_preflight_durably_blocks_without_upload(
     with pytest.raises(ReviewMirrorConflictError, match="deterministic apply preflight"):
         apply_review(
             ReviewApplyConfig(
-                plan_id=preview.plan_id[:12],
+                plan_id=preview.plan_id[:32],
                 confirm_project=REVIEW_PROJECT,
                 state_path=tmp_path / "private" / "state.sqlite3",
             ),
@@ -854,7 +1110,7 @@ def test_publication_mismatch_stops_before_root_submission(
     with pytest.raises(ReviewMirrorConflictError, match="sealed turn certificate"):
         apply_review(
             ReviewApplyConfig(
-                plan_id=preview.plan_id[:12],
+                plan_id=preview.plan_id[:32],
                 confirm_project=REVIEW_PROJECT,
                 state_path=tmp_path / "private" / "state.sqlite3",
             ),
@@ -866,7 +1122,7 @@ def test_publication_mismatch_stops_before_root_submission(
     assert FakeSink.instances[0].events == ["start", "publish", "finish"]
     with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
         assert state.status(REVIEW_PROJECT).conflicted == 1
-        plan = state.resolve_plan(preview.plan_id[:12])
+        plan = state.resolve_plan(preview.plan_id[:32])
         assert plan is not None and plan.status == "blocked"
 
 
@@ -891,7 +1147,7 @@ def test_malicious_remote_ids_conflict_without_reaching_sqlite(
     with pytest.raises(ReviewMirrorConflictError, match="malformed identity evidence"):
         apply_review(
             ReviewApplyConfig(
-                plan_id=preview.plan_id[:12],
+                plan_id=preview.plan_id[:32],
                 confirm_project=REVIEW_PROJECT,
                 state_path=state_path,
             ),
@@ -934,7 +1190,7 @@ def test_zero_turn_preflight_conflict_cannot_be_unblocked_by_root_reconcile(
     with pytest.raises(ReviewMirrorConflictError, match="sealed review turn changed"):
         apply_review(
             ReviewApplyConfig(
-                plan_id=preview.plan_id[:12],
+                plan_id=preview.plan_id[:32],
                 confirm_project=REVIEW_PROJECT,
                 state_path=tmp_path / "private" / "state.sqlite3",
             ),
@@ -945,7 +1201,7 @@ def test_zero_turn_preflight_conflict_cannot_be_unblocked_by_root_reconcile(
 
     report = reconcile_review(
         ReviewReconcileConfig(
-            plan_id=preview.plan_id[:12],
+            plan_id=preview.plan_id[:32],
             state_path=tmp_path / "private" / "state.sqlite3",
         ),
         sink_factory=FakeSink,
@@ -1007,21 +1263,27 @@ def test_name_like_parent_coordinate_never_reaches_state(
     assert not state_path.exists()
 
 
-@pytest.mark.parametrize("unsafe_user_id", ["AliceJohnson", "alice@example.com", "review-user"])
-def test_low_entropy_principal_is_never_hashed_into_state(
+@pytest.mark.parametrize("account_label", ["AliceJohnson", "alice@example.com", "review-user"])
+def test_account_identity_is_never_hashed_or_persisted(
     tmp_path: Path,
     session_payload: Callable[..., dict[str, Any]],
     atif_wrapper: Callable[..., dict[str, Any]],
-    unsafe_user_id: str,
+    account_label: str,
 ) -> None:
     client = _client(session_payload, atif_wrapper)
-    client.user_id = unsafe_user_id
+    client.user_id = account_label
+    client.sessions[0]["username"] = account_label
     state_path = tmp_path / "private" / "state.sqlite3"
 
-    with pytest.raises(ReviewMirrorError, match="opaque authenticated identity"):
-        _preview(tmp_path, client)
+    report = _preview(tmp_path, client)
 
-    assert not state_path.exists()
+    assert report.selected_sessions == 1
+    raw = state_path.read_bytes()
+    assert account_label.encode() not in raw
+    assert hashlib.sha256(account_label.encode()).hexdigest().encode() not in raw
+    legacy_digest = hashlib.sha256(f"hivemind-user-v1\0{account_label}".encode()).hexdigest()
+    assert legacy_digest.encode() not in raw
+    assert account_label not in report.render()
 
 
 def test_ambiguous_root_pauses_and_reconcile_never_resubmits(
@@ -1032,7 +1294,7 @@ def test_ambiguous_root_pauses_and_reconcile_never_resubmits(
     client = _client(session_payload, atif_wrapper)
     preview = _preview(tmp_path, client)
     apply_config = ReviewApplyConfig(
-        plan_id=preview.plan_id[:12],
+        plan_id=preview.plan_id[:32],
         confirm_project=REVIEW_PROJECT,
         state_path=tmp_path / "private" / "state.sqlite3",
         max_sessions=1,
@@ -1060,7 +1322,7 @@ def test_ambiguous_root_pauses_and_reconcile_never_resubmits(
     FakeSink.fail_root = False
     unresolved = reconcile_review(
         ReviewReconcileConfig(
-            plan_id=preview.plan_id[:12],
+            plan_id=preview.plan_id[:32],
             state_path=apply_config.state_path,
         ),
         sink_factory=FakeSink,
@@ -1072,7 +1334,7 @@ def test_ambiguous_root_pauses_and_reconcile_never_resubmits(
     FakeSink.reconcile_matches = 1
     reconciled = reconcile_review(
         ReviewReconcileConfig(
-            plan_id=preview.plan_id[:12],
+            plan_id=preview.plan_id[:32],
             state_path=apply_config.state_path,
         ),
         sink_factory=FakeSink,
@@ -1102,7 +1364,7 @@ def test_exact_remote_verification_can_resolve_an_ambiguous_flush(
 
     report = apply_review(
         ReviewApplyConfig(
-            plan_id=preview.plan_id[:12],
+            plan_id=preview.plan_id[:32],
             confirm_project=REVIEW_PROJECT,
             state_path=tmp_path / "private" / "state.sqlite3",
         ),
@@ -1206,7 +1468,7 @@ def test_apply_releases_one_preflighted_session_before_loading_the_next(
     monkeypatch.setattr(review_module, "_prepare_cohort", tracked_prepare)
     report = apply_review(
         ReviewApplyConfig(
-            plan_id=preview.plan_id[:12],
+            plan_id=preview.plan_id[:32],
             confirm_project=REVIEW_PROJECT,
             state_path=tmp_path / "private" / "state.sqlite3",
             max_sessions=3,

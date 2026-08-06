@@ -37,13 +37,16 @@ _LEDGER_STATES = frozenset(
         "conflict",
     }
 )
+REVIEW_SOURCE_SCOPE_SHA256 = hashlib.sha256(
+    b"hivemind-review-authenticated-session-certificates-v1"
+).hexdigest()
 
 
 @dataclass(frozen=True)
 class ReviewPlan:
     plan_id: str
     project: str
-    source_principal_sha256: str
+    source_scope_sha256: str
     since_utc: datetime
     until_utc: datetime
     timezone_name: str
@@ -234,10 +237,13 @@ class ReviewStateStore:
         until = _timestamp(row["until_utc"], label="plan end")
         if since >= until:
             raise StateConflictError("saved review plan window is malformed")
+        source_scope_sha256 = str(row["source_principal_sha256"])
+        if source_scope_sha256 != REVIEW_SOURCE_SCOPE_SHA256:
+            raise StateConflictError("saved review source scope is malformed")
         return ReviewPlan(
             plan_id=str(row["plan_id"]),
             project=str(row["project"]),
-            source_principal_sha256=str(row["source_principal_sha256"]),
+            source_scope_sha256=source_scope_sha256,
             since_utc=since,
             until_utc=until,
             timezone_name=str(row["timezone_name"]),
@@ -426,9 +432,10 @@ class ReviewStateStore:
         filters: list[tuple[str, str]],
         turns: list[ReviewTurnCertificate],
     ) -> ReviewPlan:
-        if not all(
-            _SHA256.fullmatch(value)
-            for value in (plan.plan_id, plan.source_principal_sha256, plan.universe_sha256)
+        if (
+            not _SHA256.fullmatch(plan.plan_id)
+            or plan.source_scope_sha256 != REVIEW_SOURCE_SCOPE_SHA256
+            or not _SHA256.fullmatch(plan.universe_sha256)
         ):
             raise StateConflictError("review plan identity is malformed")
         if plan.status not in {"planned", "completed"} or plan.selector not in {
@@ -489,7 +496,7 @@ class ReviewStateStore:
             expected_plan_identity = (
                 plan.plan_id,
                 plan.project,
-                plan.source_principal_sha256,
+                plan.source_scope_sha256,
                 plan.since_utc,
                 plan.until_utc,
                 plan.timezone_name,
@@ -504,7 +511,7 @@ class ReviewStateStore:
             saved_plan_identity = (
                 existing.plan_id,
                 existing.project,
-                existing.source_principal_sha256,
+                existing.source_scope_sha256,
                 existing.since_utc,
                 existing.until_utc,
                 existing.timezone_name,
@@ -550,7 +557,7 @@ class ReviewStateStore:
                 (
                     plan.plan_id,
                     plan.project,
-                    plan.source_principal_sha256,
+                    plan.source_scope_sha256,
                     isoformat_z(plan.since_utc),
                     isoformat_z(plan.until_utc),
                     plan.timezone_name,

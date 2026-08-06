@@ -13,7 +13,7 @@ dependencies = [
   "presidio-analyzer==2.2.357",
   "presidio-anonymizer==2.2.357",
   "spacy==3.8.14",
-  "weave[presidio] @ git+https://github.com/wandb/weave.git@eaf0a27beffd13f90d4ec64547c53a37df4bdb94",
+  "weave[presidio] @ git+https://github.com/wandb/weave.git@0b58f67e1539bfaa2c705e35bed2d9896a319c6a",
 ]
 
 [project.scripts]

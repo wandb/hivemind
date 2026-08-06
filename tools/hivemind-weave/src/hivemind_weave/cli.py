@@ -41,6 +41,17 @@ from .scheduled_sync import (
 )
 from .utils import isoformat_z
 
+_CANONICAL_BACKFILL_DISABLED = (
+    "canonical backfill preview/apply is disabled in this experimental build; "
+    "discard all pre-0.4 experimental state and use the explicitly noncanonical "
+    "review workflow"
+)
+_CANONICAL_SYNC_DISABLED = (
+    "canonical scheduled sync, scheduler authentication, status, and reconciliation "
+    "are disabled in this experimental build; unload any previously installed "
+    "LaunchAgent and do not reuse pre-0.4 experimental state"
+)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -84,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill_parser = subparsers.add_parser(
         "backfill",
-        help="preview or apply a sealed date-based micro-cohort plan",
+        help="canonical historical backfill (disabled in this experimental build)",
     )
     backfill_parser.add_argument(
         "--project",
@@ -221,7 +232,10 @@ def build_parser() -> argparse.ArgumentParser:
     review_reconcile.add_argument("--plan", dest="plan_id", required=True)
     review_reconcile.add_argument("--state-path", type=Path, default=review_state_default)
 
-    auth_parser = subparsers.add_parser("auth", help="manage scheduler authentication")
+    auth_parser = subparsers.add_parser(
+        "auth",
+        help="canonical scheduler authentication (disabled in this experimental build)",
+    )
     auth_subparsers = auth_parser.add_subparsers(dest="auth_backend", required=True)
     keychain_parser = auth_subparsers.add_parser(
         "keychain", help="manage the project-scoped macOS Keychain item"
@@ -231,7 +245,10 @@ def build_parser() -> argparse.ArgumentParser:
     keychain_set.add_argument("--project", required=True)
 
     default_sync_paths = SyncPaths.defaults()
-    sync_parser = subparsers.add_parser("sync", help="configure and run incremental sync")
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="canonical incremental sync (disabled in this experimental build)",
+    )
     sync_subparsers = sync_parser.add_subparsers(dest="sync_command", required=True)
     sync_configure = sync_subparsers.add_parser(
         "configure", help="save a secret-free incremental discovery policy"
@@ -282,7 +299,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     reconcile_parser = subparsers.add_parser(
-        "reconcile", help="clear attention only from committed private turn evidence"
+        "reconcile",
+        help="canonical sync reconciliation (disabled in this experimental build)",
     )
     reconcile_parser.add_argument(
         "--config",
@@ -317,6 +335,11 @@ def main(argv: list[str] | None = None) -> int:
             report = run_import(config)
             rendered = report.render(dry_run=args.dry_run)
         elif args.command == "backfill":
+            # Fail before project validation, HiveMind authentication/discovery, or
+            # opening SQLite. The unreleased canonical planner previously derived a
+            # durable plan binding from an account label, so none of its state may be
+            # created or reused through the public CLI.
+            raise ValueError(_CANONICAL_BACKFILL_DISABLED)
             if args.preview == bool(args.plan_id):
                 raise ValueError("backfill requires exactly one of --preview or --plan")
             if args.preview:
@@ -393,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
                         repositories=tuple(args.repo),
                         session_ids=tuple(args.session_id),
                         exclude_subagents=args.exclude_subagents,
+                        progress=lambda message: print(message, flush=True),
                     )
                 )
                 rendered = report.render()
@@ -430,12 +454,20 @@ def main(argv: list[str] | None = None) -> int:
             else:  # pragma: no cover - guarded by argparse.
                 parser.error("a review command is required")
         elif args.command == "auth":
+            # This credential exists only for the disabled canonical scheduler.
+            # Reject before prompting for, reading, or mutating a Keychain item.
+            raise ValueError(_CANONICAL_SYNC_DISABLED)
             if args.auth_backend != "keychain" or args.keychain_command != "set":
                 parser.error("an auth keychain command is required")
             set_project_keychain_secret(args.project)
             print(f"Keychain credential stored for project: {args.project}")
             return 0
         elif args.command == "sync":
+            # The prior status implementation was not purely observational: it
+            # checked Keychain state and opened a schema-migrating StateStore.
+            # Disable every scheduler surface before config, status, SQLite,
+            # Keychain, HiveMind, plist, or launchctl access.
+            raise ValueError(_CANONICAL_SYNC_DISABLED)
             default_paths = SyncPaths.defaults()
             paths = replace(default_paths, config_path=args.config.expanduser())
             if args.sync_command == "configure":
@@ -505,6 +537,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             parser.error("a sync command is required")
         elif args.command == "reconcile":
+            # Reject before loading scheduler config or attempting evidence-backed
+            # source/Keychain/state reconciliation through the canonical planner.
+            raise ValueError(_CANONICAL_SYNC_DISABLED)
             default_paths = SyncPaths.defaults()
             paths = replace(default_paths, config_path=args.config.expanduser())
             config = load_sync_config(paths.config_path)

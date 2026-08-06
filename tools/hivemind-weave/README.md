@@ -12,6 +12,14 @@ canonical v2 import.
 > before the first synthetic apply. The abandoned partial experiment in
 > `wandb/hivemind-chats` remains read-only and is not repaired or reused.
 
+> **State reset required:** experimental SQLite state created by any unreleased
+> pre-0.4 build must be discarded according to the machine's secure local-data
+> policy. It may contain a durable hash derived from a HiveMind account label and
+> is neither migrated nor trusted by this workflow. Start 0.4 with a fresh state
+> path. The canonical `backfill --preview` and `backfill --plan` CLI paths are
+> disabled before HiveMind access or SQLite mutation; only the explicitly
+> noncanonical `review` workflow is available for this prototype.
+
 ## Fixed destination and trust boundary
 
 Every review operation is bound to:
@@ -53,11 +61,31 @@ argument or persist it in SQLite.
 This review path is manual. It does not install or use cron, LaunchAgents,
 Keychain jobs, background sync, or any other scheduler.
 
+All canonical scheduler surfaces (`auth keychain set`, `sync configure`, `sync
+once`, `sync install`, `sync status`, and top-level `reconcile`) fail closed
+before config, status, SQLite, Keychain, HiveMind, plist, or `launchctl` access.
+The former status path is disabled too because opening old SQLite state could
+perform a schema migration, so it was not safely read-only.
+
+If an earlier experimental build already installed the LaunchAgent, stop the
+fixed service without reading a config file or touching Keychain credentials:
+
+```text
+/usr/bin/id -u
+/bin/launchctl bootout gui/<UID>/com.wandb.hivemind-weave.sync
+```
+
+Replace `<UID>` with the numeric output from the first command. A “service not
+found” result means it is not loaded. This only unloads the process; it neither
+reads nor deletes the plist, SQLite state, config, status, or Keychain item.
+Keep those artifacts untouched until they can be discarded under the machine's
+approved secure local-data policy.
+
 The Weave dependency is a PEP 508 Git reference pinned to the exact companion
 prototype commit:
 
 ```text
-eaf0a27beffd13f90d4ec64547c53a37df4bdb94
+0b58f67e1539bfaa2c705e35bed2d9896a319c6a
 ```
 
 The full commit, not a moving branch or tag, must appear in both
@@ -137,7 +165,14 @@ matches; child sessions are included unless `--exclude-subagents` is present.
 first whole real session that is at least 24 hours inactive, is not a child,
 has no mapping/tool-correlation warnings, has at most three turns and four
 source spans per turn, and needs exactly one content chunk plus its index for
-each turn. It does not loosen limits to manufacture a candidate.
+each turn. When the source summary supplies `turn_count`, known values above
+three are rejected before transcript download and redaction. Summaries that
+prove more than six tool calls or more than 100,000 aggregate source tokens are
+also skipped. Missing or unfamiliar counts fall back to the complete check.
+At most 25 plausible transcripts are examined in one canary invocation; a miss
+fails with the explicit-session suggestion instead of turning a one-chat test
+into an unbounded source scan. It does not loosen limits to manufacture a
+candidate.
 
 ### Apply
 
@@ -309,19 +344,28 @@ destination and manual cohort review remain required.
 SQLite retains HiveMind's internal session ID because it is the source
 coordinate required for incremental conflict detection and transcript
 re-fetching. Review v1 accepts session and nonempty parent coordinates only as
-canonical lowercase RFC-variant UUIDv4 or UUIDv7 text. Unsupported legacy IDs,
+canonical lowercase RFC-variant UUIDv4, UUIDv5, or UUIDv7 text. Unsupported legacy IDs,
 slugs, names, uppercase encodings, and other uncontracted formats fail before a
-plan is sealed. The authenticated HiveMind principal must satisfy the same
-opaque-ID contract before its one-way plan-binding digest is calculated, so a
-username or email address cannot become a durable offline-guessable fingerprint.
+plan is sealed. UUIDv5 is name-derived, so its accepted syntax is not treated as
+proof of opacity: it is preserved only in validated source-coordinate fields,
+is scrubbed from generic chat fields, and keeps both local and remote review
+state sensitive. HiveMind account labels are used only by the CLI while it
+authenticates and are never copied or hashed into the plan. Before a cohort
+starts, apply proves that the current login can still list every sealed session
+ID with its exact start and activity timestamps. It then re-fetches and deeply
+preflights every transcript, ordering, and turn certificate in the current
+cohort before that cohort's first upload. A different login cannot silently
+substitute another session universe.
 Exact agent/repository selectors are used only in memory during preview. The
 sealed plan and SQLite retain their non-sensitive kinds and counts, never the
 raw selector values or deterministic value hashes; selected session membership
 and turn certificates provide the durable cohort evidence.
 
-Agent-native and subagent IDs are not used for refetching or idempotency. A
-canonical UUIDv4/v7 is preserved; any other value is replaced by the constant
-`[REDACTED_SOURCE_COORDINATE]`, including in nested metadata. Generic chat
+Agent-native and subagent IDs are not used for refetching or idempotency. Only
+their canonical UUIDv4/v7 values are preserved; UUIDv5 and any other value are
+replaced by the constant `[REDACTED_SOURCE_COORDINATE]`, including in nested
+metadata. UUIDv5 is allowed only for validated internal session and parent
+coordinates. Generic chat
 strings receive no broad `session-*`,
 `call-*`, or model-prefix exemption: name-like content hidden inside a technical
 shape is still scrubbed. Only independently validated UUID coordinates, ATIF

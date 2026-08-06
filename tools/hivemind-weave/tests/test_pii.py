@@ -223,6 +223,38 @@ def test_coordinate_bearing_mapping_keys_fail_closed_without_hashing_names() -> 
     assert redact_source_coordinate(source) == "[REDACTED_SOURCE_COORDINATE]"
 
 
+def test_uuid_v5_is_redacted_from_an_unvalidated_coordinate_like_mapping_key() -> None:
+    source = "11111111-1111-5111-8111-111111111111"
+
+    redacted = redact_upload_data({"session_id": source, "note": source})
+
+    assert redacted == {
+        "session_id": "[REDACTED_SOURCE_COORDINATE]",
+        "note": "[REDACTED_SOURCE_COORDINATE]",
+    }
+    assert redact_source_coordinate(source) == "[REDACTED_SOURCE_COORDINATE]"
+    assert redact_source_coordinate(source, allow_name_based=True) == source
+
+
+def test_validated_internal_uuid_v5_session_coordinates_survive_mapping(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    source = "11111111-1111-5111-8111-111111111111"
+    parent = "22222222-2222-5222-8222-222222222222"
+    mapped = map_atif(
+        Session.from_api(session_payload(id=source, parent_session_id=parent, agent_session_id="")),
+        atif_wrapper(wrapper_session_id=source),
+    )
+
+    sanitized = sanitize_mapped_conversation(mapped)
+
+    assert sanitized.conversation_id == f"hivemind:{source}"
+    assert sanitized.turns[0].attributes["hivemind.session_id"] == source
+    assert sanitized.turns[0].attributes["hivemind.parent_session_id"] == parent
+    assert sanitized.agent_id == "[REDACTED_SOURCE_COORDINATE]"
+
+
 def test_redacted_mapping_key_allocation_cannot_collide_on_a_later_pass() -> None:
     payload = {
         "[REDACTED_PII_KEY_0001]": "already redacted",

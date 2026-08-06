@@ -11,6 +11,7 @@ import pytest
 from hivemind_weave import state as state_module
 from hivemind_weave.errors import StateConflictError
 from hivemind_weave.review_state import (
+    REVIEW_SOURCE_SCOPE_SHA256,
     ReviewPlan,
     ReviewStateStore,
     ReviewTurnCertificate,
@@ -35,7 +36,7 @@ def _plan(*, status: str = "planned") -> ReviewPlan:
     return ReviewPlan(
         plan_id=PLAN_ID,
         project=PROJECT,
-        source_principal_sha256="2" * 64,
+        source_scope_sha256=REVIEW_SOURCE_SCOPE_SHA256,
         since_utc=datetime(2026, 7, 1, tzinfo=UTC),
         until_utc=datetime(2026, 8, 1, tzinfo=UTC),
         timezone_name="UTC",

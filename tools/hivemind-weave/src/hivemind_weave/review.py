@@ -17,7 +17,6 @@ from .backfill import (
     BackfillWindow,
     _filter_rows,
     _normalized_filters,
-    _principal_sha256,
     _same_session_snapshot,
     _select_sessions,
     _server_lookback_days,
@@ -41,6 +40,7 @@ from .review_manifest import (
 )
 from .review_sink import ReviewRuntime, preflight_review_bundle, preflight_review_runtime
 from .review_state import (
+    REVIEW_SOURCE_SCOPE_SHA256,
     ReviewCohort,
     ReviewLedgerTurn,
     ReviewPlan,
@@ -58,8 +58,17 @@ from .utils import isoformat_z
 
 REVIEW_PROJECT = "wandb/hivemind-chats-review"
 REVIEW_SETTLE_MINUTES = 60
-REVIEW_WEAVE_COMMIT = "eaf0a27beffd13f90d4ec64547c53a37df4bdb94"
-_PLAN_REFERENCE = re.compile(r"^[0-9a-f]{12,64}$")
+REVIEW_WEAVE_COMMIT = "0b58f67e1539bfaa2c705e35bed2d9896a319c6a"
+_CANARY_TRANSCRIPT_BUDGET = 25
+_CANARY_SUMMARY_TOKEN_BUDGET = 100_000
+_CANARY_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cached_read_tokens",
+    "cached_write_tokens",
+)
+_PLAN_REFERENCE = re.compile(r"^[0-9a-f]{32,64}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RFC3339_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$",
@@ -79,6 +88,7 @@ class ReviewPreviewConfig:
     session_ids: tuple[str, ...] = ()
     exclude_subagents: bool = False
     now: datetime | None = None
+    progress: Callable[[str], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -141,7 +151,7 @@ class ReviewReport:
         lines = [
             f"Review {self.phase}:",
             f"  project:              {self.project}",
-            f"  plan alias:           {self.plan_id[:12]}",
+            f"  plan alias:           {self.plan_id[:32]}",
             "  UTC window:           "
             f"[{isoformat_z(self.since_utc)}, {isoformat_z(self.until_utc)})",
             f"  selector:             {self.selector}",
@@ -217,14 +227,6 @@ def _validate_review_project(project: str) -> None:
             f"the noncanonical review path is restricted to {REVIEW_PROJECT}; "
             "canonical projects are forbidden"
         )
-
-
-def _review_principal_sha256(user_id: object) -> str:
-    """Bind a plan only to an authenticated, opaque HiveMind principal ID."""
-    if not is_opaque_source_coordinate(user_id):
-        raise ReviewMirrorError("HiveMind did not expose a supported opaque authenticated identity")
-    assert isinstance(user_id, str)
-    return _principal_sha256(user_id)
 
 
 def _require_opaque_session_id(session_id: object) -> None:
@@ -357,23 +359,47 @@ def _plan_hash_payload(
     *,
     config: ReviewPreviewConfig,
     window: BackfillWindow,
-    principal_sha256: str,
     universe_sha256: str,
     filters: dict[str, Any],
+    sessions: list[tuple[str, datetime, datetime]],
+    certificate_payloads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return _sealed_plan_hash_payload(
+        project=config.project,
+        since_utc=window.since_utc,
+        until_utc=window.until_utc,
+        timezone_name=window.timezone_name,
+        selector="canary" if config.canary else "backlog",
+        universe_sha256=universe_sha256,
+        filter_summary=review_filter_summary(_filter_rows(filters)),
+        sessions=sessions,
+        certificate_payloads=certificate_payloads,
+    )
+
+
+def _sealed_plan_hash_payload(
+    *,
+    project: str,
+    since_utc: datetime,
+    until_utc: datetime,
+    timezone_name: str,
+    selector: str,
+    universe_sha256: str,
+    filter_summary: list[tuple[str, str]],
     sessions: list[tuple[str, datetime, datetime]],
     certificate_payloads: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
         "importer_version": __version__,
         "weave_commit": REVIEW_WEAVE_COMMIT,
-        "project": config.project,
-        "source_principal_sha256": principal_sha256,
-        "since_utc": isoformat_z(window.since_utc),
-        "until_utc": isoformat_z(window.until_utc),
-        "timezone_name": window.timezone_name,
-        "selector": "canary" if config.canary else "backlog",
+        "project": project,
+        "source_scope_sha256": REVIEW_SOURCE_SCOPE_SHA256,
+        "since_utc": isoformat_z(since_utc),
+        "until_utc": isoformat_z(until_utc),
+        "timezone_name": timezone_name,
+        "selector": selector,
         "settle_seconds": REVIEW_SETTLE_MINUTES * 60,
-        "filter_summary": review_filter_summary(_filter_rows(filters)),
+        "filter_summary": filter_summary,
         "universe_sha256": universe_sha256,
         "sessions": [
             {
@@ -386,6 +412,50 @@ def _plan_hash_payload(
         ],
         "turn_certificates": certificate_payloads,
     }
+
+
+def _saved_certificate_payload(item: ReviewTurnCertificate) -> dict[str, Any]:
+    return {
+        "session_id": item.session_id,
+        "ordinal": item.ordinal,
+        "turn_key": item.turn_key,
+        "source_payload_sha256": item.source_payload_sha256,
+        "manifest_sha256": item.manifest_sha256,
+        "index_sha256": item.index_sha256,
+        "logical_key": item.logical_key,
+        "preview_signature": item.preview_signature,
+        "started_at": item.started_at,
+        "ended_at": item.ended_at,
+        "manifest_bytes": item.manifest_bytes,
+        "chunk_count": item.chunk_count,
+        "max_chunk_bytes": item.max_chunk_bytes,
+        "index_bytes": item.index_bytes,
+        "atif_schema_version": item.atif_schema_version,
+    }
+
+
+def _assert_sealed_plan_identity(state: ReviewStateStore, plan: ReviewPlan) -> None:
+    sessions = state.get_sessions(plan.plan_id)
+    turns = state.get_turns(plan.plan_id)
+    expected_plan_id = review_plan_id(
+        _sealed_plan_hash_payload(
+            project=plan.project,
+            since_utc=plan.since_utc,
+            until_utc=plan.until_utc,
+            timezone_name=plan.timezone_name,
+            selector=plan.selector,
+            universe_sha256=plan.universe_sha256,
+            filter_summary=state.get_filters(plan.plan_id),
+            sessions=[
+                (item.session_id, item.started_at, item.last_activity_at) for item in sessions
+            ],
+            certificate_payloads=[_saved_certificate_payload(item) for item in turns],
+        )
+    )
+    if expected_plan_id != plan.plan_id or len(sessions) != plan.selected_count:
+        raise ReviewMirrorConflictError(
+            "sealed review plan identity does not match its immutable evidence"
+        )
 
 
 def _empty_report_stats() -> dict[str, int]:
@@ -428,6 +498,20 @@ def _accumulate_bundle_stats(
         stats["manifests_gt_64m"] += 1
 
 
+def _canary_summary_cannot_fit(raw: dict[str, Any]) -> bool:
+    """Reject only explicit summary values outside the strict canary budget."""
+    turn_count = raw.get("turn_count")
+    if type(turn_count) is int and turn_count > 3:
+        return True
+    tool_call_count = raw.get("tool_call_count")
+    if type(tool_call_count) is int and tool_call_count > 6:
+        return True
+    token_values = [raw.get(key) for key in _CANARY_TOKEN_FIELDS]
+    if all(type(value) is int and value >= 0 for value in token_values):
+        return sum(token_values) > _CANARY_SUMMARY_TOKEN_BUDGET
+    return False
+
+
 def preview_review(
     config: ReviewPreviewConfig,
     *,
@@ -467,11 +551,20 @@ def preview_review(
             raise ValueError("--session-id must be an opaque HiveMind machine identifier")
     client = hivemind or HiveMindClient()
     client.preflight()
-    principal_sha256 = _review_principal_sha256(client.user_id)
     raw_sessions = client.list_sessions(
         days=_server_lookback_days(window, captured_now),
         include_subagents=True,
     )
+    # Current HiveMind summaries expose a cheap aggregate turn count. Use it
+    # only to reject sessions that cannot satisfy the strict canary bound; a
+    # missing or unfamiliar value falls back to the complete transcript check.
+    # This keeps a one-chat canary from first downloading/redacting a known
+    # many-turn transcript while preserving tolerant compatibility.
+    summaries_by_id: dict[str, dict[str, Any]] = {}
+    for raw in raw_sessions:
+        raw_id = raw.get("id")
+        if isinstance(raw_id, str):
+            summaries_by_id[raw_id] = raw
     selection = _select_sessions(
         raw_sessions,
         window=window,
@@ -492,11 +585,39 @@ def preview_review(
     certificate_payloads: list[dict[str, Any]] = []
     stats = _empty_report_stats()
     if config.canary:
+        plausible_count = sum(
+            1
+            for session in selection.sessions
+            if captured_now - session.last_activity_at >= timedelta(hours=24)
+            and not session.parent_session_id
+            and not (
+                (summary := summaries_by_id.get(session.id)) is not None
+                and _canary_summary_cannot_fit(summary)
+            )
+        )
+        if config.progress is not None:
+            config.progress(
+                "Canary summary preflight: "
+                f"{plausible_count} plausible session(s); "
+                f"at most {_CANARY_TRANSCRIPT_BUDGET} transcript(s) will be examined"
+            )
+        examined_transcripts = 0
         for session in selection.sessions:
             if captured_now - session.last_activity_at < timedelta(hours=24):
                 continue
             if session.parent_session_id:
                 continue
+            summary = summaries_by_id.get(session.id)
+            if summary is not None and _canary_summary_cannot_fit(summary):
+                continue
+            if examined_transcripts >= _CANARY_TRANSCRIPT_BUDGET:
+                break
+            examined_transcripts += 1
+            if config.progress is not None:
+                config.progress(
+                    "Canary transcript preflight: "
+                    f"{examined_transcripts}/{min(plausible_count, _CANARY_TRANSCRIPT_BUDGET)}"
+                )
             try:
                 prepared = _prepare_session(client, session, runtime=runtime)
             except (ReviewMirrorError, ATIFSchemaError, ReviewManifestError):
@@ -523,8 +644,8 @@ def preview_review(
             del prepared
         if not selected_sessions:
             raise ReviewMirrorError(
-                "no session qualified for the deterministic review canary; use an exact "
-                "--session-id after inspecting the source"
+                "no session qualified within the bounded deterministic review canary; "
+                "use an exact --session-id after inspecting the source"
             )
     else:
         for session in selection.sessions:
@@ -551,7 +672,6 @@ def preview_review(
         _plan_hash_payload(
             config=config,
             window=window,
-            principal_sha256=principal_sha256,
             universe_sha256=selection.universe_sha256,
             filters=filters,
             sessions=selected_sessions,
@@ -563,7 +683,7 @@ def preview_review(
     expected_plan = ReviewPlan(
         plan_id=plan_id,
         project=config.project,
-        source_principal_sha256=principal_sha256,
+        source_scope_sha256=REVIEW_SOURCE_SCOPE_SHA256,
         since_utc=window.since_utc,
         until_utc=window.until_utc,
         timezone_name=window.timezone_name,
@@ -684,6 +804,49 @@ def _prepare_cohort(
             )
         )
     return prepared
+
+
+def _assert_plan_source_universe_access(
+    client: HiveMindClient,
+    planned_sessions: list[ReviewPlanSession],
+) -> None:
+    """Prove the active login still owns every sealed session summary."""
+    planned_ids = {item.session_id for item in planned_sessions}
+    observed_by_id: dict[str, Session] = {}
+    try:
+        raw_sessions = client.list_sessions(days=365, include_subagents=True)
+        for raw in raw_sessions:
+            # The proof concerns only the immutable sessions in this plan. An
+            # unrelated legacy coordinate elsewhere in the account must not
+            # prevent a valid sealed cohort from being applied.
+            raw_id = raw.get("id")
+            if not isinstance(raw_id, str) or raw_id not in planned_ids:
+                continue
+            observed = Session.from_api(raw)
+            _validate_session_coordinates(observed)
+            previous = observed_by_id.get(observed.id)
+            if previous is not None and previous != observed:
+                raise ReviewMirrorConflictError(
+                    "HiveMind returned inconsistent source-universe evidence"
+                )
+            observed_by_id[observed.id] = observed
+    except ReviewMirrorConflictError:
+        raise
+    except Exception as error:
+        raise ReviewMirrorConflictError(
+            "the authenticated HiveMind source universe could not be verified"
+        ) from error
+
+    for planned in planned_sessions:
+        observed = observed_by_id.get(planned.session_id)
+        if (
+            observed is None
+            or observed.started_at != planned.started_at
+            or observed.last_activity_at != planned.last_activity_at
+        ):
+            raise ReviewMirrorConflictError(
+                "the authenticated HiveMind source universe does not match the sealed plan"
+            )
 
 
 def _publication_evidence(publication: Any) -> dict[str, Any]:
@@ -1019,7 +1182,7 @@ def apply_review(
     """Apply at most ``max_sessions`` whole sessions from one sealed plan."""
     _validate_review_project(config.confirm_project)
     if not _PLAN_REFERENCE.fullmatch(config.plan_id):
-        raise ValueError("review plan reference must be 12 to 64 lowercase hex characters")
+        raise ValueError("review plan reference must be 32 to 64 lowercase hex characters")
     if not 1 <= config.max_sessions <= 10_000:
         raise ValueError("--max-sessions must be between 1 and 10000")
     # Do not turn a machine-level SDK/provenance problem into a durable source
@@ -1033,6 +1196,8 @@ def apply_review(
             raise ReviewMirrorError("review plan was not found in private state")
         if plan.project != config.confirm_project:
             raise ReviewMirrorError("--confirm-project does not match the sealed review plan")
+        _assert_sealed_plan_identity(state, plan)
+        plan_sessions = state.get_sessions(plan.plan_id)
         cohort = state.get_or_create_cohort(plan.plan_id, config.max_sessions)
         if cohort is None:
             completed, remaining = state.progress(plan.plan_id)
@@ -1057,8 +1222,7 @@ def apply_review(
         )
 
         client.preflight()
-        if _review_principal_sha256(client.user_id) != plan.source_principal_sha256:
-            raise ReviewMirrorError("HiveMind identity does not match the sealed review plan")
+        _assert_plan_source_universe_access(client, plan_sessions)
         cohort = state.begin_cohort(cohort)
         expected_by_session: dict[str, list[ReviewTurnCertificate]] = {
             planned.session_id: [] for planned in cohort_sessions
@@ -1071,6 +1235,27 @@ def apply_review(
         conflicts = 0
         sink: Any | None = None
         try:
+            # Prove source access and every immutable certificate across the
+            # complete cohort before the first sink or hosted object exists.
+            # Re-fetch one session at a time to keep peak memory bounded.
+            for planned in cohort_sessions:
+                try:
+                    checked = _prepare_cohort(
+                        client=client,
+                        plan=plan,
+                        cohort_sessions=[planned],
+                        expected_turns=expected_by_session[planned.session_id],
+                        runtime=runtime,
+                    )[0]
+                except _CohortPreflightConflict as error:
+                    conflicts += _mark_session_preflight_conflict(
+                        state,
+                        project=plan.project,
+                        session_id=error.session_id,
+                        expected_turns=expected_by_session[planned.session_id],
+                    )
+                    raise
+                del checked
             for planned in cohort_sessions:
                 # Bound peak memory to one source transcript.  Every turn in this
                 # session is mapped, redacted, serialized, and certificate-checked
@@ -1219,13 +1404,14 @@ def reconcile_review(
     """Resolve ambiguous roots by exact read-only Agents queries; never retry them."""
     _validate_review_project(REVIEW_PROJECT)
     if not _PLAN_REFERENCE.fullmatch(config.plan_id):
-        raise ValueError("review plan reference must be 12 to 64 lowercase hex characters")
+        raise ValueError("review plan reference must be 32 to 64 lowercase hex characters")
     with ReviewStateStore(config.state_path) as state:
         plan = state.resolve_plan(config.plan_id)
         if plan is None:
             raise ReviewMirrorError("review plan was not found in private state")
         if plan.project != REVIEW_PROJECT:
             raise ReviewMirrorError("sealed review plan does not target the fixed review project")
+        _assert_sealed_plan_identity(state, plan)
         pending = state.reconcilable_turns(plan.plan_id)
         uncertain = 0
         conflicts = 0

@@ -503,7 +503,7 @@ requires-dist = [
     { name = "presidio-analyzer", specifier = "==2.2.357" },
     { name = "presidio-anonymizer", specifier = "==2.2.357" },
     { name = "spacy", specifier = "==3.8.14" },
-    { name = "weave", extras = ["presidio"], git = "https://github.com/wandb/weave.git?rev=eaf0a27beffd13f90d4ec64547c53a37df4bdb94" },
+    { name = "weave", extras = ["presidio"], git = "https://github.com/wandb/weave.git?rev=0b58f67e1539bfaa2c705e35bed2d9896a319c6a" },
 ]
 
 [package.metadata.requires-dev]
@@ -1777,7 +1777,7 @@ wheels = [
 [[package]]
 name = "weave"
 version = "0.53.5.dev0"
-source = { git = "https://github.com/wandb/weave.git?rev=eaf0a27beffd13f90d4ec64547c53a37df4bdb94#eaf0a27beffd13f90d4ec64547c53a37df4bdb94" }
+source = { git = "https://github.com/wandb/weave.git?rev=0b58f67e1539bfaa2c705e35bed2d9896a319c6a#0b58f67e1539bfaa2c705e35bed2d9896a319c6a" }
 dependencies = [
     { name = "cachetools" },
     { name = "click" },

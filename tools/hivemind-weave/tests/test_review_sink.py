@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import json
 import os
 import subprocess
@@ -678,8 +679,8 @@ def test_real_sdk_requires_pep610_proof_of_exact_companion_commit(
         "url": "https://github.com/wandb/weave.git",
         "vcs_info": {
             "vcs": "git",
-            "commit_id": "eaf0a27beffd13f90d4ec64547c53a37df4bdb94",
-            "requested_revision": "eaf0a27beffd13f90d4ec64547c53a37df4bdb94",
+            "commit_id": "0b58f67e1539bfaa2c705e35bed2d9896a319c6a",
+            "requested_revision": "0b58f67e1539bfaa2c705e35bed2d9896a319c6a",
         },
     }
     monkeypatch.setattr(
@@ -1490,6 +1491,55 @@ def test_pure_bundle_preflight_needs_no_sink_credentials_or_initialization(
     )
     assert result.root_user_preview.startswith("[REVIEW PREVIEW — USER;")
     assert result.root_final_assistant_preview.startswith("[REVIEW PREVIEW — FINAL ASSISTANT;")
+
+
+def test_pinned_sdk_preflight_preserves_uri_discriminator_with_pii_enabled(
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    """Exercise the exact post-init redaction path that previously broke UriPart."""
+    runtime = review_sink_module.preflight_review_runtime()
+    pii_redaction = importlib.import_module("weave.utils.pii_redaction")
+    weave_settings = importlib.import_module("weave.trace.settings")
+    analyzed: list[str] = []
+
+    class Analyzer:
+        def analyze(self, *, text: str, **_kwargs: Any) -> list[Box]:
+            analyzed.append(text)
+            return [Box(start=0, end=len(text))] if text == "uri" else []
+
+    class Anonymizer:
+        def anonymize(self, *, text: str, analyzer_results: list[Box]) -> Box:
+            redacted = "<PERSON>" if analyzer_results else text
+            return Box(text=redacted)
+
+    monkeypatch.setattr(
+        pii_redaction,
+        "_get_engines",
+        lambda: (Analyzer(), Anonymizer()),
+    )
+    monkeypatch.setattr(
+        pii_redaction,
+        "_get_redaction_entities",
+        lambda: ["PERSON"],
+    )
+    conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
+    bundle = build_review_manifest(conversation, conversation.turns[0])
+
+    with weave_settings.override_settings(
+        redact_pii=True,
+        capture_client_info=False,
+        capture_system_info=False,
+    ):
+        result = preflight_review_bundle(
+            bundle,
+            redactor=review_sink_module.redact_data,
+            _runtime=runtime,
+        )
+
+    assert result.manifest.manifest_sha256 == bundle.manifest_sha256
+    assert "uri" not in analyzed
 
 
 def test_bundle_preflight_exercises_exact_sdk_turn_and_attribute_encoder(

@@ -27,6 +27,7 @@ _MAX_REDACTION_CACHE_ENTRY_CHARS = 256 * 1024
 _MAX_REDACTION_CACHE_CHARS = 32 * 1024 * 1024
 _CORRELATION_ATTRIBUTES = {
     "hivemind.session_id",
+    "hivemind.parent_session_id",
     "hivemind.turn_key",
     "hivemind.payload_sha256",
     "hivemind.source_payload_sha256",
@@ -147,6 +148,11 @@ _SAFE_COORDINATE_WORDS = {
 }
 _UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_NAME_BASED_UUID = re.compile(
+    r"(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![0-9a-f])",
     re.IGNORECASE,
 )
 _ATIF_VERSION = re.compile(r"^ATIF-v\d+\.\d+$", re.IGNORECASE)
@@ -411,6 +417,10 @@ def _source_aware_redact(value: str, engine_redactor: Any) -> str:
     subject to PII redaction.
     """
     scrubbed = redact_string(value)
+    # UUIDv5 is name-derived and can be a durable equality oracle. Preserve it
+    # only in independently validated source-coordinate fields, which bypass
+    # this generic string path through ``redact_source_coordinate``.
+    scrubbed = _NAME_BASED_UUID.sub(_REDACTED_SOURCE_COORDINATE, scrubbed)
     if _looks_like_technical_identifier(scrubbed):
         return scrubbed
     # Standalone identifiers and protocol coordinates are handled component by
@@ -594,11 +604,15 @@ def redact_provider_name(value: str) -> str:
     return value if value.strip().lower() in _KNOWN_PROVIDERS else str(redact_upload_data(value))
 
 
-def redact_source_coordinate(value: object) -> str:
-    """Preserve only contracted opaque source IDs; never hash rejected text."""
+def redact_source_coordinate(value: object, *, allow_name_based: bool = False) -> str:
+    """Preserve a contracted source ID, opting into UUIDv5 only at trusted boundaries."""
     if value == "":
         return ""
-    return str(value) if is_opaque_source_coordinate(value) else _REDACTED_SOURCE_COORDINATE
+    if allow_name_based:
+        valid = is_opaque_source_coordinate(value)
+    else:
+        valid = isinstance(value, str) and _UUID.fullmatch(value) is not None
+    return str(value) if valid else _REDACTED_SOURCE_COORDINATE
 
 
 def _message(item: ChatMessage) -> ChatMessage:
@@ -658,8 +672,8 @@ def _sanitize_turn(turn: MappedTurn) -> MappedTurn:
     for key in _CORRELATION_ATTRIBUTES:
         if key in turn.attributes:
             attributes[key] = (
-                redact_source_coordinate(turn.attributes[key])
-                if key == "hivemind.session_id"
+                redact_source_coordinate(turn.attributes[key], allow_name_based=True)
+                if key in {"hivemind.session_id", "hivemind.parent_session_id"}
                 else turn.attributes[key]
             )
     for key in _HASH_CORRELATORS:

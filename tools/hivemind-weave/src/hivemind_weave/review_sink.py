@@ -101,7 +101,7 @@ _ROOT_MATCH_SCHEMA = "hivemind-hosted-review-match-v1"
 _HOSTED_INDEX_SCHEMA = "hivemind-hosted-review-index-v1"
 _REVIEW_AGENT_DESCRIPTION = "Hosted review of a redacted W&B HiveMind archive"
 _REVIEW_PROJECT = "wandb/hivemind-chats-review"
-_REVIEW_WEAVE_COMMIT = "eaf0a27beffd13f90d4ec64547c53a37df4bdb94"
+_REVIEW_WEAVE_COMMIT = "0b58f67e1539bfaa2c705e35bed2d9896a319c6a"
 _REVIEW_WEAVE_URL = "https://github.com/wandb/weave.git"
 _WANDB_GRAPHQL_URL = "https://api.wandb.ai/graphql"
 _HOSTED_TRACE_SERVER_URL = "https://trace.wandb.ai"
@@ -1061,11 +1061,13 @@ def _content_bearing_fixed_point_payload(payload: dict[str, Any]) -> dict[str, A
     if payload.pop("schema", None) != REVIEW_MANIFEST_SCHEMA:
         raise HostedReviewError("canonical review bundle has an invalid schema coordinate")
     conversation = payload.get("conversation")
+    session = payload.get("session")
     previews = payload.get("review_previews")
     turn = payload.get("turn")
-    if not all(isinstance(value, dict) for value in (conversation, previews, turn)):
+    if not all(isinstance(value, dict) for value in (conversation, session, previews, turn)):
         raise HostedReviewError("canonical review bundle has malformed protocol coordinates")
     assert isinstance(conversation, dict)
+    assert isinstance(session, dict)
     assert isinstance(previews, dict)
     assert isinstance(turn, dict)
     conversation_id = conversation.pop("conversation_id", None)
@@ -1076,11 +1078,36 @@ def _content_bearing_fixed_point_payload(payload: dict[str, Any]) -> dict[str, A
     ):
         raise HostedReviewError("canonical review bundle has unsafe protocol coordinates")
     hash_context = turn.get("hash_context")
+    turn_attributes = turn.get("attributes")
     if (
         not isinstance(hash_context, dict)
+        or not isinstance(turn_attributes, dict)
         or hash_context.pop("conversation_id", None) != conversation_id
     ):
         raise HostedReviewError("canonical review bundle has inconsistent protocol coordinates")
+
+    # Internal HiveMind IDs are UUIDv5 in the current API. They are retained
+    # only at these schema-owned, independently validated source boundaries;
+    # remove them from the context-free content pass so an arbitrary nested
+    # ``session_id`` key cannot gain the same exemption.
+    conversation_session_id = _review_conversation_session_id(conversation_id)
+    source_session_id = session.get("session_id")
+    parent_session_id = session.get("parent_session_id", "")
+    if (
+        conversation_session_id is None
+        or source_session_id != conversation_session_id
+        or not is_opaque_source_coordinate(source_session_id)
+        or not isinstance(parent_session_id, str)
+        or (parent_session_id and not is_opaque_source_coordinate(parent_session_id))
+        or turn_attributes.get("hivemind.session_id") != source_session_id
+        or turn_attributes.get("hivemind.parent_session_id", "") != parent_session_id
+    ):
+        raise HostedReviewError("canonical review bundle has inconsistent source coordinates")
+    session["session_id"] = ""
+    session["parent_session_id"] = ""
+    turn_attributes["hivemind.session_id"] = ""
+    if "hivemind.parent_session_id" in turn_attributes:
+        turn_attributes["hivemind.parent_session_id"] = ""
 
     def mask_typed_field(
         owner: dict[str, Any],
@@ -1181,6 +1208,29 @@ def _safe_identity_material(
     return replace(manifest, **safe)
 
 
+def _safe_manifest_attributes(
+    manifest: HostedReviewManifest,
+    *,
+    redactor: Callable[[Any], Any],
+) -> dict[str, Any]:
+    """Redact arbitrary attributes, then restore only the sealed parent coordinate."""
+    raw = dict(manifest.attributes)
+    parent_session_id = raw.get("hivemind.parent_session_id", "")
+    if not isinstance(parent_session_id, str) or (
+        parent_session_id and not is_opaque_source_coordinate(parent_session_id)
+    ):
+        raise HostedReviewError("hosted review linkage attributes are malformed")
+    redacted = _redact_or_error(redactor, raw)
+    if not isinstance(redacted, dict) or any(not isinstance(key, str) for key in redacted):
+        raise HostedReviewError("hosted review root attributes are malformed")
+    if parent_session_id:
+        redacted["hivemind.parent_session_id"] = redact_source_coordinate(
+            parent_session_id,
+            allow_name_based=True,
+        )
+    return redacted
+
+
 def _safe_root_material(
     manifest: HostedReviewManifest,
     *,
@@ -1219,9 +1269,7 @@ def _safe_root_material(
             validate_inline_field(preview, field=label)
         except AttributeSafetyError as error:
             raise HostedReviewError(str(error)) from error
-    attributes = _redact_or_error(redactor, dict(manifest.attributes))
-    if not isinstance(attributes, dict) or any(not isinstance(key, str) for key in attributes):
-        raise HostedReviewError("hosted review root attributes are malformed")
+    attributes = _safe_manifest_attributes(manifest, redactor=redactor)
     if any(
         key in _OWNED_ROOT_ATTRIBUTES or key.startswith("gen_ai.") or key.startswith("weave.")
         for key in attributes
@@ -1502,7 +1550,7 @@ def _preflight_manifest(
         redactor,
         safe_manifest.final_assistant_preview,
     )
-    safe_attributes = _redact_or_error(redactor, dict(safe_manifest.attributes))
+    safe_attributes = _safe_manifest_attributes(safe_manifest, redactor=redactor)
     if (
         not isinstance(safe_user_preview, str)
         or not isinstance(safe_assistant_preview, str)

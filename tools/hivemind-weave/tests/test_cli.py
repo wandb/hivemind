@@ -7,11 +7,9 @@ from typing import Any
 import pytest
 
 from hivemind_weave import cli
-from hivemind_weave.backfill import BackfillReport
 from hivemind_weave.errors import ReviewMirrorUncertainError
 from hivemind_weave.models import RunReport
 from hivemind_weave.review import REVIEW_PROJECT, ReviewReport
-from hivemind_weave.scheduled_sync import SyncInspection, SyncOnceOutcome, SyncStatus
 
 
 def test_cli_validates_days_before_source_access(capsys: Any) -> None:
@@ -111,32 +109,15 @@ def test_cli_disables_legacy_monolithic_live_import(monkeypatch: Any, capsys: An
     assert "legacy live import is disabled" in capsys.readouterr().err
 
 
-def _backfill_report(*, phase: str = "preview") -> BackfillReport:
-    return BackfillReport(
-        phase=phase,
-        project="wandb/hivemind-chats",
-        plan_id="a" * 64,
-        since_utc=datetime(2026, 7, 1, tzinfo=UTC),
-        until_utc=datetime(2026, 8, 1, tzinfo=UTC),
-        selector="backlog",
-        status="planned",
-        selected=3,
-        remaining_sessions=3,
-    )
-
-
-def test_backfill_preview_builds_date_plan_config(
+def test_canonical_backfill_preview_is_disabled_before_source_or_state_access(
     monkeypatch: Any,
     tmp_path: Path,
     capsys: Any,
 ) -> None:
-    captured: list[Any] = []
+    def forbidden_preview(_config: Any) -> None:
+        raise AssertionError("canonical preview reached source/state code")
 
-    def fake_preview(config: Any) -> BackfillReport:
-        captured.append(config)
-        return _backfill_report()
-
-    monkeypatch.setattr(cli, "preview_backfill", fake_preview)
+    monkeypatch.setattr(cli, "preview_backfill", forbidden_preview)
     state_path = tmp_path / "state.sqlite3"
     exit_code = cli.main(
         [
@@ -167,33 +148,25 @@ def test_backfill_preview_builds_date_plan_config(
         ]
     )
 
-    assert exit_code == 0
-    assert captured[0].days == 45
-    assert captured[0].until == "2026-08-01"
-    assert captured[0].timezone_name == "America/New_York"
-    assert captured[0].canary is True
-    assert captured[0].agents == ("codex", "claude")
-    assert captured[0].repositories == ("wandb/hivemind",)
-    assert captured[0].session_ids == ("session-1", "session-2")
-    assert captured[0].exclude_subagents is True
-    assert captured[0].state_path == state_path
+    assert exit_code == 1
+    assert not state_path.exists()
     output = capsys.readouterr()
-    assert output.out.startswith("Weave destination (backfill preview): wandb/hivemind-chats\n")
-    assert "--days is deprecated" in output.err
+    assert output.out == ""
+    assert "canonical backfill preview/apply is disabled" in output.err
+    assert "pre-0.4 experimental state" in output.err
 
 
-def test_backfill_apply_uses_plan_id_and_apply_time_session_budget(
+def test_canonical_backfill_apply_is_disabled_before_state_or_source_access(
     monkeypatch: Any,
     tmp_path: Path,
+    capsys: Any,
 ) -> None:
-    captured: list[Any] = []
+    def forbidden_apply(_config: Any) -> None:
+        raise AssertionError("canonical apply reached state/source code")
 
-    def fake_apply(config: Any) -> BackfillReport:
-        captured.append(config)
-        return _backfill_report(phase="apply")
-
-    monkeypatch.setattr(cli, "apply_backfill", fake_apply)
+    monkeypatch.setattr(cli, "apply_backfill", forbidden_apply)
     plan_id = "b" * 64
+    state_path = tmp_path / "state.sqlite3"
     exit_code = cli.main(
         [
             "backfill",
@@ -204,14 +177,16 @@ def test_backfill_apply_uses_plan_id_and_apply_time_session_budget(
             "--confirm-project",
             "wandb/hivemind-chats",
             "--state-path",
-            str(tmp_path / "state.sqlite3"),
+            str(state_path),
         ]
     )
 
-    assert exit_code == 0
-    assert captured[0].plan_id == plan_id
-    assert captured[0].max_sessions == 5
-    assert captured[0].project == "wandb/hivemind-chats"
+    assert exit_code == 1
+    assert not state_path.exists()
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "canonical backfill preview/apply is disabled" in output.err
+    assert "pre-0.4 experimental state" in output.err
 
 
 def test_backfill_rejects_terminal_injection_before_printing_project(capsys: Any) -> None:
@@ -234,7 +209,7 @@ def test_backfill_rejects_terminal_injection_before_printing_project(capsys: Any
     assert "injected" not in captured.out
 
 
-def test_backfill_rejects_phase_inapplicable_flags(capsys: Any) -> None:
+def test_backfill_phase_validation_cannot_bypass_disabled_gate(capsys: Any) -> None:
     preview_exit = cli.main(
         [
             "backfill",
@@ -261,8 +236,8 @@ def test_backfill_rejects_phase_inapplicable_flags(capsys: Any) -> None:
 
     captured = capsys.readouterr()
     assert preview_exit == apply_exit == 1
-    assert "apply-only" in captured.err
-    assert "sealed timezone" in captured.err
+    assert captured.out == ""
+    assert captured.err.count("canonical backfill preview/apply is disabled") == 2
 
 
 def _review_report(*, phase: str = "preview") -> ReviewReport:
@@ -479,18 +454,30 @@ def test_review_uncertainty_prints_content_free_reconciliation_direction(
     assert "run review reconcile" in capsys.readouterr().err
 
 
-def test_sync_configure_builds_secret_free_incremental_policy(
+def test_canonical_scheduler_commands_are_disabled_before_any_hook_or_file_access(
     monkeypatch: Any,
     tmp_path: Path,
+    capsys: Any,
 ) -> None:
-    captured: list[Any] = []
-    monkeypatch.setattr(
-        cli,
-        "configure_scheduled_sync",
-        lambda config, *, paths: captured.append((config, paths)),
-    )
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("disabled canonical scheduler reached an access hook")
 
-    exit_code = cli.main(
+    for hook in (
+        "resolve_backfill_window",
+        "configure_scheduled_sync",
+        "set_project_keychain_secret",
+        "load_sync_config",
+        "run_sync_once_from_file",
+        "install_scheduled_sync",
+        "inspect_scheduled_sync",
+        "reconcile_scheduled_sync",
+    ):
+        monkeypatch.setattr(cli, hook, forbidden)
+
+    config_path = tmp_path / "sync.json"
+    state_path = tmp_path / "state.sqlite3"
+    commands = [
+        ["auth", "keychain", "set", "--project", "wandb/hivemind-chats"],
         [
             "sync",
             "configure",
@@ -510,84 +497,28 @@ def test_sync_configure_builds_secret_free_incremental_policy(
             "session-1",
             "--exclude-subagents",
             "--state-path",
-            str(tmp_path / "state.sqlite3"),
+            str(state_path),
             "--config",
-            str(tmp_path / "sync.json"),
-        ]
-    )
+            str(config_path),
+        ],
+        ["sync", "once", "--config", str(config_path)],
+        [
+            "sync",
+            "install",
+            "--every-minutes",
+            "15",
+            "--config",
+            str(config_path),
+        ],
+        ["sync", "status", "--config", str(config_path)],
+        ["reconcile", "--config", str(config_path)],
+    ]
 
-    assert exit_code == 0
-    config, paths = captured[0]
-    assert config.project == "wandb/hivemind-chats"
-    assert config.since == "2026-07-01T00:00:00Z"
-    assert config.settle_minutes == 60
-    assert config.agents == ("codex",)
-    assert config.repositories == ("wandb/hivemind",)
-    assert config.session_ids == ("session-1",)
-    assert config.include_subagents is False
-    assert paths.config_path == tmp_path / "sync.json"
+    for command in commands:
+        assert cli.main(command) == 1
+        assert not any(tmp_path.iterdir())
 
-
-def test_auth_sync_once_install_status_and_reconcile_commands(
-    monkeypatch: Any,
-    tmp_path: Path,
-) -> None:
-    config = cli.SyncConfig(
-        project="wandb/hivemind-chats",
-        since="2026-07-01T00:00:00Z",
-        timezone="UTC",
-        state_path=tmp_path / "state.sqlite3",
-    )
-    calls: list[Any] = []
-    monkeypatch.setattr(cli, "load_sync_config", lambda _path: config)
-    monkeypatch.setattr(
-        cli,
-        "set_project_keychain_secret",
-        lambda project: calls.append(("keychain", project)),
-    )
-    monkeypatch.setattr(
-        cli,
-        "run_sync_once_from_file",
-        lambda _path, *, paths: SyncOnceOutcome(
-            state="succeeded", exit_code=0, status=SyncStatus(state="succeeded")
-        ),
-    )
-    monkeypatch.setattr(
-        cli,
-        "install_scheduled_sync",
-        lambda configured, *, paths: (
-            calls.append(("install", configured.interval_seconds, paths.config_path))
-            or SyncInspection(True, True, True, True)
-        ),
-    )
-    monkeypatch.setattr(
-        cli,
-        "inspect_scheduled_sync",
-        lambda *, paths: SyncInspection(
-            True,
-            True,
-            True,
-            True,
-            queued_sessions=2,
-            deferred_sessions=1,
-            successful_scan_watermark="2026-08-05T12:00:00Z",
-        ),
-    )
-    monkeypatch.setattr(
-        cli,
-        "reconcile_scheduled_sync",
-        lambda configured, *, paths: (
-            calls.append(("reconcile", configured.project, paths.config_path))
-            or SyncStatus(state="succeeded")
-        ),
-    )
-    config_path = str(tmp_path / "sync.json")
-
-    assert cli.main(["auth", "keychain", "set", "--project", config.project]) == 0
-    assert cli.main(["sync", "once", "--config", config_path]) == 0
-    assert cli.main(["sync", "install", "--every-minutes", "15", "--config", config_path]) == 0
-    assert cli.main(["sync", "status", "--config", config_path]) == 0
-    assert cli.main(["reconcile", "--config", config_path]) == 0
-    assert ("keychain", config.project) in calls
-    assert ("install", 900, tmp_path / "sync.json") in calls
-    assert ("reconcile", config.project, tmp_path / "sync.json") in calls
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err.count("canonical scheduled sync") == len(commands)
+    assert "unload any previously installed LaunchAgent" in output.err

@@ -842,6 +842,8 @@ _REVIEW_PLANS_SQL = """
 CREATE TABLE review_plans (
     plan_id TEXT PRIMARY KEY CHECK(length(plan_id) = 64),
     project TEXT NOT NULL,
+    -- Legacy column name: this stores a public source-scope certificate,
+    -- never a username-, email-, or principal-derived digest.
     source_principal_sha256 TEXT NOT NULL CHECK(length(source_principal_sha256) = 64),
     since_utc TEXT NOT NULL,
     until_utc TEXT NOT NULL,

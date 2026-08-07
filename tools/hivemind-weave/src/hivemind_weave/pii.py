@@ -31,7 +31,16 @@ _REDACTION_CACHE_BYTES = 0
 # transient process memory and are cleared whenever the PII engine is reset.
 _MAX_REDACTION_CACHE_ENTRY_BYTES = 8 * 1024 * 1024
 _MAX_REDACTION_CACHE_BYTES = 128 * 1024 * 1024
-_MAX_REDACTION_FIXED_POINT_PASSES = 8
+# A text leaf may need more than one Presidio pass because removing one entity
+# can expose enough context for another recognizer match.  Bound that closure
+# by cumulative analyzed bytes, not an arbitrary pass count: every changing
+# pass must also strictly remove non-marker text, so the remaining-content
+# measure independently proves termination.  The budget always permits one
+# complete scan plus at least 64 MiB of verification/progress work, while
+# limiting pathological rescans to 1 GiB beyond the source leaf.
+_MIN_REDACTION_CONVERGENCE_EXTRA_WORK_BYTES = 64 * 1024 * 1024
+_MAX_REDACTION_CONVERGENCE_EXTRA_WORK_BYTES = 1024 * 1024 * 1024
+_REDACTION_CONVERGENCE_WORK_MULTIPLIER = 64
 _CORRELATION_ATTRIBUTES = {
     "hivemind.session_id",
     "hivemind.parent_session_id",
@@ -572,6 +581,13 @@ def _source_aware_redact(value: str, engine_redactor: Any) -> str:
     # ``atif_trajectory_metadata`` while still removing ``alice_johnson``.
     if _COORDINATE_LIKE_TEXT.fullmatch(scrubbed):
         return _scrub_coordinate_like_pii(scrubbed, engine_redactor)
+    # Shield markers produced by an earlier pass before any heuristic probes
+    # their marker label as a code identifier.  For example, Presidio's
+    # ``<US_DRIVER_LICENSE>`` was otherwise reinterpreted as the words
+    # "US DRIVER LICENSE" and rewritten to the malformed ``<[REDACTED]>`` on
+    # the next pass.  A second shield below covers markers generated during
+    # this pass; both sets are restored byte-for-byte after analysis.
+    scrubbed, existing_redaction_markers = _protect_redaction_placeholders(scrubbed)
     scrubbed = _redact_person_code_identifiers(scrubbed, engine_redactor)
     protected, replacements = _protect_declared_code_identifiers(scrubbed, engine_redactor)
     # Small NER models occasionally tag only the surname of a two-token name.
@@ -579,7 +595,11 @@ def _source_aware_redact(value: str, engine_redactor: Any) -> str:
     # are already shielded above, so this remains conservative around code.
     protected = _LIKELY_FULL_NAME_OR_LOCATION.sub("[REDACTED]", protected)
     protected = _LIKELY_CAMEL_CASE_NAME.sub("[REDACTED]", protected)
-    protected, redaction_markers = _protect_redaction_placeholders(protected)
+    protected, generated_redaction_markers = _protect_redaction_placeholders(protected)
+    redaction_markers = {
+        **existing_redaction_markers,
+        **generated_redaction_markers,
+    }
     redacted = engine_redactor(protected)
     for placeholder, marker in redaction_markers.items():
         if redacted.count(placeholder) != 1:
@@ -677,11 +697,75 @@ def _redact_pii_string_uncached(value: str) -> str:
     return _source_aware_redact(value, _PII_ENGINE_REDACTOR)
 
 
+def _unredacted_character_count(value: str) -> int:
+    """Measure content left outside stable semantic redaction markers."""
+    count = 0
+    offset = 0
+    for match in _EMBEDDED_REDACTION_PLACEHOLDER.finditer(value):
+        count += match.start() - offset
+        offset = match.end()
+    return count + len(value) - offset
+
+
+def _redaction_convergence_work_budget(source_bytes: int) -> int:
+    """Return a source-sized, process-local CPU/work ceiling for one leaf."""
+    scaled_extra = source_bytes * (_REDACTION_CONVERGENCE_WORK_MULTIPLIER - 1)
+    extra = min(
+        _MAX_REDACTION_CONVERGENCE_EXTRA_WORK_BYTES,
+        max(_MIN_REDACTION_CONVERGENCE_EXTRA_WORK_BYTES, scaled_extra),
+    )
+    # Including the complete source size separately guarantees that even a
+    # source larger than the extra-work ceiling receives one full scan.
+    return source_bytes + extra
+
+
+def _redact_pii_string_to_fixed_point(value: str) -> str:
+    """Reach a proved, bounded text fixed point or fail without returning data.
+
+    Presidio transformations are permitted to replace source text only with
+    the importer's stable semantic markers.  After marker text is excluded,
+    every changing pass therefore has to strictly reduce the remaining source
+    content.  Digests detect cycles without retaining raw historical values,
+    and cumulative UTF-8 input bytes bound the work even for an adversarial
+    one-character-at-a-time redactor.
+    """
+    source_bytes = len(value.encode("utf-8"))
+    work_budget = _redaction_convergence_work_budget(source_bytes)
+    work_bytes = 0
+    current = value
+    remaining = _unredacted_character_count(current)
+    seen = {(source_bytes, hashlib.sha256(value.encode("utf-8")).digest())}
+
+    while True:
+        current_bytes = current.encode("utf-8")
+        work_bytes += len(current_bytes)
+        if work_bytes > work_budget:
+            raise ValueError("PII redaction exceeded bounded work before reaching a fixed point")
+
+        redacted = _redact_pii_string_uncached(current)
+        if redacted == current:
+            return redacted
+
+        redacted_bytes = redacted.encode("utf-8")
+        fingerprint = (len(redacted_bytes), hashlib.sha256(redacted_bytes).digest())
+        if fingerprint in seen:
+            raise ValueError("PII redaction entered a cycle before reaching a fixed point")
+
+        redacted_remaining = _unredacted_character_count(redacted)
+        if redacted_remaining >= remaining:
+            raise ValueError(
+                "PII redaction made a non-redacting change before reaching a fixed point"
+            )
+        seen.add(fingerprint)
+        current = redacted
+        remaining = redacted_remaining
+
+
 def _redact_pii_string(value: str) -> str:
-    """Cache by digest only; raw pre-redaction text is never retained as a key."""
+    """Return a stable redaction, caching by digest without retaining raw keys."""
     encoded_value = value.encode("utf-8")
     if len(encoded_value) > _MAX_REDACTION_CACHE_ENTRY_BYTES:
-        return _redact_pii_string_uncached(value)
+        return _redact_pii_string_to_fixed_point(value)
 
     global _REDACTION_CACHE_BYTES
     cache_key = (len(encoded_value), hashlib.sha256(encoded_value).hexdigest())
@@ -690,7 +774,7 @@ def _redact_pii_string(value: str) -> str:
         _REDACTION_CACHE.move_to_end(cache_key)
         return cached
 
-    redacted = _redact_pii_string_uncached(value)
+    redacted = _redact_pii_string_to_fixed_point(value)
     redacted_bytes = len(redacted.encode("utf-8"))
     if redacted_bytes <= _MAX_REDACTION_CACHE_ENTRY_BYTES:
         _REDACTION_CACHE[cache_key] = redacted
@@ -755,13 +839,15 @@ def redact_upload_data(value: Any) -> Any:
             )
         )
 
-    current = value
-    for _ in range(_MAX_REDACTION_FIXED_POINT_PASSES):
-        redacted = redact_once(current)
-        if redacted == current:
-            return redacted
-        current = redacted
-    raise ValueError("credential and PII redaction did not reach a fixed point")
+    # Each text leaf is already closed independently, so a complete second
+    # pass is a cheap exact proof over structural key/coordinate/JSON handling.
+    # Never return a merely "probably stable" payload: any difference here is
+    # an implementation invariant failure and remains fail-closed.
+    redacted = redact_once(value)
+    verified = redact_once(redacted)
+    if verified != redacted:
+        raise ValueError("credential and PII redaction did not reach a verified fixed point")
+    return redacted
 
 
 def redact_agent_name(value: str) -> str:

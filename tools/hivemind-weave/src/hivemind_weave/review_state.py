@@ -28,6 +28,8 @@ _TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
 _SPAN_ID = re.compile(r"^[0-9a-f]{16}$")
 _IMPORTER_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]{1,32})?$")
 _MAX_PLAN_SUCCESSOR_DEPTH = 256
+_MAX_PRESEAL_ATTEMPTS = 65535
+_REVIEW_PROJECT = "wandb/hivemind-chats-review"
 _LEDGER_STATES = frozenset(
     {
         "planned",
@@ -42,6 +44,18 @@ _LEDGER_STATES = frozenset(
 REVIEW_SOURCE_SCOPE_SHA256 = hashlib.sha256(
     b"hivemind-review-authenticated-session-certificates-v1"
 ).hexdigest()
+REVIEW_PRESEAL_FAILURE_CODES = frozenset(
+    {
+        "atif_schema",
+        "manifest_size",
+        "mapping_invalid",
+        "preparation_timeout",
+        "redaction_failed",
+        "source_changed",
+        "source_serialization",
+        "source_unstable",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -139,10 +153,30 @@ class ReviewRetiredTurnEvidence:
 
 
 @dataclass(frozen=True)
+class ReviewPresealFailure:
+    project: str
+    session_id: str
+    started_at: datetime
+    last_activity_at: datetime
+    first_error_code: str
+    last_error_code: str
+    attempt_count: int
+    first_attempt_at: datetime
+    last_attempt_at: datetime
+
+
+@dataclass(frozen=True)
+class ReviewRetryAttempt:
+    attempt_count: int
+    last_attempt_at: datetime
+
+
+@dataclass(frozen=True)
 class ReviewStatus:
     plans: int
     queued_sessions: int
     completed_sessions: int
+    preseal_retries: int
     planned_turns: int
     objects_publishing: int
     objects_verified: int
@@ -216,6 +250,16 @@ def _timestamp(value: Any, *, label: str) -> datetime:
     parsed = parse_datetime(value)
     if parsed is None:
         raise StateConflictError(f"saved review {label} is malformed")
+    return parsed
+
+
+def _canonical_saved_timestamp(value: Any, *, label: str) -> datetime:
+    """Decode only the UTC representation emitted by this importer."""
+    if not isinstance(value, str):
+        raise StateConflictError(f"saved review {label} is malformed")
+    parsed = _timestamp(value, label=label)
+    if isoformat_z(parsed) != value:
+        raise StateConflictError(f"saved review {label} is not canonical UTC")
     return parsed
 
 
@@ -294,6 +338,44 @@ class ReviewStateStore:
             started_at=_timestamp(row["started_at"], label="session start"),
             last_activity_at=_timestamp(row["last_activity_at"], label="session activity"),
             status=str(row["status"]),
+        )
+
+    @staticmethod
+    def _preseal_failure(row: Any) -> ReviewPresealFailure:
+        project = str(row["project"])
+        if project != _REVIEW_PROJECT:
+            raise StateConflictError("saved review pre-seal project is malformed")
+        started_at = _canonical_saved_timestamp(row["started_at"], label="pre-seal session start")
+        last_activity_at = _canonical_saved_timestamp(
+            row["last_activity_at"], label="pre-seal session activity"
+        )
+        first_attempt_at = _canonical_saved_timestamp(
+            row["first_attempt_at"], label="first pre-seal attempt time"
+        )
+        last_attempt_at = _canonical_saved_timestamp(
+            row["last_attempt_at"], label="pre-seal attempt time"
+        )
+        first_error_code = str(row["first_error_code"])
+        last_error_code = str(row["last_error_code"])
+        attempt_count = int(row["attempt_count"])
+        if (
+            started_at > last_activity_at
+            or first_attempt_at > last_attempt_at
+            or first_error_code not in REVIEW_PRESEAL_FAILURE_CODES
+            or last_error_code not in REVIEW_PRESEAL_FAILURE_CODES
+            or not 1 <= attempt_count <= _MAX_PRESEAL_ATTEMPTS
+        ):
+            raise StateConflictError("saved review pre-seal failure is malformed")
+        return ReviewPresealFailure(
+            project=project,
+            session_id=_source_id(row["session_id"]),
+            started_at=started_at,
+            last_activity_at=last_activity_at,
+            first_error_code=first_error_code,
+            last_error_code=last_error_code,
+            attempt_count=attempt_count,
+            first_attempt_at=first_attempt_at,
+            last_attempt_at=last_attempt_at,
         )
 
     @staticmethod
@@ -641,6 +723,238 @@ class ReviewStateStore:
             )
             for row in rows
         }
+
+    def record_preseal_failure(
+        self,
+        *,
+        project: str,
+        session_id: str,
+        started_at: datetime,
+        last_activity_at: datetime,
+        error_code: str,
+    ) -> ReviewPresealFailure:
+        """Record one recognized, candidate-local preparation rejection.
+
+        The row intentionally contains no exception text, payload digest, title,
+        repository, selector, or transcript-derived metadata. The exact source
+        revision remains pending; this evidence is used only to schedule fair
+        retries behind untouched revisions.
+        """
+        if project != _REVIEW_PROJECT:
+            raise StateConflictError("review pre-seal failures require the fixed private project")
+        safe_session_id = _source_id(session_id)
+        if started_at.tzinfo is None or last_activity_at.tzinfo is None:
+            raise StateConflictError("review pre-seal revision timestamps must be timezone-aware")
+        safe_started_at = started_at.astimezone(UTC)
+        safe_last_activity_at = last_activity_at.astimezone(UTC)
+        if safe_started_at > safe_last_activity_at:
+            raise StateConflictError("review pre-seal revision coordinates are malformed")
+        if error_code not in REVIEW_PRESEAL_FAILURE_CODES:
+            raise StateConflictError("review pre-seal failure code is not allowlisted")
+
+        started_text = isoformat_z(safe_started_at)
+        activity_text = isoformat_z(safe_last_activity_at)
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            existing_row = self._db.execute(
+                """
+                SELECT * FROM review_preseal_failures
+                WHERE project = ? AND session_id = ?
+                  AND started_at = ? AND last_activity_at = ?
+                """,
+                (project, safe_session_id, started_text, activity_text),
+            ).fetchone()
+            now = datetime.now(UTC)
+            if existing_row is None:
+                now_text = isoformat_z(now)
+                self._db.execute(
+                    """
+                    INSERT INTO review_preseal_failures (
+                        project, session_id, started_at, last_activity_at,
+                        first_error_code, last_error_code, attempt_count,
+                        first_attempt_at, last_attempt_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        project,
+                        safe_session_id,
+                        started_text,
+                        activity_text,
+                        error_code,
+                        error_code,
+                        now_text,
+                        now_text,
+                    ),
+                )
+            else:
+                existing = self._preseal_failure(existing_row)
+                monotonic_now = max(now, existing.last_attempt_at)
+                self._db.execute(
+                    """
+                    UPDATE review_preseal_failures
+                    SET last_error_code = ?,
+                        attempt_count = CASE
+                            WHEN attempt_count < ? THEN attempt_count + 1
+                            ELSE ?
+                        END,
+                        last_attempt_at = ?
+                    WHERE project = ? AND session_id = ?
+                      AND started_at = ? AND last_activity_at = ?
+                    """,
+                    (
+                        error_code,
+                        _MAX_PRESEAL_ATTEMPTS,
+                        _MAX_PRESEAL_ATTEMPTS,
+                        isoformat_z(monotonic_now),
+                        project,
+                        safe_session_id,
+                        started_text,
+                        activity_text,
+                    ),
+                )
+            self._commit()
+        except Exception:
+            self._db.rollback()
+            raise
+        saved = self._db.execute(
+            """
+            SELECT * FROM review_preseal_failures
+            WHERE project = ? AND session_id = ?
+              AND started_at = ? AND last_activity_at = ?
+            """,
+            (project, safe_session_id, started_text, activity_text),
+        ).fetchone()
+        if saved is None:  # pragma: no cover - guarded by the transaction.
+            raise StateConflictError("review pre-seal failure was not stored")
+        return self._preseal_failure(saved)
+
+    def preseal_failures(self, project: str) -> tuple[ReviewPresealFailure, ...]:
+        """Return validated content-free preparation retry evidence."""
+        if project != _REVIEW_PROJECT:
+            raise StateConflictError("review pre-seal failures require the fixed private project")
+        rows = self._db.execute(
+            """
+            SELECT * FROM review_preseal_failures
+            WHERE project = ?
+            ORDER BY last_attempt_at, session_id, started_at, last_activity_at
+            """,
+            (project,),
+        ).fetchall()
+        return tuple(self._preseal_failure(row) for row in rows)
+
+    def retry_session_attempts(
+        self,
+        project: str,
+    ) -> dict[tuple[str, datetime, datetime], ReviewRetryAttempt]:
+        """Aggregate all recognized retry attempts by exact source revision."""
+        if project != _REVIEW_PROJECT:
+            raise StateConflictError("review retry scheduling requires the fixed private project")
+        attempts: dict[tuple[str, datetime, datetime], ReviewRetryAttempt] = {}
+
+        def add(
+            key: tuple[str, datetime, datetime],
+            *,
+            count: int,
+            attempted_at: datetime,
+        ) -> None:
+            previous = attempts.get(key)
+            if previous is None:
+                attempts[key] = ReviewRetryAttempt(
+                    attempt_count=min(count, _MAX_PRESEAL_ATTEMPTS),
+                    last_attempt_at=attempted_at,
+                )
+                return
+            attempts[key] = ReviewRetryAttempt(
+                attempt_count=min(
+                    previous.attempt_count + count,
+                    _MAX_PRESEAL_ATTEMPTS,
+                ),
+                last_attempt_at=max(previous.last_attempt_at, attempted_at),
+            )
+
+        for failure in self.preseal_failures(project):
+            add(
+                (failure.session_id, failure.started_at, failure.last_activity_at),
+                count=failure.attempt_count,
+                attempted_at=failure.last_attempt_at,
+            )
+
+        terminal_rows = self._db.execute(
+            """
+            SELECT session.session_id, session.started_at, session.last_activity_at,
+                   retired.retired_at AS attempted_at
+            FROM review_plan_sessions AS session
+            JOIN review_plans AS plan ON plan.plan_id = session.plan_id
+            JOIN review_plan_retirements AS retired ON retired.plan_id = plan.plan_id
+            WHERE plan.project = ?
+            UNION ALL
+            SELECT session.session_id, session.started_at, session.last_activity_at,
+                   revalidated.revalidated_at AS attempted_at
+            FROM review_plan_sessions AS session
+            JOIN review_plans AS plan ON plan.plan_id = session.plan_id
+            JOIN review_plan_revalidations AS revalidated ON revalidated.plan_id = plan.plan_id
+            WHERE plan.project = ?
+            ORDER BY attempted_at, session_id, started_at, last_activity_at
+            """,
+            (project, project),
+        ).fetchall()
+        for row in terminal_rows:
+            started_at = _canonical_saved_timestamp(row["started_at"], label="retry session start")
+            last_activity_at = _canonical_saved_timestamp(
+                row["last_activity_at"], label="retry session activity"
+            )
+            attempted_at = _canonical_saved_timestamp(
+                row["attempted_at"], label="terminal attempt time"
+            )
+            if started_at > last_activity_at:
+                raise StateConflictError("saved review retry revision is malformed")
+            add(
+                (_source_id(row["session_id"]), started_at, last_activity_at),
+                count=1,
+                attempted_at=attempted_at,
+            )
+        return attempts
+
+    def pending_retry_session_attempts(
+        self,
+        project: str,
+    ) -> dict[tuple[str, datetime, datetime], ReviewRetryAttempt]:
+        """Return retry evidence not already owned by a nonterminal plan.
+
+        Pre-seal evidence is immutable and therefore remains in the journal
+        after an exact revision later seals or completes successfully.  Such a
+        revision is no longer queued.  A retired or revalidated plan is a
+        terminal attempt, however, so its revision remains eligible for the
+        fair retry tier until a later nonterminal plan takes ownership.
+        """
+        attempts = self.retry_session_attempts(project)
+        active_rows = self._db.execute(
+            """
+            SELECT DISTINCT session.session_id, session.started_at,
+                            session.last_activity_at
+            FROM review_plan_sessions AS session
+            JOIN review_plans AS plan ON plan.plan_id = session.plan_id
+            WHERE plan.project = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_retirements AS retired
+                  WHERE retired.plan_id = plan.plan_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_plan_revalidations AS revalidated
+                  WHERE revalidated.plan_id = plan.plan_id
+              )
+            """,
+            (project,),
+        ).fetchall()
+        active_revisions = {
+            (
+                _source_id(row["session_id"]),
+                _timestamp(row["started_at"], label="active retry session start"),
+                _timestamp(row["last_activity_at"], label="active retry session activity"),
+            )
+            for row in active_rows
+        }
+        return {key: attempt for key, attempt in attempts.items() if key not in active_revisions}
 
     def unfinished_plan_for_window(
         self,
@@ -1938,10 +2252,13 @@ class ReviewStateStore:
             args,
         ).fetchall()
         turns = {str(row["status"]): int(row["count"]) for row in turn_rows}
+        retry_project = _REVIEW_PROJECT if project is None else project
+        preseal_retries = len(self.pending_retry_session_attempts(retry_project))
         return ReviewStatus(
             plans=plans,
             queued_sessions=sessions.get("pending", 0) + sessions.get("blocked", 0),
             completed_sessions=sessions.get("completed", 0),
+            preseal_retries=preseal_retries,
             planned_turns=turns.get("planned", 0),
             objects_publishing=turns.get("objects_publishing", 0),
             objects_verified=turns.get("objects_verified", 0),

@@ -287,6 +287,58 @@ def test_repeated_locations_converge_inside_preserved_step_data(
     assert redact_upload_data({key: serialized})[key] == serialized
 
 
+def test_large_nested_canonical_json_converges_losslessly_after_many_changes(
+    monkeypatch: Any,
+) -> None:
+    tokens = [f"sensitiveword{index:02d}" for index in range(12)]
+    ordinary = "x" * (512 * 1024)
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    key = "hivemind.preserved_step_data"
+    source = pii_module.canonical_json(
+        {
+            "steps": [
+                {
+                    "raw_step": {
+                        "message": f"{ordinary}\n{' '.join(tokens)}",
+                        "credential": f'OPENAI_API_KEY="{secret}"',
+                    }
+                }
+            ],
+            "stable_markers": {
+                "[REDACTED_PII_KEY_0001]": "<PERSON>",
+                "[REDACTED_KEY_0002]": "[REDACTED_SOURCE_COORDINATE]",
+            },
+        }
+    )
+
+    def redact_one(value: str) -> str:
+        for token in tokens:
+            if token in value:
+                return value.replace(token, "<PERSON>", 1)
+        return value
+
+    monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
+    monkeypatch.setattr(pii_module, "_PII_ENGINE_REDACTOR", redact_one)
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
+
+    redacted = redact_upload_data({key: source})[key]
+    decoded = json.loads(redacted)
+    message = decoded["steps"][0]["raw_step"]["message"]
+
+    assert message.startswith(ordinary)
+    assert len(message.splitlines()[0]) == len(ordinary)
+    assert all(token not in message for token in tokens)
+    assert message.count("<PERSON>") == len(tokens)
+    assert secret not in redacted
+    assert decoded["stable_markers"] == {
+        "[REDACTED_KEY_0002]": "[REDACTED_SOURCE_COORDINATE]",
+        "[REDACTED_PII_KEY_0001]": "<PERSON>",
+    }
+    assert redacted == pii_module.canonical_json(decoded)
+    assert redact_upload_data({key: redacted})[key] == redacted
+
+
 def test_coordinate_bearing_mapping_keys_fail_closed_without_hashing_names() -> None:
     source = "nonopaque-source-coordinate"
     redacted = redact_upload_data(
@@ -439,6 +491,15 @@ def test_generated_redaction_markers_cannot_change_later_ner_context() -> None:
     assert all("<LOCATION>" not in value for value in engine_inputs)
 
 
+def test_embedded_typed_marker_is_shielded_before_code_identifier_probes() -> None:
+    def marker_label_sensitive_engine(value: str) -> str:
+        return "<PERSON>" if value == "US DRIVER LICENSE" else value
+
+    source = "prefix <US_DRIVER_LICENSE> suffix"
+
+    assert pii_module._source_aware_redact(source, marker_label_sensitive_engine) == source
+
+
 def test_redaction_marker_shields_are_collision_safe_and_reversible() -> None:
     existing_internal_token, _ = pii_module._protect_redaction_placeholders("<LOCATION>")
     source = f"{existing_internal_token} <LOCATION> <PERSON> <LOCATION>"
@@ -461,47 +522,90 @@ def test_json_looking_chat_text_keeps_its_exact_formatting() -> None:
     assert redact_upload_data(source) == source
 
 
-def test_upload_redaction_iterates_to_a_bounded_fixed_point(monkeypatch: Any) -> None:
-    transitions = {"raw": "once", "once": "stable", "stable": "stable"}
+def test_upload_redaction_converges_after_more_than_eight_text_changes(
+    monkeypatch: Any,
+) -> None:
+    tokens = [f"privateword{index:02d}" for index in range(12)]
+    source = " ".join(tokens)
     calls: list[str] = []
 
     monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
     monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
 
-    def walk(value: str) -> str:
+    def redact_one(value: str) -> str:
         calls.append(value)
-        return transitions[value]
+        for token in tokens:
+            if token in value:
+                return value.replace(token, "[REDACTED]", 1)
+        return value
 
-    monkeypatch.setattr(pii_module, "_pii_walk", walk)
+    monkeypatch.setattr(pii_module, "_redact_pii_string_uncached", redact_one)
 
-    assert redact_upload_data("raw") == "stable"
-    assert calls == ["raw", "once", "stable"]
+    redacted = str(redact_upload_data(source))
+
+    assert all(token not in redacted for token in tokens)
+    assert redacted.count("[REDACTED]") == len(tokens)
+    assert len(calls) > 8
+    assert redact_upload_data(redacted) == redacted
 
 
 def test_upload_redaction_rejects_a_nonconverging_cycle(monkeypatch: Any) -> None:
     monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
     monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
-    monkeypatch.setattr(pii_module, "_pii_walk", lambda value: "b" if value == "a" else "a")
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
+    monkeypatch.setattr(
+        pii_module,
+        "_redact_pii_string_uncached",
+        lambda value: "[REDACTED] beta" if value == "secret-alpha" else "secret-alpha",
+    )
 
-    with pytest.raises(ValueError, match="fixed point"):
-        redact_upload_data("a")
+    with pytest.raises(ValueError, match="cycle"):
+        redact_upload_data("secret-alpha")
 
 
-def test_upload_redaction_rejects_monotonic_nonconvergence(monkeypatch: Any) -> None:
+def test_upload_redaction_rejects_a_non_redacting_change(monkeypatch: Any) -> None:
     calls = 0
     monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
     monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
 
     def grow(value: str) -> str:
         nonlocal calls
         calls += 1
         return f"{value}x"
 
-    monkeypatch.setattr(pii_module, "_pii_walk", grow)
+    monkeypatch.setattr(pii_module, "_redact_pii_string_uncached", grow)
 
-    with pytest.raises(ValueError, match="fixed point"):
+    with pytest.raises(ValueError, match="non-redacting"):
         redact_upload_data("a")
-    assert calls == pii_module._MAX_REDACTION_FIXED_POINT_PASSES
+    assert calls == 1
+
+
+def test_upload_redaction_rejects_progress_beyond_its_work_budget(
+    monkeypatch: Any,
+) -> None:
+    calls = 0
+    monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
+    monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
+    monkeypatch.setattr(pii_module, "_MIN_REDACTION_CONVERGENCE_EXTRA_WORK_BYTES", 0)
+    monkeypatch.setattr(pii_module, "_MAX_REDACTION_CONVERGENCE_EXTRA_WORK_BYTES", 0)
+
+    def redact_one(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"[REDACTED]{value[1:]}"
+
+    monkeypatch.setattr(pii_module, "_redact_pii_string_uncached", redact_one)
+
+    with pytest.raises(ValueError, match="bounded work"):
+        redact_upload_data("abcdefghij")
+    assert calls == 1
 
 
 def test_verification_signature_uses_sdk_dict_redaction_not_string_hook(
@@ -609,16 +713,16 @@ def test_redaction_cache_uses_only_digest_keys_and_redacted_values(monkeypatch: 
     def fake_redactor(value: str) -> str:
         nonlocal calls
         calls += 1
-        return f"[safe:{len(value)}]"
+        return value if value == "[REDACTED]" else "[REDACTED]"
 
     monkeypatch.setattr(pii_module, "_redact_pii_string_uncached", fake_redactor)
     source = "private-source-value " * 500
-    pii_module._REDACTION_CACHE.clear()
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
     monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
 
-    assert pii_module._redact_pii_string(source) == f"[safe:{len(source)}]"
-    assert pii_module._redact_pii_string(source) == f"[safe:{len(source)}]"
-    assert calls == 1
+    assert pii_module._redact_pii_string(source) == "[REDACTED]"
+    assert pii_module._redact_pii_string(source) == "[REDACTED]"
+    assert calls == 2
     assert all(source not in str(key) for key in pii_module._REDACTION_CACHE)
     assert source not in pii_module._REDACTION_CACHE.values()
 

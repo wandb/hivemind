@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - the importer targets macOS/Linux.
 
 
 DB_APPLICATION_ID = 0x484D5756
-DB_SCHEMA_VERSION = 11
+DB_SCHEMA_VERSION = 13
 RUN_SCHEMA_VERSION = "2"
 _HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ATOMIC_EVIDENCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
@@ -1043,6 +1043,31 @@ CREATE TABLE review_plan_revalidations (
 )
 """
 
+# RFC3339 UTC text with an optional fractional component is not lexicographically
+# ordered within one second (``...00Z`` sorts after ``...00.1Z``). The facade
+# parses, canonicalizes, and compares every source/attempt timestamp instead of
+# encoding a misleading TEXT-order CHECK here or in the update trigger below.
+_REVIEW_PRESEAL_FAILURES_SQL = """
+CREATE TABLE review_preseal_failures (
+    project TEXT NOT NULL CHECK(project = 'wandb/hivemind-chats-review'),
+    session_id TEXT NOT NULL CHECK(length(session_id) = 36),
+    started_at TEXT NOT NULL CHECK(length(started_at) BETWEEN 20 AND 40),
+    last_activity_at TEXT NOT NULL CHECK(length(last_activity_at) BETWEEN 20 AND 40),
+    first_error_code TEXT NOT NULL CHECK(first_error_code IN (
+        'atif_schema', 'manifest_size', 'mapping_invalid', 'redaction_failed',
+        'preparation_timeout', 'source_changed', 'source_serialization', 'source_unstable'
+    )),
+    last_error_code TEXT NOT NULL CHECK(last_error_code IN (
+        'atif_schema', 'manifest_size', 'mapping_invalid', 'redaction_failed',
+        'preparation_timeout', 'source_changed', 'source_serialization', 'source_unstable'
+    )),
+    attempt_count INTEGER NOT NULL CHECK(attempt_count BETWEEN 1 AND 65535),
+    first_attempt_at TEXT NOT NULL CHECK(length(first_attempt_at) BETWEEN 20 AND 40),
+    last_attempt_at TEXT NOT NULL CHECK(length(last_attempt_at) BETWEEN 20 AND 40),
+    PRIMARY KEY (project, session_id, started_at, last_activity_at)
+)
+"""
+
 _REVIEW_PLANS_INDEX_SQL = """
 CREATE INDEX review_plans_project_status ON review_plans(project, status)
 """
@@ -1499,6 +1524,62 @@ BEGIN
 END
 """
 
+_REVIEW_PRESEAL_FAILURE_IDENTITY_TRIGGER_SQL = """
+CREATE TRIGGER review_preseal_failures_identity_immutable
+BEFORE UPDATE OF
+    project, session_id, started_at, last_activity_at,
+    first_error_code, first_attempt_at
+ON review_preseal_failures
+BEGIN
+    SELECT RAISE(ABORT, 'review pre-seal failure identity is immutable');
+END
+"""
+
+_REVIEW_PRESEAL_FAILURE_INSERT_TRIGGER_SQL = """
+CREATE TRIGGER review_preseal_failures_insert_guard
+BEFORE INSERT ON review_preseal_failures
+WHEN NEW.attempt_count != 1
+  OR NEW.first_error_code != NEW.last_error_code
+  OR NEW.first_attempt_at != NEW.last_attempt_at
+BEGIN
+    SELECT RAISE(ABORT, 'review pre-seal failure lacks initial attempt evidence');
+END
+"""
+
+_REVIEW_PRESEAL_FAILURE_ATTEMPT_TRIGGER_SQL = """
+CREATE TRIGGER review_preseal_failures_attempt_guard
+BEFORE UPDATE ON review_preseal_failures
+WHEN NOT (
+    NEW.attempt_count = CASE
+        WHEN OLD.attempt_count < 65535 THEN OLD.attempt_count + 1
+        ELSE 65535
+    END
+    AND NEW.last_error_code IN (
+        'atif_schema', 'manifest_size', 'mapping_invalid', 'redaction_failed',
+        'preparation_timeout', 'source_changed', 'source_serialization', 'source_unstable'
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'review pre-seal failure attempt evidence is invalid');
+END
+"""
+
+_REVIEW_PRESEAL_FAILURE_NO_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER review_preseal_failures_no_delete
+BEFORE DELETE ON review_preseal_failures
+BEGIN
+    SELECT RAISE(ABORT, 'review pre-seal failure evidence cannot be deleted');
+END
+"""
+
+_REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL = (
+    _REVIEW_PRESEAL_FAILURES_SQL,
+    _REVIEW_PRESEAL_FAILURE_IDENTITY_TRIGGER_SQL,
+    _REVIEW_PRESEAL_FAILURE_INSERT_TRIGGER_SQL,
+    _REVIEW_PRESEAL_FAILURE_ATTEMPT_TRIGGER_SQL,
+    _REVIEW_PRESEAL_FAILURE_NO_DELETE_TRIGGER_SQL,
+)
+
 _REVIEW_PREFLIGHT_RECOVERY_SCHEMA_SQL = (
     _REVIEW_PREFLIGHT_CONFLICT_ARCHIVE_SQL,
     _REVIEW_PLAN_RETIREMENTS_SQL,
@@ -1528,6 +1609,7 @@ _REVIEW_SCHEMA_SQL = (
     _REVIEW_PREFLIGHT_CONFLICT_ARCHIVE_SQL,
     _REVIEW_PLAN_RETIREMENTS_SQL,
     _REVIEW_PLAN_REVALIDATIONS_SQL,
+    _REVIEW_PRESEAL_FAILURES_SQL,
     _REVIEW_PLANS_INDEX_SQL,
     _REVIEW_LEDGER_INDEX_SQL,
     _REVIEW_PLAN_IMMUTABLE_TRIGGER_SQL,
@@ -1545,6 +1627,10 @@ _REVIEW_SCHEMA_SQL = (
     _REVIEW_PLAN_REVALIDATION_INSERT_GUARD_SQL,
     _REVIEW_PLAN_REVALIDATION_IMMUTABLE_TRIGGER_SQL,
     _REVIEW_PLAN_REVALIDATION_NO_DELETE_TRIGGER_SQL,
+    _REVIEW_PRESEAL_FAILURE_IDENTITY_TRIGGER_SQL,
+    _REVIEW_PRESEAL_FAILURE_INSERT_TRIGGER_SQL,
+    _REVIEW_PRESEAL_FAILURE_ATTEMPT_TRIGGER_SQL,
+    _REVIEW_PRESEAL_FAILURE_NO_DELETE_TRIGGER_SQL,
     _REVIEW_LEDGER_IDENTITY_TRIGGER_SQL,
     _REVIEW_LEDGER_REVISION_TRIGGER_SQL,
     _REVIEW_LEDGER_TRANSITION_TRIGGER_SQL,
@@ -1996,6 +2082,7 @@ _EXPECTED_SCHEMA_SQL = {
     "review_preflight_conflict_archive": _REVIEW_PREFLIGHT_CONFLICT_ARCHIVE_SQL,
     "review_plan_retirements": _REVIEW_PLAN_RETIREMENTS_SQL,
     "review_plan_revalidations": _REVIEW_PLAN_REVALIDATIONS_SQL,
+    "review_preseal_failures": _REVIEW_PRESEAL_FAILURES_SQL,
     "review_plans_project_status": _REVIEW_PLANS_INDEX_SQL,
     "review_turn_ledger_project_status": _REVIEW_LEDGER_INDEX_SQL,
     "review_plans_immutable": _REVIEW_PLAN_IMMUTABLE_TRIGGER_SQL,
@@ -2017,6 +2104,10 @@ _EXPECTED_SCHEMA_SQL = {
     "review_plan_revalidations_insert_guard": _REVIEW_PLAN_REVALIDATION_INSERT_GUARD_SQL,
     "review_plan_revalidations_immutable": _REVIEW_PLAN_REVALIDATION_IMMUTABLE_TRIGGER_SQL,
     "review_plan_revalidations_no_delete": _REVIEW_PLAN_REVALIDATION_NO_DELETE_TRIGGER_SQL,
+    "review_preseal_failures_identity_immutable": (_REVIEW_PRESEAL_FAILURE_IDENTITY_TRIGGER_SQL),
+    "review_preseal_failures_insert_guard": _REVIEW_PRESEAL_FAILURE_INSERT_TRIGGER_SQL,
+    "review_preseal_failures_attempt_guard": _REVIEW_PRESEAL_FAILURE_ATTEMPT_TRIGGER_SQL,
+    "review_preseal_failures_no_delete": _REVIEW_PRESEAL_FAILURE_NO_DELETE_TRIGGER_SQL,
     "review_turn_ledger_identity_immutable": _REVIEW_LEDGER_IDENTITY_TRIGGER_SQL,
     "review_turn_ledger_revision_guard": _REVIEW_LEDGER_REVISION_TRIGGER_SQL,
     "review_turn_ledger_transition_guard": _REVIEW_LEDGER_TRANSITION_TRIGGER_SQL,
@@ -2364,6 +2455,52 @@ class StateStore:
             if user_version == DB_SCHEMA_VERSION:
                 if application_id != DB_APPLICATION_ID:
                     raise StateConflictError("state database application identity is missing")
+            elif user_version == 12 and application_id == DB_APPLICATION_ID:
+                legacy_table = "review_preseal_failures_v12"
+                legacy_rows = int(
+                    self._db.execute("SELECT COUNT(*) FROM review_preseal_failures").fetchone()[0]
+                )
+                for trigger in (
+                    "review_preseal_failures_identity_immutable",
+                    "review_preseal_failures_insert_guard",
+                    "review_preseal_failures_attempt_guard",
+                    "review_preseal_failures_no_delete",
+                ):
+                    self._db.execute(f"DROP TRIGGER {trigger}")
+                self._db.execute(f"ALTER TABLE review_preseal_failures RENAME TO {legacy_table}")
+                self._db.execute(_REVIEW_PRESEAL_FAILURES_SQL)
+                self._db.execute(
+                    f"""
+                    INSERT INTO review_preseal_failures (
+                        project, session_id, started_at, last_activity_at,
+                        first_error_code, last_error_code, attempt_count,
+                        first_attempt_at, last_attempt_at
+                    )
+                    SELECT
+                        project, session_id, started_at, last_activity_at,
+                        first_error_code, last_error_code, attempt_count,
+                        first_attempt_at, last_attempt_at
+                    FROM {legacy_table}
+                    """
+                )
+                migrated_rows = int(
+                    self._db.execute("SELECT COUNT(*) FROM review_preseal_failures").fetchone()[0]
+                )
+                if migrated_rows != legacy_rows:
+                    raise StateConflictError("review pre-seal failure migration lost rows")
+                self._db.execute(f"DROP TABLE {legacy_table}")
+                for statement in (
+                    _REVIEW_PRESEAL_FAILURE_IDENTITY_TRIGGER_SQL,
+                    _REVIEW_PRESEAL_FAILURE_INSERT_TRIGGER_SQL,
+                    _REVIEW_PRESEAL_FAILURE_ATTEMPT_TRIGGER_SQL,
+                    _REVIEW_PRESEAL_FAILURE_NO_DELETE_TRIGGER_SQL,
+                ):
+                    self._db.execute(statement)
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
+            elif user_version == 11 and application_id == DB_APPLICATION_ID:
+                for statement in _REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL:
+                    self._db.execute(statement)
+                self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 10 and application_id == DB_APPLICATION_ID:
                 self._db.execute("DROP TRIGGER review_turn_ledger_no_delete")
                 self._db.execute("DROP TRIGGER review_plan_retirements_insert_guard")
@@ -2371,6 +2508,8 @@ class StateStore:
                 self._db.execute(_REVIEW_PLAN_RETIREMENT_INSERT_GUARD_SQL)
                 self._db.execute(_REVIEW_PLAN_REVALIDATION_INSERT_GUARD_SQL)
                 self._db.execute(_REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL)
+                for statement in _REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL:
+                    self._db.execute(statement)
                 self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 9 and application_id == DB_APPLICATION_ID:
                 self._db.execute("DROP TRIGGER review_turn_ledger_no_delete")
@@ -2379,6 +2518,8 @@ class StateStore:
                     self._db.execute(statement)
                 self._db.execute(_REVIEW_PLAN_RETIREMENT_INSERT_GUARD_SQL)
                 self._db.execute(_REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL)
+                for statement in _REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL:
+                    self._db.execute(statement)
                 self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 8 and application_id == DB_APPLICATION_ID:
                 self._db.execute("DROP TRIGGER review_turn_ledger_no_delete")
@@ -2387,6 +2528,8 @@ class StateStore:
                 for statement in _REVIEW_REVALIDATION_SCHEMA_SQL:
                     self._db.execute(statement)
                 self._db.execute(_REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL)
+                for statement in _REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL:
+                    self._db.execute(statement)
                 self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 7 and application_id == DB_APPLICATION_ID:
                 self._db.execute(
@@ -2401,6 +2544,8 @@ class StateStore:
                 for statement in _REVIEW_REVALIDATION_SCHEMA_SQL:
                     self._db.execute(statement)
                 self._db.execute(_REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL)
+                for statement in _REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL:
+                    self._db.execute(statement)
                 self._db.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
             elif user_version == 6 and application_id == DB_APPLICATION_ID:
                 for statement in _REVIEW_SCHEMA_SQL:

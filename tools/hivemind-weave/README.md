@@ -151,6 +151,7 @@ hivemind-weave review preview
     [--exclude-subagents]
     [--canary]
     [--next-sessions N]
+    [--session-timeout-minutes MINUTES]
     [--state-path PATH]
 ```
 
@@ -204,6 +205,27 @@ deliberately limited to an isolated one-session plan. This keeps a drifting
 HiveMind export from stranding or obscuring work that already completed in the
 same plan.
 
+Every real CLI review preview mode runs each session in a fresh read-only
+worker with a hard wall-clock deadline. The default is 15 minutes and
+`--session-timeout-minutes` accepts 1–60 for backlog, canary, and exact-session
+previews. Only source coordinates, immutable digests, timestamps, size counts,
+an authoritative subagent boolean, and content-free per-turn canary counts
+return through a bounded private pipe—never transcript content. Worker-only
+canary facts are excluded from the plan hash and SQLite.
+The worker receives no W&B/model credential, SQLite path, or upload interface.
+If it times out, the complete worker process group (including an active
+HiveMind CLI child) is terminated and reaped before the parent records the
+content-free `preparation_timeout` retry state in `--next-sessions` mode. A
+timeout always stops the invocation without sealing a plan; it never advances
+to a later chat. Canary and exact-session timeouts do not create retry rows.
+Only a parent-side source-metadata request that contains invalid Unicode or
+exceeds the 2 MiB private request bound is classified as
+`source_serialization`: backlog mode records that content-free code and
+continues fairly, canary mode may examine the next candidate within its fixed
+budget, and an exact/all-session preview aborts. Worker spawn failures,
+malformed or oversized responses, orphaned descendants, and unknown failures
+remain unrecorded run-level errors.
+
 An exact session revision that already ended in a terminal zero-write
 retirement or revalidation sorts behind every untouched revision. It is not
 filtered out and remains in the reported backlog; after fresh work is drained,
@@ -240,11 +262,14 @@ under the same session/turn key is a conflict and is never duplicated.
 
 ### Status
 
-Status reads only local content-free evidence. It reports plan/session progress
-and counts for planned, object-publishing, object-verified, root-submitting,
+Status reads only local content-free evidence. It reports plan/session progress,
+the number of exact session revisions currently eligible for a fair pre-seal
+retry, and counts for planned, object-publishing, object-verified, root-submitting,
 visible, uncertain, and conflicting turns. It never fetches transcripts or
 prints titles, prompts, object contents, credentials, hashes, trace IDs, or raw
-session IDs.
+session IDs. Immutable rejection evidence remains in the journal, but the retry
+count excludes a revision once a live or completed plan owns it; retired and
+revalidated terminal attempts remain eligible until a successor plan is sealed.
 
 ```text
 hivemind-weave review status
@@ -344,6 +369,11 @@ Each microplan still performs complete mapping, redaction, exact wire
 serialization, and source-revision certification before its first upload. The
 full eligible-universe digest is sealed into every microplan, while only the
 bounded whole sessions and their turn certificates are retained as membership.
+Recognized candidate-local preparation failures do not consume the requested
+success budget, but each preview examines at most `N + 8` transcripts (and no
+more than 108). Failed exact revisions remain in the backlog. Untouched
+revisions run first; retries rotate by bounded attempt count and oldest attempt
+time instead of letting one malformed chat monopolize `--next-sessions 1`.
 
 Stop at the first uncertain response, conflict, privacy/permission failure,
 reference mismatch, manifest reconstruction error, count mismatch, or other
@@ -363,6 +393,14 @@ bounded error codes, and remote root identity. It contains no transcript or API
 key, but its IDs, timestamps, hashes, project name, and statuses are still
 sensitive; keep its directory private and retain it while the review project
 exists.
+
+Pre-seal retry evidence is one bounded row per exact session revision. It keeps
+only the UUID/timestamps, immutable first and latest allowlisted error codes,
+first/latest local attempt times, and a saturating attempt count. It never keeps
+exception text or transcript-derived hashes. These rows are intentionally
+non-deletable within the journal, so failed-only UUID coordinates persist for
+the journal's lifetime; treat UUIDv5 values as sensitive metadata, not as
+anonymous identifiers.
 
 One turn follows this order:
 

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from hivemind_weave import review_state as review_state_module
 from hivemind_weave import state as state_module
 from hivemind_weave.errors import StateConflictError
 from hivemind_weave.review_state import (
@@ -19,6 +20,7 @@ from hivemind_weave.review_state import (
     review_successor_plan_id,
 )
 from hivemind_weave.state import DB_APPLICATION_ID, DB_SCHEMA_VERSION, StateStore
+from hivemind_weave.utils import isoformat_z
 
 PROJECT = "wandb/hivemind-chats-review"
 PLAN_ID = "1" * 64
@@ -153,6 +155,271 @@ def test_review_state_lifecycle_keeps_only_content_free_evidence(tmp_path: Path)
     assert b"private prompt" not in raw
     assert b"tool result" not in raw
     assert b"codex" not in raw
+
+
+def test_preseal_failure_evidence_is_bounded_content_free_and_exact_revision(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "private" / "state.sqlite3"
+    with ReviewStateStore(state_path) as state:
+        first = state.record_preseal_failure(
+            project=PROJECT,
+            session_id=SESSION_ID,
+            started_at=START,
+            last_activity_at=ACTIVITY,
+            error_code="redaction_failed",
+        )
+        second = state.record_preseal_failure(
+            project=PROJECT,
+            session_id=SESSION_ID,
+            started_at=START,
+            last_activity_at=ACTIVITY,
+            error_code="mapping_invalid",
+        )
+        newer = state.record_preseal_failure(
+            project=PROJECT,
+            session_id=SESSION_ID,
+            started_at=START,
+            last_activity_at=ACTIVITY.replace(day=3),
+            error_code="source_unstable",
+        )
+
+        assert first.attempt_count == 1
+        assert second.attempt_count == 2
+        assert second.first_error_code == "redaction_failed"
+        assert second.last_error_code == "mapping_invalid"
+        assert second.first_attempt_at == first.first_attempt_at
+        assert second.last_attempt_at >= first.last_attempt_at
+        assert newer.attempt_count == 1
+        assert len(state.preseal_failures(PROJECT)) == 2
+        attempts = state.retry_session_attempts(PROJECT)
+        assert attempts[(SESSION_ID, START, ACTIVITY)].attempt_count == 2
+        assert attempts[(SESSION_ID, START, ACTIVITY.replace(day=3))].attempt_count == 1
+
+    raw = state_path.read_bytes()
+    for forbidden in (
+        b"private prompt",
+        b"private repository",
+        b"Alice Johnson",
+        b"exception traceback",
+        hashlib.sha256(b"Alice Johnson").hexdigest().encode(),
+    ):
+        assert forbidden not in raw
+
+
+def test_preseal_failure_accepts_preparation_timeout(tmp_path: Path) -> None:
+    state_path = tmp_path / "private" / "state.sqlite3"
+    with ReviewStateStore(state_path) as state:
+        first = state.record_preseal_failure(
+            project=PROJECT,
+            session_id=SESSION_ID,
+            started_at=START,
+            last_activity_at=ACTIVITY,
+            error_code="atif_schema",
+        )
+        timed_out = state.record_preseal_failure(
+            project=PROJECT,
+            session_id=SESSION_ID,
+            started_at=START,
+            last_activity_at=ACTIVITY,
+            error_code="preparation_timeout",
+        )
+
+        assert first.first_error_code == "atif_schema"
+        assert timed_out.first_error_code == "atif_schema"
+        assert timed_out.last_error_code == "preparation_timeout"
+        assert timed_out.attempt_count == 2
+        assert state.preseal_failures(PROJECT) == (timed_out,)
+
+
+def test_preseal_failure_accepts_same_second_fractional_timestamp_ordering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 8, 6, 16, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return cls.current if tz is None else cls.current.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(review_state_module, "datetime", FrozenDateTime)
+    state_path = tmp_path / "private" / "state.sqlite3"
+    started_at = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    last_activity_at = datetime(2026, 7, 1, 12, 0, 0, 100_000, tzinfo=UTC)
+
+    with ReviewStateStore(state_path) as state:
+        first = state.record_preseal_failure(
+            project=PROJECT,
+            session_id=SESSION_ID,
+            started_at=started_at,
+            last_activity_at=last_activity_at,
+            error_code="source_unstable",
+        )
+        FrozenDateTime.current = datetime(2026, 8, 6, 16, 0, 0, 100_000, tzinfo=UTC)
+        second = state.record_preseal_failure(
+            project=PROJECT,
+            session_id=SESSION_ID,
+            started_at=started_at,
+            last_activity_at=last_activity_at,
+            error_code="source_unstable",
+        )
+
+    assert first.first_attempt_at == datetime(2026, 8, 6, 16, 0, tzinfo=UTC)
+    assert second.last_attempt_at == FrozenDateTime.current
+    assert second.attempt_count == 2
+
+
+def test_pending_retry_count_excludes_owned_revision_and_restores_terminal_attempt(
+    tmp_path: Path,
+) -> None:
+    active_path = tmp_path / "active" / "state.sqlite3"
+    with ReviewStateStore(active_path) as state:
+        state.record_preseal_failure(
+            project=PROJECT,
+            session_id=SESSION_ID,
+            started_at=START,
+            last_activity_at=ACTIVITY,
+            error_code="source_unstable",
+        )
+        assert len(state.pending_retry_session_attempts(PROJECT)) == 1
+        _create(state)
+        assert state.pending_retry_session_attempts(PROJECT) == {}
+        assert state.status(PROJECT).preseal_retries == 0
+
+        cohort = state.get_or_create_cohort(PLAN_ID, 1)
+        assert cohort is not None
+        cohort = state.begin_cohort(cohort)
+        state.finish_cohort(
+            cohort,
+            success=True,
+            visible_turns=0,
+            skipped_turns=0,
+            conflicted_turns=0,
+            failed_items=0,
+        )
+        assert state.pending_retry_session_attempts(PROJECT) == {}
+        assert state.status(PROJECT).preseal_retries == 0
+
+    terminal_path = tmp_path / "terminal" / "state.sqlite3"
+    with ReviewStateStore(terminal_path) as state:
+        _block_with_preflight_conflict(state)
+        assert state.pending_retry_session_attempts(PROJECT) == {}
+        state.retire_preflight_plan(
+            PLAN_ID,
+            proof_sha256="c" * 64,
+            importer_version="0.4.0",
+        )
+        pending = state.pending_retry_session_attempts(PROJECT)
+        assert len(pending) == 1
+        assert (SESSION_ID, START, ACTIVITY) in pending
+        assert state.status(PROJECT).preseal_retries == 1
+
+
+def test_preseal_failure_rejects_unsafe_identity_project_and_code(tmp_path: Path) -> None:
+    state_path = tmp_path / "private" / "state.sqlite3"
+    with ReviewStateStore(state_path) as state:
+        with pytest.raises(StateConflictError, match="fixed private project"):
+            state.record_preseal_failure(
+                project="other/private-project",
+                session_id=SESSION_ID,
+                started_at=START,
+                last_activity_at=ACTIVITY,
+                error_code="atif_schema",
+            )
+        with pytest.raises(StateConflictError, match="unsafe"):
+            state.record_preseal_failure(
+                project=PROJECT,
+                session_id="alice@example.com",
+                started_at=START,
+                last_activity_at=ACTIVITY,
+                error_code="atif_schema",
+            )
+        with pytest.raises(StateConflictError, match="allowlisted"):
+            state.record_preseal_failure(
+                project=PROJECT,
+                session_id=SESSION_ID,
+                started_at=START,
+                last_activity_at=ACTIVITY,
+                error_code="alice_johnson",
+            )
+        assert state.preseal_failures(PROJECT) == ()
+
+    raw = state_path.read_bytes()
+    assert b"alice@example.com" not in raw
+    assert b"alice_johnson" not in raw
+
+
+def test_preseal_failure_sql_guards_and_decoder_fail_closed(tmp_path: Path) -> None:
+    state_path = tmp_path / "private" / "state.sqlite3"
+    with ReviewStateStore(state_path) as state:
+        state.record_preseal_failure(
+            project=PROJECT,
+            session_id=SESSION_ID,
+            started_at=START,
+            last_activity_at=ACTIVITY,
+            error_code="atif_schema",
+        )
+        key = (PROJECT, SESSION_ID, isoformat_z(START), isoformat_z(ACTIVITY))
+        where = "project = ? AND session_id = ? AND started_at = ? AND last_activity_at = ?"
+        with pytest.raises(sqlite3.IntegrityError, match=r"immutable|attempt evidence"):
+            state._db.execute(
+                f"UPDATE review_preseal_failures SET first_error_code = 'manifest_size' "
+                f"WHERE {where}",
+                key,
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="attempt evidence is invalid"):
+            state._db.execute(
+                f"UPDATE review_preseal_failures SET attempt_count = attempt_count + 2 "
+                f"WHERE {where}",
+                key,
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match=r"CHECK constraint|attempt evidence",
+        ):
+            state._db.execute(
+                f"UPDATE review_preseal_failures "
+                f"SET attempt_count = attempt_count + 1, last_error_code = 'alice_johnson' "
+                f"WHERE {where}",
+                key,
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be deleted"):
+            state._db.execute(
+                f"DELETE FROM review_preseal_failures WHERE {where}",
+                key,
+            )
+
+        # This lexical alias passes the intentionally small SQL length check,
+        # but the facade refuses to schedule from noncanonical saved evidence.
+        state._db.execute(
+            f"UPDATE review_preseal_failures "
+            f"SET attempt_count = attempt_count + 1, "
+            f"last_attempt_at = '2126-08-06T16:00:00+00:00' WHERE {where}",
+            key,
+        )
+        with pytest.raises(StateConflictError, match="not canonical UTC"):
+            state.preseal_failures(PROJECT)
+
+
+def test_retry_attempts_aggregate_terminal_and_preseal_evidence(tmp_path: Path) -> None:
+    state_path = tmp_path / "private" / "state.sqlite3"
+    with ReviewStateStore(state_path) as state:
+        state.record_preseal_failure(
+            project=PROJECT,
+            session_id=SESSION_ID,
+            started_at=START,
+            last_activity_at=ACTIVITY,
+            error_code="source_changed",
+        )
+        _block_with_preflight_conflict(state)
+        state.retire_preflight_plan(
+            PLAN_ID,
+            proof_sha256="c" * 64,
+            importer_version="0.4.0",
+        )
+        attempts = state.retry_session_attempts(PROJECT)
+        assert attempts[(SESSION_ID, START, ACTIVITY)].attempt_count == 2
 
 
 def test_low_entropy_filter_values_and_their_dictionary_hashes_never_reach_state(
@@ -938,6 +1205,7 @@ def test_schema_v7_adds_hosted_index_size_atomically(tmp_path: Path) -> None:
     recovery_statements = {
         *state_module._REVIEW_PREFLIGHT_RECOVERY_SCHEMA_SQL,
         *state_module._REVIEW_REVALIDATION_SCHEMA_SQL,
+        *state_module._REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL,
     }
     for statement in state_module._SCHEMA_SQL:
         if statement in recovery_statements:
@@ -977,6 +1245,7 @@ def test_schema_v8_adds_preflight_retirement_evidence_atomically(tmp_path: Path)
     recovery_statements = {
         *state_module._REVIEW_PREFLIGHT_RECOVERY_SCHEMA_SQL,
         *state_module._REVIEW_REVALIDATION_SCHEMA_SQL,
+        *state_module._REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL,
     }
     for statement in state_module._SCHEMA_SQL:
         if statement in recovery_statements:
@@ -1012,7 +1281,10 @@ def test_schema_v8_adds_preflight_retirement_evidence_atomically(tmp_path: Path)
 def test_schema_v9_adds_preflight_revalidation_evidence_atomically(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     connection = sqlite3.connect(path)
-    revalidation_statements = set(state_module._REVIEW_REVALIDATION_SCHEMA_SQL)
+    revalidation_statements = {
+        *state_module._REVIEW_REVALIDATION_SCHEMA_SQL,
+        *state_module._REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL,
+    }
     old_retirement_guard = state_module._REVIEW_PLAN_RETIREMENT_INSERT_GUARD_SQL.replace(
         "    AND NOT EXISTS (\n"
         "        SELECT 1 FROM review_plan_revalidations\n"
@@ -1135,6 +1407,8 @@ def test_schema_v10_tightens_review_ledger_delete_authority_atomically(
     )
     connection = sqlite3.connect(path)
     for statement in state_module._SCHEMA_SQL:
+        if statement in state_module._REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL:
+            continue
         if statement == state_module._REVIEW_LEDGER_NO_DELETE_TRIGGER_SQL:
             statement = old_trigger
         elif statement == state_module._REVIEW_PLAN_RETIREMENT_INSERT_GUARD_SQL:
@@ -1170,3 +1444,231 @@ def test_schema_v10_tightens_review_ledger_delete_authority_atomically(
         )
         assert "selected_count = 1" in retirement_sql
         assert "selected_count = 1" in revalidation_sql
+
+
+def test_schema_v11_adds_preseal_failure_fairness_atomically(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    for statement in state_module._SCHEMA_SQL:
+        if statement not in state_module._REVIEW_PRESEAL_FAIRNESS_SCHEMA_SQL:
+            connection.execute(statement)
+    connection.execute("PRAGMA user_version=11")
+    connection.execute(f"PRAGMA application_id={DB_APPLICATION_ID}")
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+
+    with StateStore(path) as state:
+        assert state.connection.execute("PRAGMA user_version").fetchone()[0] == DB_SCHEMA_VERSION
+        table = state.connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE name = 'review_preseal_failures'"
+        ).fetchone()
+        assert table is not None
+        assert "first_error_code" in str(table[0])
+        assert "last_error_code" in str(table[0])
+        triggers = {
+            str(row[0])
+            for row in state.connection.execute(
+                "SELECT name FROM sqlite_schema "
+                "WHERE type = 'trigger' AND tbl_name = 'review_preseal_failures'"
+            ).fetchall()
+        }
+        assert triggers == {
+            "review_preseal_failures_identity_immutable",
+            "review_preseal_failures_insert_guard",
+            "review_preseal_failures_attempt_guard",
+            "review_preseal_failures_no_delete",
+        }
+
+
+def _schema_v12_statement(statement: str) -> str:
+    if statement not in {
+        state_module._REVIEW_PRESEAL_FAILURES_SQL,
+        state_module._REVIEW_PRESEAL_FAILURE_ATTEMPT_TRIGGER_SQL,
+    }:
+        return statement
+    legacy = statement.replace("'preparation_timeout', ", "")
+    assert legacy != statement
+    return legacy
+
+
+def _create_schema_v12(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path)
+    for statement in state_module._SCHEMA_SQL:
+        connection.execute(_schema_v12_statement(statement))
+    connection.execute("PRAGMA user_version=12")
+    connection.execute(f"PRAGMA application_id={DB_APPLICATION_ID}")
+    return connection
+
+
+def test_schema_v12_adds_preparation_timeout_without_losing_rows_or_guards(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = _create_schema_v12(path)
+    columns = (
+        "project, session_id, started_at, last_activity_at, "
+        "first_error_code, last_error_code, attempt_count, "
+        "first_attempt_at, last_attempt_at"
+    )
+    connection.executemany(
+        f"INSERT INTO review_preseal_failures ({columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            (
+                PROJECT,
+                SESSION_ID,
+                isoformat_z(START),
+                isoformat_z(ACTIVITY),
+                "atif_schema",
+                "atif_schema",
+                1,
+                "2026-08-06T12:00:00Z",
+                "2026-08-06T12:00:00Z",
+            ),
+            (
+                PROJECT,
+                "22222222-2222-4222-8222-222222222222",
+                "2026-07-03T00:00:00Z",
+                "2026-07-04T00:00:00Z",
+                "source_unstable",
+                "source_unstable",
+                1,
+                "2026-08-06T12:30:00Z",
+                "2026-08-06T12:30:00Z",
+            ),
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE review_preseal_failures
+        SET last_error_code = 'mapping_invalid', attempt_count = 2,
+            last_attempt_at = '2026-08-06T13:00:00Z'
+        WHERE session_id = ?
+        """,
+        (SESSION_ID,),
+    )
+    before = connection.execute(
+        f"SELECT {columns} FROM review_preseal_failures ORDER BY session_id"
+    ).fetchall()
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+
+    with StateStore(path) as state:
+        assert state.connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        after = [
+            tuple(row)
+            for row in state.connection.execute(
+                f"SELECT {columns} FROM review_preseal_failures ORDER BY session_id"
+            ).fetchall()
+        ]
+        assert after == before
+        assert (
+            state.connection.execute(
+                "SELECT name FROM sqlite_schema WHERE name = 'review_preseal_failures_v12'"
+            ).fetchone()
+            is None
+        )
+
+        table_sql = str(
+            state.connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE name = 'review_preseal_failures'"
+            ).fetchone()[0]
+        )
+        assert "preparation_timeout" in table_sql
+        expected_triggers = {
+            "review_preseal_failures_identity_immutable": (
+                state_module._REVIEW_PRESEAL_FAILURE_IDENTITY_TRIGGER_SQL
+            ),
+            "review_preseal_failures_insert_guard": (
+                state_module._REVIEW_PRESEAL_FAILURE_INSERT_TRIGGER_SQL
+            ),
+            "review_preseal_failures_attempt_guard": (
+                state_module._REVIEW_PRESEAL_FAILURE_ATTEMPT_TRIGGER_SQL
+            ),
+            "review_preseal_failures_no_delete": (
+                state_module._REVIEW_PRESEAL_FAILURE_NO_DELETE_TRIGGER_SQL
+            ),
+        }
+        saved_triggers = {
+            str(row["name"]): str(row["sql"])
+            for row in state.connection.execute(
+                "SELECT name, sql FROM sqlite_schema "
+                "WHERE type = 'trigger' AND tbl_name = 'review_preseal_failures'"
+            ).fetchall()
+        }
+        assert {name: state_module._normalize_sql(sql) for name, sql in saved_triggers.items()} == {
+            name: state_module._normalize_sql(sql) for name, sql in expected_triggers.items()
+        }
+
+        timed_out = state.connection.execute(
+            """
+            UPDATE review_preseal_failures
+            SET last_error_code = 'preparation_timeout', attempt_count = attempt_count + 1,
+                last_attempt_at = '2026-08-06T14:00:00Z'
+            WHERE session_id = ?
+            RETURNING last_error_code, attempt_count
+            """,
+            (SESSION_ID,),
+        ).fetchone()
+        assert tuple(timed_out) == ("preparation_timeout", 3)
+
+
+def test_schema_v12_preparation_timeout_migration_rolls_back_atomically(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = _create_schema_v12(path)
+    connection.execute("PRAGMA ignore_check_constraints=ON")
+    connection.execute(
+        """
+        INSERT INTO review_preseal_failures (
+            project, session_id, started_at, last_activity_at,
+            first_error_code, last_error_code, attempt_count,
+            first_attempt_at, last_attempt_at
+        ) VALUES (?, ?, ?, ?, 'not_allowlisted', 'not_allowlisted', 1, ?, ?)
+        """,
+        (
+            PROJECT,
+            SESSION_ID,
+            isoformat_z(START),
+            isoformat_z(ACTIVITY),
+            "2026-08-06T12:00:00Z",
+            "2026-08-06T12:00:00Z",
+        ),
+    )
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        StateStore(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        names = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type IN ('table', 'trigger')"
+            ).fetchall()
+        }
+        assert "review_preseal_failures" in names
+        assert "review_preseal_failures_v12" not in names
+        assert {
+            "review_preseal_failures_identity_immutable",
+            "review_preseal_failures_insert_guard",
+            "review_preseal_failures_attempt_guard",
+            "review_preseal_failures_no_delete",
+        } <= names
+        table_sql = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE name = 'review_preseal_failures'"
+            ).fetchone()[0]
+        )
+        assert "preparation_timeout" not in table_sql
+        assert connection.execute(
+            "SELECT last_error_code FROM review_preseal_failures"
+        ).fetchall() == [("not_allowlisted",)]
+    finally:
+        connection.close()

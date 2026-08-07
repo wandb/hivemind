@@ -38,13 +38,19 @@ from .review_manifest import (
     ReviewManifestError,
     build_review_manifest,
 )
-from .review_sink import ReviewRuntime, preflight_review_bundle, preflight_review_runtime
+from .review_sink import (
+    HostedReviewError,
+    ReviewRuntime,
+    preflight_review_bundle,
+    preflight_review_runtime,
+)
 from .review_state import (
     REVIEW_SOURCE_SCOPE_SHA256,
     ReviewCohort,
     ReviewLedgerTurn,
     ReviewPlan,
     ReviewPlanSession,
+    ReviewRetryAttempt,
     ReviewStateStore,
     ReviewStatus,
     ReviewTurnCertificate,
@@ -54,6 +60,16 @@ from .review_state import (
     valid_review_span_id,
     valid_review_trace_id,
 )
+from .review_worker import (
+    DEFAULT_SESSION_TIMEOUT_MINUTES,
+    MAX_SESSION_TIMEOUT_MINUTES,
+    MIN_SESSION_TIMEOUT_MINUTES,
+    ReviewPreparationResult,
+    ReviewPreparationSourceSerialization,
+    ReviewPreparationSupervisor,
+    ReviewPreparationTimeout,
+    ReviewPreparationWorkerError,
+)
 from .source_identity import is_opaque_source_coordinate
 from .utils import isoformat_z, sha256_json
 
@@ -62,6 +78,8 @@ REVIEW_SETTLE_MINUTES = 60
 REVIEW_WEAVE_COMMIT = "0b58f67e1539bfaa2c705e35bed2d9896a319c6a"
 _CANARY_TRANSCRIPT_BUDGET = 25
 _CANARY_SUMMARY_TOKEN_BUDGET = 100_000
+_MICROPLAN_REJECTION_ALLOWANCE = 8
+_MICROPLAN_MAX_TRANSCRIPT_ATTEMPTS = 108
 _CANARY_TOKEN_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -89,6 +107,7 @@ class ReviewPreviewConfig:
     repositories: tuple[str, ...] = ()
     session_ids: tuple[str, ...] = ()
     exclude_subagents: bool = False
+    session_timeout_minutes: int | None = None
     now: datetime | None = None
     progress: Callable[[str], None] | None = None
 
@@ -131,6 +150,7 @@ class ReviewReport:
     completed_sessions: int = 0
     remaining_sessions: int = 0
     remaining_backlog_sessions: int = 0
+    preseal_retries: int = 0
     turns: int = 0
     visible_turns: int = 0
     skipped_turns: int = 0
@@ -178,6 +198,7 @@ class ReviewReport:
                     f"  deferred sessions:    {self.deferred}",
                     f"  invalid summaries:    {self.invalid}",
                     f"  unplanned backlog:    {self.remaining_backlog_sessions}",
+                    f"  pre-seal retries:     {self.preseal_retries}",
                     f"  certified turns:      {self.turns}",
                     f"  manifest bytes:       {self.manifest_bytes}",
                     f"  max manifest bytes:   {self.max_manifest_bytes}",
@@ -358,21 +379,143 @@ def _canary_rejection_reason(prepared: _PreparedSession, *, now: datetime) -> st
     return None
 
 
+def _supervised_canary_rejection_reason(
+    prepared: ReviewPreparationResult,
+    *,
+    now: datetime,
+) -> str | None:
+    """Apply the canary contract using only validated content-free evidence."""
+    if now - prepared.last_activity_at < timedelta(hours=24):
+        return "not_inactive_24h"
+    if prepared.is_subagent:
+        return "child_session"
+    if len(prepared.certificate_payloads) != len(prepared.canary_turn_facts):
+        raise ReviewMirrorError(
+            "review preparation worker returned inconsistent canary turn evidence"
+        )
+    if not 1 <= len(prepared.certificate_payloads) <= 3:
+        return "turn_budget"
+    for certificate, facts in zip(
+        prepared.certificate_payloads,
+        prepared.canary_turn_facts,
+        strict=True,
+    ):
+        if facts.physical_span_count > 4:
+            return "span_budget"
+        if facts.mapping_warning_count:
+            return "mapping_warning"
+        if certificate["chunk_count"] != 1:
+            return "wire_budget"
+    return None
+
+
 def _canary_preparation_rejection(error: Exception) -> str | None:
     """Classify only candidate-specific failures; propagate importer defects."""
+    if isinstance(error, ReviewPreparationWorkerError):
+        return None
     if isinstance(error, ATIFSchemaError):
         return "atif_schema"
     message = str(error)
     if isinstance(error, ReviewMirrorError):
-        if "not stable" in message:
+        if message in _SOURCE_UNSTABLE_MESSAGES:
             return "source_unstable"
-        return "source_changed" if "changed" in message else None
+        return "source_changed" if message in _SOURCE_CHANGED_MESSAGES else None
     if isinstance(error, ReviewManifestError):
         if "requires more than the allowed chunks" in message:
             return "manifest_size"
         if "contains a non-JSON value" in message or "contains invalid Unicode" in message:
-            return "source_serialization"
+            # `source_serialization` is reserved for the parent's bounded
+            # metadata request. A transcript-level manifest defect is still a
+            # deterministic candidate-local mapping failure.
+            return "mapping_invalid"
     return None
+
+
+_REDACTION_FAILURE_MESSAGES = frozenset(
+    {
+        "PII engine altered an internal redaction-marker token",
+        "PII engine altered an internal code-identifier token",
+        "PII redaction exceeded bounded work before reaching a fixed point",
+        "PII redaction entered a cycle before reaching a fixed point",
+        "PII redaction made a non-redacting change before reaching a fixed point",
+        "credential and PII redaction did not reach a verified fixed point",
+        "mapping keys collide after PII redaction",
+        "review preview redaction failed",
+        "review preview redaction changed the text type",
+        "required hosted review redaction failed",
+        "canonical review bundle is not a fixed point of the active redactor",
+    }
+)
+_MAPPING_FAILURE_MESSAGES = frozenset(
+    {
+        "mapped ATIF JSON attribute is not text",
+        "mapped ATIF JSON attribute is invalid",
+        "mapped ATIF JSON attribute wrapper changed type",
+        "mapped ATIF JSON attribute changed type during redaction",
+        "mapped turn attributes changed shape during redaction",
+        "mapped turn is missing its session metadata",
+        "mapped turn has invalid parent-session metadata",
+        "mapped turn has invalid mapping warnings",
+        "mapped turn is missing its source payload hash",
+        "mapped turn has invalid attributes",
+        "mapped turn has invalid ATIF trajectory metadata",
+        "review manifest does not contain a complete mapped turn",
+        "review manifest has invalid mapping warnings",
+        "review manifest warnings do not match the mapped turn",
+        "review manifest session metadata does not match the mapped turn",
+        "review manifest has invalid mapped messages",
+    }
+)
+_SOURCE_CHANGED_MESSAGES = frozenset(
+    {
+        "a selected session changed before review preparation; no content was uploaded",
+        "a selected session detail changed during review preparation; no content was uploaded",
+    }
+)
+_SOURCE_UNSTABLE_MESSAGES = frozenset(
+    {
+        "a selected session export was not stable across repeated preparation; "
+        "no content was uploaded",
+    }
+)
+
+
+def _preseal_preparation_failure_code(error: Exception) -> str | None:
+    """Classify only fixed, candidate-local preparation failures.
+
+    Unknown exceptions and generic wrapper messages are deliberately not
+    durable retry evidence. Their full body remains process-local and the run
+    aborts fail-closed.
+    """
+    current: BaseException | None = error
+    seen: set[int] = set()
+    mapping_fallback = False
+    candidate_codes: list[str] = []
+    for _depth in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        if isinstance(current, ReviewPreparationWorkerError):
+            return None
+        message = str(current)
+        if message in _REDACTION_FAILURE_MESSAGES:
+            return "redaction_failed"
+        if isinstance(current, Exception):
+            candidate_code = _canary_preparation_rejection(current)
+            if candidate_code is not None:
+                candidate_codes.append(candidate_code)
+        if message in _MAPPING_FAILURE_MESSAGES or (
+            message.startswith("mapped ATIF JSON attribute ")
+            and message.endswith(" failed redaction")
+        ):
+            # A sanitizer mapping wrapper may carry a more specific fixed-point
+            # failure as its cause. Preserve that coarser-but-correct category
+            # without retaining either message.
+            mapping_fallback = True
+        current = current.__cause__
+    if candidate_codes:
+        return candidate_codes[0]
+    return "mapping_invalid" if mapping_fallback else None
 
 
 def _certificate_payload(
@@ -380,38 +523,48 @@ def _certificate_payload(
     project: str,
     prepared: _PreparedSession,
     stats: dict[str, int] | None = None,
+    include_index_evidence: bool = False,
 ) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for ordinal, turn in enumerate(prepared.conversation.turns):
         bundle = build_review_manifest(prepared.conversation, turn)
         if stats is not None:
             _accumulate_bundle_stats(stats, bundle)
-        payload.append(
-            {
-                "session_id": prepared.session.id,
-                "ordinal": ordinal,
-                "turn_key": turn.key,
-                "source_payload_sha256": bundle.source_payload_sha256,
-                "manifest_sha256": bundle.manifest_sha256,
-                "index_sha256": bundle.index_sha256,
-                "logical_key": review_logical_key(
-                    project,
-                    prepared.conversation.conversation_id,
-                    turn.key,
-                ),
-                "preview_signature": bundle.preview_signature,
-                "started_at": turn.started_at,
-                "ended_at": turn.ended_at,
-                "manifest_bytes": bundle.manifest_byte_count,
-                "chunk_count": len(bundle.chunks),
-                "max_chunk_bytes": max(
-                    (chunk.byte_count for chunk in bundle.chunks),
-                    default=0,
-                ),
-                "index_bytes": bundle.index_byte_count,
-                "atif_schema_version": prepared.conversation.schema_version,
-            }
-        )
+        certificate = {
+            "session_id": prepared.session.id,
+            "ordinal": ordinal,
+            "turn_key": turn.key,
+            "source_payload_sha256": bundle.source_payload_sha256,
+            "manifest_sha256": bundle.manifest_sha256,
+            "index_sha256": bundle.index_sha256,
+            "logical_key": review_logical_key(
+                project,
+                prepared.conversation.conversation_id,
+                turn.key,
+            ),
+            "preview_signature": bundle.preview_signature,
+            "started_at": turn.started_at,
+            "ended_at": turn.ended_at,
+            "manifest_bytes": bundle.manifest_byte_count,
+            "chunk_count": len(bundle.chunks),
+            "max_chunk_bytes": max(
+                (chunk.byte_count for chunk in bundle.chunks),
+                default=0,
+            ),
+            "index_bytes": bundle.index_byte_count,
+            "atif_schema_version": prepared.conversation.schema_version,
+        }
+        if include_index_evidence:
+            # The index contains only immutable names, digests, sizes, and
+            # schemas. It lets the parent validate every size relationship
+            # without returning any manifest/transcript content through IPC.
+            certificate["worker_index_json"] = bundle.index_json
+            certificate["worker_physical_span_count"] = (
+                1 + len(turn.llms) + len(turn.tools) + len(turn.subagents)
+            )
+            warnings = turn.attributes.get("hivemind.mapping_warnings", [])
+            certificate["worker_mapping_warning_count"] = len(warnings)
+        payload.append(certificate)
     return payload
 
 
@@ -568,6 +721,32 @@ def _accumulate_bundle_stats(
         stats["manifests_gt_64m"] += 1
 
 
+def _accumulate_certificate_stats(
+    stats: dict[str, int],
+    payloads: Sequence[dict[str, Any]],
+) -> None:
+    """Accumulate report counters from validated content-free worker evidence."""
+    for payload in payloads:
+        manifest_bytes = payload["manifest_bytes"]
+        chunk_count = payload["chunk_count"]
+        max_chunk_bytes = payload["max_chunk_bytes"]
+        stats["turns"] += 1
+        stats["manifest_bytes"] += manifest_bytes
+        stats["max_manifest_bytes"] = max(stats["max_manifest_bytes"], manifest_bytes)
+        stats["chunk_count"] += chunk_count
+        stats["max_chunks_per_turn"] = max(stats["max_chunks_per_turn"], chunk_count)
+        stats["max_chunk_bytes"] = max(stats["max_chunk_bytes"], max_chunk_bytes)
+        stats["index_bytes"] += payload["index_bytes"]
+        if manifest_bytes <= 1024 * 1024:
+            stats["manifests_le_1m"] += 1
+        elif manifest_bytes <= 8 * 1024 * 1024:
+            stats["manifests_le_8m"] += 1
+        elif manifest_bytes <= 64 * 1024 * 1024:
+            stats["manifests_le_64m"] += 1
+        else:
+            stats["manifests_gt_64m"] += 1
+
+
 def _canary_summary_cannot_fit(raw: dict[str, Any]) -> bool:
     """Reject only explicit summary values outside the strict canary budget."""
     turn_count = raw.get("turn_count")
@@ -608,6 +787,7 @@ def preview_review(
     config: ReviewPreviewConfig,
     *,
     hivemind: HiveMindClient | None = None,
+    preparation_supervisor: ReviewPreparationSupervisor | None = None,
 ) -> ReviewReport:
     """Discover, redact, serialize, and seal a content-free immutable plan."""
     _validate_review_project(config.project)
@@ -621,6 +801,14 @@ def preview_review(
             raise ValueError("--next-sessions cannot be combined with --canary")
         if config.session_ids:
             raise ValueError("--next-sessions cannot be combined with --session-id")
+    if config.session_timeout_minutes is not None and (
+        type(config.session_timeout_minutes) is not int
+        or not MIN_SESSION_TIMEOUT_MINUTES
+        <= config.session_timeout_minutes
+        <= MAX_SESSION_TIMEOUT_MINUTES
+    ):
+        raise ValueError("--session-timeout-minutes must be between 1 and 60")
+    session_timeout_minutes = config.session_timeout_minutes or DEFAULT_SESSION_TIMEOUT_MINUTES
     # A moving or incompatible Weave install is a run-level failure, not a
     # canary-candidate defect. Prove the exact local SDK contract before HiveMind
     # discovery or any sealed-plan mutation.
@@ -650,6 +838,9 @@ def preview_review(
             raise ValueError("--session-id must be an opaque HiveMind machine identifier")
     client = hivemind or HiveMindClient()
     client.preflight()
+    active_supervisor = preparation_supervisor
+    if active_supervisor is None and hivemind is None:
+        active_supervisor = ReviewPreparationSupervisor()
     raw_sessions = client.list_sessions(
         days=_server_lookback_days(window, captured_now),
         include_subagents=True,
@@ -685,9 +876,11 @@ def preview_review(
     stats = _empty_report_stats()
     planning_sessions = selection.sessions
     remaining_backlog_sessions = 0
+    pending_backlog_count = 0
+    retry_revision_keys: set[tuple[str, datetime, datetime]] = set()
     if config.next_sessions is not None:
         completed_snapshots: set[tuple[str, datetime, datetime]] = set()
-        terminal_snapshots: set[tuple[str, datetime, datetime]] = set()
+        retry_attempts: dict[tuple[str, datetime, datetime], ReviewRetryAttempt] = {}
         state_path = config.state_path.expanduser()
         if state_path.exists():
             with ReviewStateStore(state_path) as state:
@@ -702,28 +895,41 @@ def preview_review(
                         f"apply or reconcile plan {unfinished.plan_id[:32]}"
                     )
                 completed_snapshots = state.completed_session_snapshots(config.project)
-                terminal_snapshots = state.terminal_session_snapshots(config.project)
+                retry_attempts = state.pending_retry_session_attempts(config.project)
         pending_sessions = [
             session
             for session in selection.sessions
             if (session.id, session.started_at, session.last_activity_at) not in completed_snapshots
         ]
+        pending_backlog_count = len(pending_sessions)
+        retry_revision_keys = set(retry_attempts)
         pending_sessions.sort(
             key=lambda session: (
                 (
-                    session.id,
-                    session.started_at,
-                    session.last_activity_at,
+                    attempt := retry_attempts.get(
+                        (session.id, session.started_at, session.last_activity_at)
+                    )
                 )
-                in terminal_snapshots,
+                is not None,
+                attempt.attempt_count if attempt is not None else 0,
+                attempt.last_attempt_at
+                if attempt is not None
+                else datetime.min.replace(tzinfo=UTC),
                 _summary_work_order(
                     summaries_by_id.get(session.id, {}),
                     session,
                 ),
             )
         )
-        planning_sessions = pending_sessions[: config.next_sessions]
-        remaining_backlog_sessions = len(pending_sessions) - len(planning_sessions)
+        # Rejections do not consume the whole-session success budget, but they
+        # do consume a separate bounded transcript-attempt allowance. A bad
+        # backlog therefore cannot turn `--next-sessions 1` into an unbounded
+        # mapping/redaction run.
+        transcript_attempt_budget = min(
+            _MICROPLAN_MAX_TRANSCRIPT_ATTEMPTS,
+            config.next_sessions + _MICROPLAN_REJECTION_ALLOWANCE,
+        )
+        planning_sessions = pending_sessions[:transcript_attempt_budget]
     if config.canary:
         canary_rejections: dict[str, int] = {}
 
@@ -740,7 +946,6 @@ def preview_review(
             1
             for session in selection.sessions
             if captured_now - session.last_activity_at >= timedelta(hours=24)
-            and not session.parent_session_id
             and not (
                 (summary := summaries_by_id.get(session.id)) is not None
                 and _canary_summary_cannot_fit(summary)
@@ -756,8 +961,6 @@ def preview_review(
         for session in selection.sessions:
             if captured_now - session.last_activity_at < timedelta(hours=24):
                 continue
-            if session.parent_session_id:
-                continue
             summary = summaries_by_id.get(session.id)
             if summary is not None and _canary_summary_cannot_fit(summary):
                 continue
@@ -769,13 +972,42 @@ def preview_review(
                     "Canary transcript preflight: "
                     f"{examined_transcripts}/{min(plausible_count, _CANARY_TRANSCRIPT_BUDGET)}"
                 )
+            prepared: _PreparedSession | None = None
+            supervised: ReviewPreparationResult | None = None
             try:
-                prepared = _prepare_session_stable(
-                    client,
-                    session,
-                    project=config.project,
-                    runtime=runtime,
+                if active_supervisor is None:
+                    prepared = _prepare_session_stable(
+                        client,
+                        session,
+                        project=config.project,
+                        runtime=runtime,
+                    )
+                else:
+                    supervised = active_supervisor.prepare(
+                        session=session,
+                        project=config.project,
+                        hivemind_binary=str(getattr(client, "binary", "")),
+                        timeout_seconds=session_timeout_minutes * 60,
+                    )
+                    if supervised.rejection_code:
+                        report_canary_result(
+                            ordinal=examined_transcripts,
+                            total=min(plausible_count, _CANARY_TRANSCRIPT_BUDGET),
+                            result=supervised.rejection_code,
+                        )
+                        continue
+            except ReviewPreparationSourceSerialization:
+                report_canary_result(
+                    ordinal=examined_transcripts,
+                    total=min(plausible_count, _CANARY_TRANSCRIPT_BUDGET),
+                    result="source_serialization",
                 )
+                continue
+            except ReviewPreparationTimeout:
+                raise ReviewMirrorError(
+                    "review canary session preparation exceeded the configured deadline; "
+                    "no plan was sealed"
+                ) from None
             except (ReviewMirrorError, ATIFSchemaError, ReviewManifestError) as error:
                 reason = _canary_preparation_rejection(error)
                 if reason is None:
@@ -786,35 +1018,58 @@ def preview_review(
                     result=reason,
                 )
                 continue
-            rejection_reason = _canary_rejection_reason(prepared, now=captured_now)
+            if prepared is not None:
+                rejection_reason = _canary_rejection_reason(
+                    prepared,
+                    now=captured_now,
+                )
+            else:
+                assert supervised is not None
+                rejection_reason = _supervised_canary_rejection_reason(
+                    supervised,
+                    now=captured_now,
+                )
             if rejection_reason is None:
                 report_canary_result(
                     ordinal=examined_transcripts,
                     total=min(plausible_count, _CANARY_TRANSCRIPT_BUDGET),
                     result="selected",
                 )
-                selected_sessions.append(
-                    (
-                        prepared.session.id,
-                        prepared.session.started_at,
-                        prepared.session.last_activity_at,
+                if prepared is not None:
+                    selected_sessions.append(
+                        (
+                            prepared.session.id,
+                            prepared.session.started_at,
+                            prepared.session.last_activity_at,
+                        )
                     )
-                )
-                certificate_payloads.extend(
-                    _certificate_payload(
-                        project=config.project,
-                        prepared=prepared,
-                        stats=stats,
+                    certificate_payloads.extend(
+                        _certificate_payload(
+                            project=config.project,
+                            prepared=prepared,
+                            stats=stats,
+                        )
                     )
-                )
-                del prepared
+                    del prepared
+                else:
+                    assert supervised is not None
+                    selected_sessions.append(
+                        (
+                            supervised.session_id,
+                            supervised.started_at,
+                            supervised.last_activity_at,
+                        )
+                    )
+                    certificate_payloads.extend(supervised.certificate_payloads)
+                    _accumulate_certificate_stats(stats, supervised.certificate_payloads)
                 break
             report_canary_result(
                 ordinal=examined_transcripts,
                 total=min(plausible_count, _CANARY_TRANSCRIPT_BUDGET),
                 result=rejection_reason,
             )
-            del prepared
+            if prepared is not None:
+                del prepared
         if not selected_sessions:
             if config.progress is not None and canary_rejections:
                 config.progress(
@@ -829,37 +1084,143 @@ def preview_review(
             )
     else:
         for ordinal, session in enumerate(planning_sessions, start=1):
+            if config.next_sessions is not None and len(selected_sessions) >= config.next_sessions:
+                break
             if config.next_sessions is not None and config.progress is not None:
                 config.progress(
                     f"Microplan transcript preflight: {ordinal}/{len(planning_sessions)}"
                 )
-            prepared = _prepare_session_stable(
-                client,
-                session,
-                project=config.project,
-                runtime=runtime,
-            )
-            selected_sessions.append(
-                (
-                    prepared.session.id,
-                    prepared.session.started_at,
-                    prepared.session.last_activity_at,
+            prepared: _PreparedSession | None = None
+            supervised_payloads: tuple[dict[str, Any], ...] = ()
+            error_code = ""
+            try:
+                if active_supervisor is None:
+                    prepared = _prepare_session_stable(
+                        client,
+                        session,
+                        project=config.project,
+                        runtime=runtime,
+                    )
+                else:
+                    supervised = active_supervisor.prepare(
+                        session=session,
+                        project=config.project,
+                        hivemind_binary=str(getattr(client, "binary", "")),
+                        timeout_seconds=session_timeout_minutes * 60,
+                    )
+                    error_code = supervised.rejection_code
+                    if not error_code:
+                        supervised_payloads = supervised.certificate_payloads
+                        selected_session = (
+                            supervised.session_id,
+                            supervised.started_at,
+                            supervised.last_activity_at,
+                        )
+            except ReviewPreparationSourceSerialization:
+                error_code = "source_serialization"
+            except ReviewPreparationTimeout:
+                if config.next_sessions is not None:
+                    with ReviewStateStore(config.state_path) as state:
+                        state.record_preseal_failure(
+                            project=config.project,
+                            session_id=session.id,
+                            started_at=session.started_at,
+                            last_activity_at=session.last_activity_at,
+                            error_code="preparation_timeout",
+                        )
+                    if config.progress is not None:
+                        config.progress(
+                            f"Microplan transcript result: {ordinal}/{len(planning_sessions)} "
+                            "rejected (preparation_timeout)"
+                        )
+                # The supervisor has already terminated and reaped its process
+                # group. Stop this invocation so a machine-load-dependent
+                # timeout cannot silently select a later source revision.
+                raise ReviewMirrorError(
+                    "review session preparation exceeded the configured deadline; "
+                    + (
+                        "no plan was sealed and the revision remains queued"
+                        if config.next_sessions is not None
+                        else "no plan was sealed"
+                    )
+                ) from None
+            except (
+                ATIFSchemaError,
+                HostedReviewError,
+                ReviewManifestError,
+                ReviewMirrorError,
+                ValueError,
+            ) as error:
+                if config.next_sessions is None:
+                    raise
+                error_code = _preseal_preparation_failure_code(error)
+                if error_code is None:
+                    raise
+            if error_code:
+                if config.next_sessions is None:
+                    raise ReviewMirrorError(
+                        "review session failed isolated preparation "
+                        f"({error_code}); no plan was sealed"
+                    )
+                revision_key = (
+                    session.id,
+                    session.started_at,
+                    session.last_activity_at,
                 )
-            )
-            certificate_payloads.extend(
-                _certificate_payload(
-                    project=config.project,
-                    prepared=prepared,
-                    stats=stats,
+                with ReviewStateStore(config.state_path) as state:
+                    state.record_preseal_failure(
+                        project=config.project,
+                        session_id=session.id,
+                        started_at=session.started_at,
+                        last_activity_at=session.last_activity_at,
+                        error_code=error_code,
+                    )
+                if config.progress is not None:
+                    config.progress(
+                        f"Microplan transcript result: {ordinal}/{len(planning_sessions)} "
+                        f"rejected ({error_code})"
+                    )
+                # Retry at most one already-attempted revision per invocation.
+                # Its newly incremented rank then lets another equally pending
+                # failed revision move ahead on the next invocation.
+                if revision_key in retry_revision_keys:
+                    break
+                continue
+            if prepared is not None:
+                selected_sessions.append(
+                    (
+                        prepared.session.id,
+                        prepared.session.started_at,
+                        prepared.session.last_activity_at,
+                    )
                 )
-            )
+                certificate_payloads.extend(
+                    _certificate_payload(
+                        project=config.project,
+                        prepared=prepared,
+                        stats=stats,
+                    )
+                )
+            else:
+                selected_sessions.append(selected_session)
+                certificate_payloads.extend(supervised_payloads)
+                _accumulate_certificate_stats(stats, supervised_payloads)
             if config.next_sessions is not None and config.progress is not None:
                 config.progress(
                     f"Microplan transcript result: {ordinal}/{len(planning_sessions)} certified"
                 )
             # A 21-day backlog may contain very large transcripts.  Only the
             # content-free certificate survives into the next iteration.
-            del prepared
+            if prepared is not None:
+                del prepared
+
+        if config.next_sessions is not None:
+            remaining_backlog_sessions = pending_backlog_count - len(selected_sessions)
+            if planning_sessions and not selected_sessions:
+                raise ReviewMirrorError(
+                    "no pending session passed bounded review preparation; "
+                    "recognized revisions remain queued for a later fair retry"
+                )
 
     base_plan_id = review_plan_id(
         _plan_hash_payload(
@@ -899,6 +1260,7 @@ def preview_review(
             turns=certificates,
         )
         completed, remaining = state.progress(plan.plan_id)
+        preseal_retries = len(state.pending_retry_session_attempts(config.project))
     return ReviewReport(
         phase="preview",
         project=plan.project,
@@ -915,6 +1277,7 @@ def preview_review(
         completed_sessions=completed,
         remaining_sessions=remaining,
         remaining_backlog_sessions=remaining_backlog_sessions,
+        preseal_retries=preseal_retries,
         **stats,
     )
 
@@ -1976,6 +2339,7 @@ def review_status(state_path: Path, *, project: str = REVIEW_PROJECT) -> str:
             plans=0,
             queued_sessions=0,
             completed_sessions=0,
+            preseal_retries=0,
             planned_turns=0,
             objects_publishing=0,
             objects_verified=0,
@@ -1994,6 +2358,7 @@ def review_status(state_path: Path, *, project: str = REVIEW_PROJECT) -> str:
             f"  sealed plans:         {status.plans}",
             f"  queued sessions:      {status.queued_sessions}",
             f"  completed sessions:   {status.completed_sessions}",
+            f"  pre-seal retries:     {status.preseal_retries}",
             f"  planned turns:        {status.planned_turns}",
             f"  objects publishing:   {status.objects_publishing}",
             f"  objects verified:     {status.objects_verified}",

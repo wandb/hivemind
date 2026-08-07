@@ -219,6 +219,12 @@ def build_parser() -> argparse.ArgumentParser:
             "in this private project"
         ),
     )
+    review_preview.add_argument(
+        "--session-timeout-minutes",
+        type=int,
+        metavar="MINUTES",
+        help=("hard 1-60 minute preparation deadline per session (default: 15)"),
+    )
     review_preview.add_argument("--state-path", type=Path, default=review_state_default)
 
     review_apply = review_subparsers.add_parser(
@@ -436,6 +442,7 @@ def main(argv: list[str] | None = None) -> int:
                         repositories=tuple(args.repo),
                         session_ids=tuple(args.session_id),
                         exclude_subagents=args.exclude_subagents,
+                        session_timeout_minutes=args.session_timeout_minutes,
                         progress=lambda message: print(message, flush=True),
                     )
                 )

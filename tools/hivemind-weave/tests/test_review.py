@@ -4,6 +4,8 @@ import gc
 import hashlib
 import json
 import sqlite3
+import sys
+import textwrap
 import weakref
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -34,6 +36,13 @@ from hivemind_weave.review import (
 )
 from hivemind_weave.review_manifest import ReviewManifestError
 from hivemind_weave.review_state import ReviewStateStore, review_logical_key
+from hivemind_weave.review_worker import (
+    ReviewCanaryTurnFacts,
+    ReviewPreparationResult,
+    ReviewPreparationSupervisor,
+    ReviewPreparationTimeout,
+    ReviewPreparationWorkerError,
+)
 from hivemind_weave.utils import canonical_json, isoformat_z, parse_datetime
 
 NOW = datetime(2026, 8, 6, 16, 0, tzinfo=UTC)
@@ -310,6 +319,77 @@ def _preview(
     )
 
 
+def _scripted_certificate_supervisor(
+    certificate_payloads: list[dict[str, Any]],
+    *,
+    is_subagent: bool = False,
+) -> ReviewPreparationSupervisor:
+    serialized_payloads = canonical_json(certificate_payloads)
+    script = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import sys
+
+        request = json.load(sys.stdin)
+        session = request["session"]
+        response = {{
+            "protocol": request["protocol"],
+            "importer_version": request["importer_version"],
+            "nonce": request["nonce"],
+            "status": "prepared",
+            "project": request["project"],
+            "session": {{
+                "id": session["id"],
+                "started_at": session["started_at"],
+                "last_activity_at": session["last_activity_at"],
+                "is_subagent": {is_subagent!r},
+            }},
+            "certificates": json.loads({serialized_payloads!r}),
+        }}
+        os.write(int(sys.argv[1]), json.dumps(response).encode())
+        """
+    )
+    return ReviewPreparationSupervisor(
+        command_factory=lambda result_fd: (sys.executable, "-c", script, str(result_fd))
+    )
+
+
+def test_preseal_classifier_prefers_wrapped_redaction_and_rejects_unknowns() -> None:
+    fixed_point = ValueError(
+        "PII redaction made a non-redacting change before reaching a fixed point"
+    )
+    wrapped = ValueError("mapped ATIF JSON attribute tool_arguments_json failed redaction")
+    wrapped.__cause__ = fixed_point
+    serialization_wrapper = ReviewManifestError("review manifest contains invalid Unicode")
+    serialization_wrapper.__cause__ = wrapped
+    source_wrapper = ReviewMirrorError(
+        "a selected session export was not stable across repeated preparation"
+    )
+    source_wrapper.__cause__ = serialization_wrapper
+
+    assert review_module._preseal_preparation_failure_code(wrapped) == "redaction_failed"
+    assert review_module._preseal_preparation_failure_code(source_wrapper) == "redaction_failed"
+    assert (
+        review_module._preseal_preparation_failure_code(
+            ValueError("mapped ATIF JSON attribute is invalid")
+        )
+        == "mapping_invalid"
+    )
+    assert (
+        review_module._preseal_preparation_failure_code(
+            ReviewManifestError("unexpected private invariant body")
+        )
+        is None
+    )
+    assert (
+        review_module._preseal_preparation_failure_code(
+            ReviewMirrorError("private worker changed an unrelated internal invariant")
+        )
+        is None
+    )
+
+
 def _terminalize_zero_write_plan(state_path: Path, plan_id: str) -> None:
     with ReviewStateStore(state_path) as state:
         cohort = state.get_or_create_cohort(plan_id, 1)
@@ -380,6 +460,218 @@ def test_preview_seals_complete_content_free_plan_and_canary(
     assert all(isinstance(item.ended_at, datetime) for item in turns)
 
 
+def test_subprocess_canary_matches_inprocess_plan_and_keeps_state_content_free(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    certificate_client = _client(session_payload, atif_wrapper)
+    prepared = review_module._prepare_session_stable(
+        certificate_client,
+        review_module.Session.from_api(certificate_client.sessions[0]),
+        project=REVIEW_PROJECT,
+        runtime=review_module.preflight_review_runtime(),
+    )
+    worker_payloads = review_module._certificate_payload(
+        project=REVIEW_PROJECT,
+        prepared=prepared,
+        include_index_evidence=True,
+    )
+    direct = _preview(
+        tmp_path / "direct",
+        _client(session_payload, atif_wrapper),
+        canary=True,
+    )
+    supervised_client = _client(session_payload, atif_wrapper)
+    supervised_client.binary = "/usr/bin/true"  # type: ignore[attr-defined]
+    supervised_path = tmp_path / "supervised" / "state.sqlite3"
+    supervised = preview_review(
+        ReviewPreviewConfig(
+            since="2026-07-16T00:00:00Z",
+            until="2026-08-06T16:00:00Z",
+            project=REVIEW_PROJECT,
+            state_path=supervised_path,
+            canary=True,
+            now=NOW,
+        ),
+        hivemind=supervised_client,  # type: ignore[arg-type]
+        preparation_supervisor=_scripted_certificate_supervisor(worker_payloads),
+    )
+
+    assert supervised.plan_id == direct.plan_id
+    assert supervised.render() == direct.render()
+    saved = supervised_path.read_bytes()
+    assert b"private title" not in saved
+    assert b"Create hello.txt" not in saved
+    assert b"worker_" not in saved
+
+
+def test_subprocess_canary_timeout_stops_without_plan_or_retry_state(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    client.binary = "/usr/bin/true"  # type: ignore[attr-defined]
+    script = textwrap.dedent(
+        """
+        import signal
+        import time
+
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(60)
+        """
+    )
+
+    class FastTimeoutSupervisor(ReviewPreparationSupervisor):
+        def prepare(self, **kwargs: Any) -> Any:
+            kwargs["timeout_seconds"] = 0.1
+            return super().prepare(**kwargs)
+
+    supervisor = FastTimeoutSupervisor(
+        command_factory=lambda _result_fd: (sys.executable, "-c", script),
+        termination_grace_seconds=0.05,
+    )
+    state_path = tmp_path / "state.sqlite3"
+    progress: list[str] = []
+    with pytest.raises(ReviewMirrorError, match=r"canary session preparation.*deadline"):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=state_path,
+                canary=True,
+                now=NOW,
+                progress=progress.append,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            preparation_supervisor=supervisor,
+        )
+    assert not state_path.exists()
+    assert all("private title" not in message for message in progress)
+
+
+def test_supervised_canary_uses_authoritative_child_fact_not_list_summary(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    assert client.sessions[0]["parent_session_id"] == ""
+    client.binary = "/usr/bin/true"  # type: ignore[attr-defined]
+    prepared = review_module._prepare_session_stable(
+        _client(session_payload, atif_wrapper),
+        review_module.Session.from_api(client.sessions[0]),
+        project=REVIEW_PROJECT,
+        runtime=review_module.preflight_review_runtime(),
+    )
+    worker_payloads = review_module._certificate_payload(
+        project=REVIEW_PROJECT,
+        prepared=prepared,
+        include_index_evidence=True,
+    )
+    state_path = tmp_path / "state.sqlite3"
+
+    with pytest.raises(ReviewMirrorError, match="no session qualified"):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=state_path,
+                canary=True,
+                now=NOW,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            preparation_supervisor=_scripted_certificate_supervisor(
+                worker_payloads,
+                is_subagent=True,
+            ),
+        )
+
+    assert not state_path.exists()
+
+
+def test_supervised_canary_does_not_exclude_authoritative_root_from_summary_parent(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    client.sessions[0]["parent_session_id"] = REVIEW_SESSION_IDS[1]
+    client.binary = "/usr/bin/true"  # type: ignore[attr-defined]
+    certificate_client = _client(session_payload, atif_wrapper)
+    prepared = review_module._prepare_session_stable(
+        certificate_client,
+        review_module.Session.from_api(certificate_client.sessions[0]),
+        project=REVIEW_PROJECT,
+        runtime=review_module.preflight_review_runtime(),
+    )
+    worker_payloads = review_module._certificate_payload(
+        project=REVIEW_PROJECT,
+        prepared=prepared,
+        include_index_evidence=True,
+    )
+
+    report = preview_review(
+        ReviewPreviewConfig(
+            since="2026-07-16T00:00:00Z",
+            until="2026-08-06T16:00:00Z",
+            project=REVIEW_PROJECT,
+            state_path=tmp_path / "state.sqlite3",
+            canary=True,
+            now=NOW,
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        preparation_supervisor=_scripted_certificate_supervisor(
+            worker_payloads,
+            is_subagent=False,
+        ),
+    )
+
+    assert report.selected_sessions == 1
+
+
+def test_canary_advances_after_parent_source_serialization_rejection(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=2)
+    client.sessions[0]["title"] = "private-lone-surrogate-\ud800"
+    client.binary = "/usr/bin/true"  # type: ignore[attr-defined]
+    certificate_client = _client(session_payload, atif_wrapper, count=2)
+    prepared = review_module._prepare_session_stable(
+        certificate_client,
+        review_module.Session.from_api(certificate_client.sessions[1]),
+        project=REVIEW_PROJECT,
+        runtime=review_module.preflight_review_runtime(),
+    )
+    worker_payloads = review_module._certificate_payload(
+        project=REVIEW_PROJECT,
+        prepared=prepared,
+        include_index_evidence=True,
+    )
+    state_path = tmp_path / "state.sqlite3"
+    report = preview_review(
+        ReviewPreviewConfig(
+            since="2026-07-16T00:00:00Z",
+            until="2026-08-06T16:00:00Z",
+            project=REVIEW_PROJECT,
+            state_path=state_path,
+            canary=True,
+            now=NOW,
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        preparation_supervisor=_scripted_certificate_supervisor(worker_payloads),
+    )
+    with ReviewStateStore(state_path) as state:
+        selected = state.get_sessions(report.plan_id)
+        assert state.preseal_failures(REVIEW_PROJECT) == ()
+    assert [item.session_id for item in selected] == [REVIEW_SESSION_IDS[1]]
+
+
 def test_next_sessions_seals_resumable_whole_session_microplans(
     tmp_path: Path,
     session_payload: Callable[..., dict[str, Any]],
@@ -441,6 +733,704 @@ def test_next_sessions_uses_deterministic_content_free_work_order(
     with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
         sessions = state.get_sessions(report.plan_id)
     assert [item.session_id for item in sessions] == [REVIEW_SESSION_IDS[2]]
+
+
+def test_next_sessions_records_rejection_then_seals_later_fresh_session(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=3)
+    original = review_module._prepare_session_stable
+
+    def reject_first(client_arg: Any, session_arg: Any, **kwargs: Any) -> Any:
+        if session_arg.id == REVIEW_SESSION_IDS[0]:
+            raise ReviewManifestError("review preview redaction failed")
+        return original(client_arg, session_arg, **kwargs)
+
+    monkeypatch.setattr(review_module, "_prepare_session_stable", reject_first)
+    report = _preview(tmp_path, client, next_sessions=1)
+
+    assert report.selected_sessions == 1
+    assert report.remaining_backlog_sessions == 2
+    assert report.preseal_retries == 1
+    state_path = tmp_path / "private" / "state.sqlite3"
+    with ReviewStateStore(state_path) as state:
+        sessions = state.get_sessions(report.plan_id)
+        failures = state.preseal_failures(REVIEW_PROJECT)
+        assert [item.session_id for item in sessions] == [REVIEW_SESSION_IDS[1]]
+        assert len(failures) == 1
+        assert failures[0].session_id == REVIEW_SESSION_IDS[0]
+        assert failures[0].last_error_code == "redaction_failed"
+        assert (
+            REVIEW_SESSION_IDS[0],
+            parse_datetime(client.sessions[0]["started_at"]),
+            parse_datetime(client.sessions[0]["last_activity_at"]),
+        ) not in state.completed_session_snapshots(REVIEW_PROJECT)
+    assert "pre-seal retries:     1" in review_status(state_path)
+
+
+def test_next_sessions_timeout_records_content_free_evidence_and_stops(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=3)
+    calls: list[tuple[str, float]] = []
+
+    class TimeoutSupervisor:
+        def prepare(self, *, session: Any, timeout_seconds: float, **_kwargs: Any) -> Any:
+            calls.append((session.id, timeout_seconds))
+            # A real supervisor raises only after its complete process group is
+            # terminated and the direct worker is reaped.
+            raise ReviewPreparationTimeout("review session preparation exceeded its deadline")
+
+    state_path = tmp_path / "private" / "state.sqlite3"
+    progress: list[str] = []
+    with pytest.raises(ReviewMirrorError, match="no plan was sealed"):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=state_path,
+                next_sessions=1,
+                now=NOW,
+                progress=progress.append,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            preparation_supervisor=TimeoutSupervisor(),  # type: ignore[arg-type]
+        )
+
+    assert calls == [(REVIEW_SESSION_IDS[0], 15 * 60)]
+    with ReviewStateStore(state_path) as state:
+        failures = state.preseal_failures(REVIEW_PROJECT)
+        assert len(failures) == 1
+        assert failures[0].last_error_code == "preparation_timeout"
+        assert state.status(REVIEW_PROJECT).plans == 0
+    assert all("private title" not in message for message in progress)
+    assert b"private title" not in state_path.read_bytes()
+
+
+def test_timeout_revision_moves_behind_fresh_work_on_next_invocation(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=3)
+    state_path = tmp_path / "private" / "state.sqlite3"
+
+    class TimeoutSupervisor:
+        def prepare(self, **_kwargs: Any) -> Any:
+            raise ReviewPreparationTimeout("deadline")
+
+    config = ReviewPreviewConfig(
+        since="2026-07-16T00:00:00Z",
+        until="2026-08-06T16:00:00Z",
+        project=REVIEW_PROJECT,
+        state_path=state_path,
+        next_sessions=1,
+        now=NOW,
+    )
+    with pytest.raises(ReviewMirrorError, match="no plan was sealed"):
+        preview_review(
+            config,
+            hivemind=client,  # type: ignore[arg-type]
+            preparation_supervisor=TimeoutSupervisor(),  # type: ignore[arg-type]
+        )
+
+    runtime = review_module.preflight_review_runtime()
+
+    class LocalCertificateSupervisor:
+        def prepare(self, *, session: Any, project: str, **_kwargs: Any) -> Any:
+            prepared = review_module._prepare_session_stable(
+                client,
+                session,
+                project=project,
+                runtime=runtime,
+            )
+            return ReviewPreparationResult(
+                session_id=prepared.session.id,
+                started_at=prepared.session.started_at,
+                last_activity_at=prepared.session.last_activity_at,
+                certificate_payloads=tuple(
+                    review_module._certificate_payload(project=project, prepared=prepared)
+                ),
+            )
+
+    report = preview_review(
+        config,
+        hivemind=client,  # type: ignore[arg-type]
+        preparation_supervisor=LocalCertificateSupervisor(),  # type: ignore[arg-type]
+    )
+    with ReviewStateStore(state_path) as state:
+        selected = state.get_sessions(report.plan_id)
+    assert [item.session_id for item in selected] == [REVIEW_SESSION_IDS[1]]
+
+
+@pytest.mark.parametrize(
+    "bad_title",
+    ["private-lone-surrogate-\ud800", "private-oversized-" + ("x" * (2 * 1024 * 1024))],
+    ids=["lone-surrogate", "oversized-title"],
+)
+def test_next_sessions_records_request_serialization_and_continues_fairly(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+    bad_title: str,
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=2)
+    client.sessions[0]["title"] = bad_title
+    client.binary = "/usr/bin/true"  # type: ignore[attr-defined]
+
+    certificate_client = _client(session_payload, atif_wrapper, count=2)
+    prepared = review_module._prepare_session_stable(
+        certificate_client,
+        review_module.Session.from_api(certificate_client.sessions[1]),
+        project=REVIEW_PROJECT,
+        runtime=review_module.preflight_review_runtime(),
+    )
+    worker_payloads = review_module._certificate_payload(
+        project=REVIEW_PROJECT,
+        prepared=prepared,
+        include_index_evidence=True,
+    )
+    state_path = tmp_path / "private" / "state.sqlite3"
+    report = preview_review(
+        ReviewPreviewConfig(
+            since="2026-07-16T00:00:00Z",
+            until="2026-08-06T16:00:00Z",
+            project=REVIEW_PROJECT,
+            state_path=state_path,
+            next_sessions=1,
+            now=NOW,
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+        preparation_supervisor=_scripted_certificate_supervisor(worker_payloads),
+    )
+
+    with ReviewStateStore(state_path) as state:
+        selected = state.get_sessions(report.plan_id)
+        failures = state.preseal_failures(REVIEW_PROJECT)
+    assert [item.session_id for item in selected] == [REVIEW_SESSION_IDS[1]]
+    assert len(failures) == 1
+    assert failures[0].session_id == REVIEW_SESSION_IDS[0]
+    assert failures[0].last_error_code == "source_serialization"
+    assert state_path.stat().st_size < 1024 * 1024
+
+
+def test_supervised_certificates_produce_identical_plan_and_report(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    certificate_client = _client(session_payload, atif_wrapper)
+    direct_client = _client(session_payload, atif_wrapper)
+    supervised_client = _client(session_payload, atif_wrapper)
+    prepared = review_module._prepare_session_stable(
+        certificate_client,
+        review_module.Session.from_api(certificate_client.sessions[0]),
+        project=REVIEW_PROJECT,
+        runtime=review_module.preflight_review_runtime(),
+    )
+    worker_payloads = review_module._certificate_payload(
+        project=REVIEW_PROJECT,
+        prepared=prepared,
+        include_index_evidence=True,
+    )
+    direct = _preview(tmp_path / "direct", direct_client, next_sessions=1)
+    supervisor = _scripted_certificate_supervisor(worker_payloads)
+    supervised_client.binary = "/usr/bin/true"  # type: ignore[attr-defined]
+
+    supervised = preview_review(
+        ReviewPreviewConfig(
+            since="2026-07-16T00:00:00Z",
+            until="2026-08-06T16:00:00Z",
+            project=REVIEW_PROJECT,
+            state_path=tmp_path / "supervised" / "private" / "state.sqlite3",
+            next_sessions=1,
+            now=NOW,
+        ),
+        hivemind=supervised_client,  # type: ignore[arg-type]
+        preparation_supervisor=supervisor,
+    )
+
+    assert supervised.plan_id == direct.plan_id
+    assert supervised.render() == direct.render()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "worker returned partial protocol evidence",
+        "worker response exceeded its protocol bound",
+        "worker crashed before returning evidence",
+        "worker changed its private protocol",
+    ],
+)
+def test_worker_protocol_failures_are_not_persisted_as_source_retries(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+    failure: str,
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+
+    class BrokenSupervisor:
+        def prepare(self, **_kwargs: Any) -> Any:
+            raise ReviewPreparationWorkerError(failure)
+
+    state_path = tmp_path / failure.split()[1] / "state.sqlite3"
+    with pytest.raises(ReviewPreparationWorkerError, match=failure):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=state_path,
+                next_sessions=1,
+                now=NOW,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            preparation_supervisor=BrokenSupervisor(),  # type: ignore[arg-type]
+        )
+    assert not state_path.exists()
+
+
+def test_canary_generic_worker_error_never_becomes_candidate_rejection(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+
+    class BrokenSupervisor:
+        def prepare(self, **_kwargs: Any) -> Any:
+            raise ReviewPreparationWorkerError("worker changed its private protocol")
+
+    state_path = tmp_path / "state.sqlite3"
+    with pytest.raises(ReviewPreparationWorkerError, match="changed"):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=state_path,
+                canary=True,
+                now=NOW,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            preparation_supervisor=BrokenSupervisor(),  # type: ignore[arg-type]
+        )
+    assert not state_path.exists()
+
+
+def test_keyboard_interrupt_is_not_persisted_as_timeout_evidence(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+
+    class InterruptedSupervisor:
+        def prepare(self, **_kwargs: Any) -> Any:
+            raise KeyboardInterrupt
+
+    state_path = tmp_path / "state.sqlite3"
+    with pytest.raises(KeyboardInterrupt):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=state_path,
+                next_sessions=1,
+                now=NOW,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            preparation_supervisor=InterruptedSupervisor(),  # type: ignore[arg-type]
+        )
+    assert not state_path.exists()
+
+
+@pytest.mark.parametrize("timeout", [0, 61, True])
+def test_next_sessions_rejects_invalid_session_timeout(
+    tmp_path: Path,
+    timeout: Any,
+) -> None:
+    with pytest.raises(ValueError, match="between 1 and 60"):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=tmp_path / "state.sqlite3",
+                next_sessions=1,
+                session_timeout_minutes=timeout,
+                now=NOW,
+            )
+        )
+
+
+def test_session_timeout_is_accepted_for_exact_preview(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    report = preview_review(
+        ReviewPreviewConfig(
+            since="2026-07-16T00:00:00Z",
+            until="2026-08-06T16:00:00Z",
+            project=REVIEW_PROJECT,
+            state_path=tmp_path / "state.sqlite3",
+            session_ids=(REVIEW_SESSION_IDS[0],),
+            session_timeout_minutes=15,
+            now=NOW,
+        ),
+        hivemind=client,  # type: ignore[arg-type]
+    )
+    assert report.selected_sessions == 1
+
+
+@pytest.mark.parametrize("canary", [False, True], ids=["exact", "canary"])
+def test_real_preview_automatically_uses_supervisor_for_exact_and_canary(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    canary: bool,
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    prepared = review_module._prepare_session_stable(
+        client,
+        review_module.Session.from_api(client.sessions[0]),
+        project=REVIEW_PROJECT,
+        runtime=review_module.preflight_review_runtime(),
+    )
+    certificate_payloads = tuple(
+        review_module._certificate_payload(
+            project=REVIEW_PROJECT,
+            prepared=prepared,
+        )
+    )
+    turn = prepared.conversation.turns[0]
+    facts = (
+        ReviewCanaryTurnFacts(
+            physical_span_count=(1 + len(turn.llms) + len(turn.tools) + len(turn.subagents)),
+            mapping_warning_count=len(turn.attributes.get("hivemind.mapping_warnings", [])),
+        ),
+    )
+    calls: list[str] = []
+
+    class SpySupervisor:
+        def prepare(self, *, session: Any, timeout_seconds: float, **_kwargs: Any) -> Any:
+            calls.append(session.id)
+            assert timeout_seconds == 15 * 60
+            return ReviewPreparationResult(
+                session_id=prepared.session.id,
+                started_at=prepared.session.started_at,
+                last_activity_at=prepared.session.last_activity_at,
+                certificate_payloads=certificate_payloads,
+                canary_turn_facts=facts,
+                is_subagent=False,
+            )
+
+    spy = SpySupervisor()
+    monkeypatch.setattr(review_module, "HiveMindClient", lambda: client)
+    monkeypatch.setattr(review_module, "ReviewPreparationSupervisor", lambda: spy)
+    report = preview_review(
+        ReviewPreviewConfig(
+            since="2026-07-16T00:00:00Z",
+            until="2026-08-06T16:00:00Z",
+            project=REVIEW_PROJECT,
+            state_path=tmp_path / "state.sqlite3",
+            canary=canary,
+            session_ids=() if canary else (REVIEW_SESSION_IDS[0],),
+            now=NOW,
+        )
+    )
+
+    assert report.selected_sessions == 1
+    assert calls == [REVIEW_SESSION_IDS[0]]
+
+
+def test_exact_subprocess_rejection_aborts_without_retry_state(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    client.binary = "/usr/bin/true"  # type: ignore[attr-defined]
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import sys
+
+        request = json.load(sys.stdin)
+        response = {
+            "protocol": request["protocol"],
+            "importer_version": request["importer_version"],
+            "nonce": request["nonce"],
+            "status": "rejected",
+            "error_code": "source_changed",
+        }
+        os.write(int(sys.argv[1]), json.dumps(response).encode())
+        """
+    )
+    supervisor = ReviewPreparationSupervisor(
+        command_factory=lambda result_fd: (sys.executable, "-c", script, str(result_fd))
+    )
+    state_path = tmp_path / "state.sqlite3"
+    with pytest.raises(ReviewMirrorError, match=r"isolated preparation \(source_changed\)"):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=state_path,
+                session_ids=(REVIEW_SESSION_IDS[0],),
+                now=NOW,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            preparation_supervisor=supervisor,
+        )
+    assert not state_path.exists()
+
+
+def test_exact_timeout_aborts_without_retry_state(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+
+    class TimeoutSupervisor:
+        def prepare(self, **_kwargs: Any) -> Any:
+            raise ReviewPreparationTimeout("deadline")
+
+    state_path = tmp_path / "state.sqlite3"
+    with pytest.raises(ReviewMirrorError, match="deadline"):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=state_path,
+                session_ids=(REVIEW_SESSION_IDS[0],),
+                now=NOW,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            preparation_supervisor=TimeoutSupervisor(),  # type: ignore[arg-type]
+        )
+    assert not state_path.exists()
+
+
+def test_full_supervised_preview_rejection_discards_prior_session_without_plan(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=2)
+    client.binary = "/usr/bin/true"  # type: ignore[attr-defined]
+    certificate_client = _client(session_payload, atif_wrapper, count=2)
+    prepared = review_module._prepare_session_stable(
+        certificate_client,
+        review_module.Session.from_api(certificate_client.sessions[0]),
+        project=REVIEW_PROJECT,
+        runtime=review_module.preflight_review_runtime(),
+    )
+    worker_payloads = canonical_json(
+        review_module._certificate_payload(
+            project=REVIEW_PROJECT,
+            prepared=prepared,
+            include_index_evidence=True,
+        )
+    )
+    script = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import sys
+
+        request = json.load(sys.stdin)
+        session = request["session"]
+        if session["id"] == {REVIEW_SESSION_IDS[0]!r}:
+            response = {{
+                "protocol": request["protocol"],
+                "importer_version": request["importer_version"],
+                "nonce": request["nonce"],
+                "status": "prepared",
+                "project": request["project"],
+                "session": {{
+                    "id": session["id"],
+                    "started_at": session["started_at"],
+                    "last_activity_at": session["last_activity_at"],
+                    "is_subagent": False,
+                }},
+                "certificates": json.loads({worker_payloads!r}),
+            }}
+        else:
+            response = {{
+                "protocol": request["protocol"],
+                "importer_version": request["importer_version"],
+                "nonce": request["nonce"],
+                "status": "rejected",
+                "error_code": "source_changed",
+            }}
+        os.write(int(sys.argv[1]), json.dumps(response).encode())
+        """
+    )
+    supervisor = ReviewPreparationSupervisor(
+        command_factory=lambda result_fd: (sys.executable, "-c", script, str(result_fd))
+    )
+    state_path = tmp_path / "state.sqlite3"
+
+    with pytest.raises(ReviewMirrorError, match=r"isolated preparation \(source_changed\)"):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=state_path,
+                now=NOW,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+            preparation_supervisor=supervisor,
+        )
+
+    assert not state_path.exists()
+
+
+def test_next_sessions_retry_failures_rotate_without_starvation(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(session_payload, atif_wrapper, count=2)
+    attempted: list[str] = []
+
+    def reject(client_arg: Any, session_arg: Any, **kwargs: Any) -> Any:
+        attempted.append(session_arg.id)
+        raise ReviewManifestError("review preview redaction failed")
+
+    monkeypatch.setattr(review_module, "_prepare_session_stable", reject)
+    with pytest.raises(ReviewMirrorError, match="remain queued"):
+        _preview(tmp_path, client, next_sessions=1)
+    assert attempted == list(REVIEW_SESSION_IDS[:2])
+
+    attempted.clear()
+    with pytest.raises(ReviewMirrorError, match="remain queued"):
+        _preview(tmp_path, client, next_sessions=1)
+    assert attempted == [REVIEW_SESSION_IDS[0]]
+
+    attempted.clear()
+    with pytest.raises(ReviewMirrorError, match="remain queued"):
+        _preview(tmp_path, client, next_sessions=1)
+    assert attempted == [REVIEW_SESSION_IDS[1]]
+
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        failures = {item.session_id: item for item in state.preseal_failures(REVIEW_PROJECT)}
+    assert failures[REVIEW_SESSION_IDS[0]].attempt_count == 2
+    assert failures[REVIEW_SESSION_IDS[1]].attempt_count == 2
+
+
+def test_next_sessions_bounds_fresh_rejection_work_and_keeps_exact_backlog(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_ids = tuple(f"{index:08x}-1111-4111-8111-{index:012x}" for index in range(1, 13))
+    sessions = [
+        session_payload(
+            id=session_id,
+            title="private title",
+            started_at=f"2026-07-{19 + index:02d}T12:00:00Z",
+            last_activity_at=f"2026-07-{19 + index:02d}T12:30:00Z",
+        )
+        for index, session_id in enumerate(session_ids, start=1)
+    ]
+    transcripts = {
+        session_id: atif_wrapper(
+            wrapper_session_id=session_id,
+            session_id=f"atif-{session_id}",
+        )
+        for session_id in session_ids
+    }
+    client = FakeHiveMind(sessions, transcripts)
+    attempted: list[str] = []
+
+    def reject_all(client_arg: Any, session_arg: Any, **kwargs: Any) -> Any:
+        attempted.append(session_arg.id)
+        raise ReviewManifestError("review preview redaction failed")
+
+    monkeypatch.setattr(review_module, "_prepare_session_stable", reject_all)
+    with pytest.raises(ReviewMirrorError, match="remain queued"):
+        _preview(tmp_path, client, next_sessions=1)
+    assert len(attempted) == review_module._MICROPLAN_REJECTION_ALLOWANCE + 1
+
+    # Restore the module-level implementation before preparing the first
+    # untouched revision.
+    monkeypatch.undo()
+    first_untouched = session_ids[len(attempted)]
+    second = _preview(tmp_path, client, next_sessions=1)
+    assert second.selected_sessions == 1
+    assert second.remaining_backlog_sessions == len(session_ids) - 1
+    with ReviewStateStore(tmp_path / "private" / "state.sqlite3") as state:
+        assert [item.session_id for item in state.get_sessions(second.plan_id)] == [first_untouched]
+        assert len(state.preseal_failures(REVIEW_PROJECT)) == len(attempted)
+
+
+def test_preseal_history_does_not_change_explicit_selection_or_persist_unknown_errors(
+    tmp_path: Path,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(session_payload, atif_wrapper)
+    explicit_path = tmp_path / "explicit" / "state.sqlite3"
+
+    def recognized(client_arg: Any, session_arg: Any, **kwargs: Any) -> Any:
+        raise ReviewManifestError("review preview redaction failed")
+
+    monkeypatch.setattr(review_module, "_prepare_session_stable", recognized)
+    with pytest.raises(ReviewManifestError, match="review preview redaction failed"):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=explicit_path,
+                session_ids=(REVIEW_SESSION_IDS[0],),
+                now=NOW,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+        )
+    assert not explicit_path.exists()
+
+    unknown_path = tmp_path / "unknown" / "state.sqlite3"
+
+    def unknown(client_arg: Any, session_arg: Any, **kwargs: Any) -> Any:
+        raise ReviewManifestError("private invariant: Alice Johnson")
+
+    monkeypatch.setattr(review_module, "_prepare_session_stable", unknown)
+    with pytest.raises(ReviewManifestError, match="private invariant"):
+        preview_review(
+            ReviewPreviewConfig(
+                since="2026-07-16T00:00:00Z",
+                until="2026-08-06T16:00:00Z",
+                project=REVIEW_PROJECT,
+                state_path=unknown_path,
+                next_sessions=1,
+                now=NOW,
+            ),
+            hivemind=client,  # type: ignore[arg-type]
+        )
+    assert not unknown_path.exists()
 
 
 def test_next_sessions_retries_terminal_revision_after_every_fresh_revision(
@@ -1133,10 +2123,14 @@ def test_preview_rejects_an_unstable_atif_export_before_sealing_state(
     client.get_atif = lambda _session_id: next(exports)  # type: ignore[method-assign]
     state_path = tmp_path / "private" / "state.sqlite3"
 
-    with pytest.raises(ReviewMirrorError, match="export was not stable"):
+    with pytest.raises(ReviewMirrorError, match="remain queued"):
         _preview(tmp_path, client, next_sessions=1)
 
-    assert not state_path.exists()
+    with ReviewStateStore(state_path) as state:
+        failures = state.preseal_failures(REVIEW_PROJECT)
+        assert len(failures) == 1
+        assert failures[0].last_error_code == "source_unstable"
+        assert state.status(REVIEW_PROJECT).plans == 0
     assert FakeSink.instances == []
 
 

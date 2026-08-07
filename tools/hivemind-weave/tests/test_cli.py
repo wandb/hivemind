@@ -318,6 +318,40 @@ def test_review_preview_does_not_expose_a_timezone_option(capsys: Any) -> None:
     assert "unrecognized arguments: --timezone UTC" in capsys.readouterr().err
 
 
+def test_review_preview_passes_bounded_session_timeout(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    captured: list[Any] = []
+
+    def fake_preview(config: Any) -> ReviewReport:
+        captured.append(config)
+        return _review_report()
+
+    monkeypatch.setattr(cli, "preview_review", fake_preview)
+    assert (
+        cli.main(
+            [
+                "review",
+                "preview",
+                "--since",
+                "2026-07-16T00:00:00Z",
+                "--project",
+                REVIEW_PROJECT,
+                "--next-sessions",
+                "1",
+                "--session-timeout-minutes",
+                "7",
+                "--state-path",
+                str(tmp_path / "state.sqlite3"),
+            ]
+        )
+        == 0
+    )
+    assert captured[0].next_sessions == 1
+    assert captured[0].session_timeout_minutes == 7
+
+
 def test_review_apply_requires_fixed_confirmation_and_passes_session_budget(
     monkeypatch: Any,
     tmp_path: Path,

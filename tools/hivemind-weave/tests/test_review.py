@@ -74,6 +74,7 @@ class FakeHiveMind:
         self.transcripts = transcripts
         self.user_id: str | None = user_id
         self.fetches: list[str] = []
+        self.list_calls: list[tuple[int, bool]] = []
 
     def preflight(self) -> None:
         return None
@@ -81,6 +82,7 @@ class FakeHiveMind:
     def list_sessions(self, *, days: int, include_subagents: bool) -> list[dict[str, Any]]:
         assert 1 <= days <= 365
         assert include_subagents is True
+        self.list_calls.append((days, include_subagents))
         return list(self.sessions)
 
     def get_session(self, session_id: str) -> dict[str, Any]:
@@ -441,6 +443,7 @@ def test_preview_seals_complete_content_free_plan_and_canary(
     client = _client(session_payload, atif_wrapper, count=2)
     report = _preview(tmp_path, client, canary=True)
 
+    assert client.list_calls == [(365, True)]
     assert report.selected_sessions == 1
     assert report.turns == 1
     assert report.chunk_count >= 1

@@ -276,6 +276,59 @@ hivemind-weave review status
     [--state-path PATH]
 ```
 
+### Coverage audit
+
+Use the audit when the review UI appears to contain fewer chats than the exact
+source window. It compares HiveMind session revisions with the local review
+journal; it does not fetch transcripts or contact Weave. The command always
+requests HiveMind's supported `days=365` feed with child sessions enabled,
+performs the exact `last_activity_at` window and 60-minute settle filter
+locally, and requires two independently complete pagination scans to produce
+the same returned candidate revision universe before reporting coverage.
+
+HiveMind does not document whether the `days` server predicate uses start time,
+activity time, or another coordinate. A session started more than 365 days ago
+could therefore be absent even if it was active inside the requested audit
+window. The audit reports this explicitly: `365-day feed coverage: COMPLETE`
+means exact journal coverage of the two matching returned feeds only;
+`unbounded source completeness` always remains `UNPROVEN`. Exit zero has that
+bounded meaning and is not proof that every HiveMind session exists in the
+feed. With `--exclude-subagents`, coverage is root-only and says nothing about
+child sessions; the rendered report always prints whether subagents were in
+scope.
+
+```text
+hivemind-weave review audit
+    --since RFC3339
+    [--until RFC3339]
+    --project wandb/hivemind-chats-review
+    [--exclude-subagents]
+    [--state-path PATH]
+```
+
+The report contains aggregate root/subagent counts only. It separates exact
+completed revisions, exact planned or retry revisions that are not complete,
+known session IDs whose activity revision advanced, never-planned revisions,
+active deferred revisions, and invalid/unclassifiable summaries. Feed coverage
+is complete only when every settled, classifiable returned revision in the
+exact closed window has exact completed journal evidence. `INCOMPLETE`, an
+unstable source scan, or unreadable journal evidence exits nonzero.
+
+Audit opens an existing journal through a shared importer lock, reads a bounded
+database image only from the already identity-pinned file descriptor, and
+deserializes that image into a private in-memory SQLite connection. SQLite
+never receives the user pathname. The audit checks path ancestry, ownership,
+private permissions, file types, link counts, exact schema, full SQLite
+integrity, and complete visible turn evidence. It never creates a directory,
+database, lock, WAL, temporary database, or migration. If the database is
+absent, every eligible source revision is reported as never planned and no
+local file is created. A nonempty WAL/journal, an active writer, a replaced or
+unlinked database entry inside the pinned directory, or incomplete visible
+evidence fails conclusively instead of risking a stale read. Renaming or
+replacing the user-facing ancestor path cannot redirect the already pinned
+descriptor. No raw session ID, title, repository, prompt, tool, digest, object
+reference, trace ID, exception body, or secret is printed or newly persisted.
+
 ### Reconcile
 
 Reconcile is for an apply whose root result became ambiguous after submission.

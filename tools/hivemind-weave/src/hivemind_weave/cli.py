@@ -29,6 +29,7 @@ from .review import (
     recover_preflight_review,
     review_status,
 )
+from .review_audit import ReviewAuditConfig, audit_review
 from .scheduled_sync import (
     ScheduledSyncError,
     SyncConfig,
@@ -241,6 +242,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="show content-free local review progress",
     )
     review_status_parser.add_argument("--state-path", type=Path, default=review_state_default)
+
+    review_audit = review_subparsers.add_parser(
+        "audit",
+        help="compare an exact HiveMind window with read-only local review evidence",
+    )
+    review_audit.add_argument("--since", required=True, help="inclusive RFC3339 timestamp")
+    review_audit.add_argument(
+        "--until",
+        help="exclusive RFC3339 timestamp (default: captured current UTC time)",
+    )
+    review_audit.add_argument("--project", required=True)
+    review_audit.add_argument("--exclude-subagents", action="store_true")
+    review_audit.add_argument("--state-path", type=Path, default=review_state_default)
 
     review_reconcile = review_subparsers.add_parser(
         "reconcile",
@@ -466,6 +480,21 @@ def main(argv: list[str] | None = None) -> int:
             elif args.review_command == "status":
                 print(review_status(args.state_path, project=REVIEW_PROJECT))
                 return 0
+            elif args.review_command == "audit":
+                if args.project != REVIEW_PROJECT:
+                    raise ValueError(
+                        f"review audit requires the fixed private project {REVIEW_PROJECT}"
+                    )
+                report = audit_review(
+                    ReviewAuditConfig(
+                        since=args.since,
+                        until=args.until,
+                        project=args.project,
+                        state_path=args.state_path,
+                        exclude_subagents=args.exclude_subagents,
+                    )
+                )
+                rendered = report.render()
             elif args.review_command == "reconcile":
                 print(
                     f"Weave destination (review reconcile): {REVIEW_PROJECT}",

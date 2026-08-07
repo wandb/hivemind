@@ -19,7 +19,6 @@ from .backfill import (
     _normalized_filters,
     _same_session_snapshot,
     _select_sessions,
-    _server_lookback_days,
     resolve_backfill_window,
 )
 from .errors import (
@@ -841,10 +840,10 @@ def preview_review(
     active_supervisor = preparation_supervisor
     if active_supervisor is None and hivemind is None:
         active_supervisor = ReviewPreparationSupervisor()
-    raw_sessions = client.list_sessions(
-        days=_server_lookback_days(window, captured_now),
-        include_subagents=True,
-    )
+    # The server's ``days`` predicate is not a documented substitute for our
+    # exact last_activity_at window. Always request the complete supported
+    # lookback and apply the sealed interval and subagent policy locally.
+    raw_sessions = client.list_sessions(days=365, include_subagents=True)
     # Current HiveMind summaries expose a cheap aggregate turn count. Use it
     # only to reject sessions that cannot satisfy the strict canary bound; a
     # missing or unfamiliar value falls back to the complete transcript check.

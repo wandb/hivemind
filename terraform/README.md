@@ -12,10 +12,10 @@ interactive setup step.
 module "hivemind" {
   # Always pin with ?ref=. Without it Terraform tracks the default branch, so
   # the module under your deployment changes whenever we push.
-  source = "github.com/wandb/hivemind//terraform/modules/hivemind-gcp?ref=v1.0.6"
+  source = "github.com/wandb/hivemind//terraform/modules/hivemind-gcp?ref=v1.0.7"
 
   project_id       = "acme-prod"
-  hivemind_version = "v1.0.6"
+  hivemind_version = "v1.0.7"
 
   domain            = "hivemind.acme.com"
   static_ip         = true

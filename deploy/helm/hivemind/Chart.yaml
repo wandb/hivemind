@@ -11,7 +11,7 @@ type: application
 version: 0.1.0
 # Default application image tag (ghcr.io/wandb/hivemind-server). Override with
 # image.tag in values. Tracks a published hivemind-server release.
-appVersion: "1.0.6"
+appVersion: "1.0.7"
 home: https://github.com/wandb/hivemind
 sources:
   - https://github.com/wandb/hivemind

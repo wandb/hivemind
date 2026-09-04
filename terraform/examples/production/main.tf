@@ -77,7 +77,7 @@ module "hivemind" {
 
   project_id       = var.project_id
   region           = var.region
-  hivemind_version = "v1.0.7"
+  hivemind_version = "v1.0.8"
 
   domain    = var.domain
   tls       = "caddy"

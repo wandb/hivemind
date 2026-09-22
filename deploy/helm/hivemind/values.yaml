@@ -64,6 +64,10 @@ config:
   # Developers on those VMs then authenticate as themselves with no setup —
   # see docs/partner-federation.md. Empty = disabled.
   trustedOidcPatIssuers: ""
+  # Sparkbox federated sign-in: the gateway domain (e.g. "catnip.sh") and the
+  # GitHub orgs offered the button. Empty domain disables the integration.
+  sparkboxDomain: ""
+  sparkboxSigninOrgs: ""
   # Self-host defaults: no quotas, no retention deletion, no per-user clickwrap.
   usageQuotaMode: "off"        # off | shadow | enforce
   retentionSweepMode: "off"    # off | dry_run | enforce

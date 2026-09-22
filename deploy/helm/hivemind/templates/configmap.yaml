@@ -58,6 +58,12 @@ data:
   {{- with .Values.config.trustedOidcPatIssuers }}
   TRUSTED_OIDC_PAT_ISSUERS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.config.sparkboxDomain }}
+  SPARKBOX_DOMAIN: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.sparkboxSigninOrgs }}
+  SPARKBOX_SIGNIN_ORGS: {{ . | quote }}
+  {{- end }}
   USAGE_QUOTA_MODE: {{ .Values.config.usageQuotaMode | quote }}
   RETENTION_SWEEP_MODE: {{ .Values.config.retentionSweepMode | quote }}
   TERMS_ACCEPTANCE_ENABLED: {{ .Values.config.termsAcceptanceEnabled | quote }}

@@ -125,6 +125,8 @@ services:
       # those VMs authenticate as themselves with no setup. See
       # docs/partner-federation.md.
       - TRUSTED_OIDC_PAT_ISSUERS=${TRUSTED_OIDC_PAT_ISSUERS:-}
+      - SPARKBOX_DOMAIN=${SPARKBOX_DOMAIN:-}
+      - SPARKBOX_SIGNIN_ORGS=${SPARKBOX_SIGNIN_ORGS:-}
       # Self-host defaults: no quotas, no retention deletion, no autoscaler.
       # USAGE_QUOTA_MODE is a no-op on self-host: quota_mode() reads
       # LICENSE_ENFORCEMENT_MODE instead (warn -> counters advance but never deny).

@@ -35,7 +35,7 @@ module "hivemind" {
 
   project_id       = var.project_id
   region           = var.region
-  hivemind_version = "v1.0.8"
+  hivemind_version = "v1.1.0"
 
   # No DNS, no public port: reach it over the tunnel below.
   domain = "localhost"

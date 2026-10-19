@@ -73,14 +73,16 @@ config = {
 Path(sys.argv[1]).write_text(json.dumps(config, indent=2) + "\n")
 PY
 hivemind-rc serve --name "$rc_name" setup --config "$rc_prefix/selfhost.json"
-umask 077
-hivemind-rc serve --name "$rc_name" up > "$rc_prefix/serve-up.private.log" 2>&1
+(umask 077; : > "$rc_prefix/serve-up.private.log")
+(umask 022; hivemind-rc serve --name "$rc_name" up > "$rc_prefix/serve-up.private.log" 2>&1)
 hivemind-rc serve --name "$rc_name" status
 ```
 
 The server version comes from the same selection as the CLI. Setup can be
 rendered again with `--force --config "$rc_prefix/selfhost.json"`; it preserves
 existing instance keys by default.
+The log is created privately before startup; the CLI uses a normal umask so
+its generated public configuration files are readable by container users.
 Startup output includes a one-time setup URL: keep the log private and exclude
 setup tokens, cookies, and credentials from shared evidence.
 

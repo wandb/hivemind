@@ -44,6 +44,10 @@ Other commands: `hivemind serve down` (stop), `hivemind serve restart [svc]`,
 Use `hivemind serve --name smoke up` to run an isolated test instance; its
 state lives under `~/.hivemind/serve/smoke`.
 
+For isolated candidate installs, exact CLI and server pins, lifecycle checks,
+and managed-agent exposure acceptance checks, see
+[Testing a self-hosted release candidate](testing-release-candidates.md).
+
 ## Kubernetes (Helm)
 
 For a clustered deployment with autoscaling, there is a Helm chart at

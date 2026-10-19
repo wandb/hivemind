@@ -88,7 +88,7 @@ assert h['status'] == 'ok' and h['clickhouse'] == 'ok', h
 assert h['cache']['type'] == 'redis', h
 print('PASS', h)
 PY
-curl -fsS http://localhost:8080/dashboard > "$rc_prefix/dashboard.html"
+curl -fsS http://localhost:8080/ > "$rc_prefix/dashboard.html"
 ```
 
 Record the image digest and build SHA from health, and check the worker uses

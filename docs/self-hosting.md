@@ -208,7 +208,7 @@ If you prefer, create the app yourself at
 | Webhook URL | `https://YOUR_DOMAIN/v1/webhooks/github` |
 | Webhook secret | random string → `GITHUB_APP_WEBHOOK_SECRET` |
 | Org permissions | **Members: Read-only** |
-| Repo permissions | **Metadata: Read-only**, **Pull requests: Read & write** |
+| Repo permissions | **Metadata**, **Checks**, **Commit statuses: Read-only**; **Contents**, **Issues**, **Pull requests**, **Actions**, **Workflows: Read & write** |
 | Subscribe to events | **Pull request**, **Membership** |
 | Where can it be installed | Only on this account |
 

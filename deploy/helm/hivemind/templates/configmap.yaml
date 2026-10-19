@@ -125,9 +125,6 @@ data:
   {{- with .Values.config.llm.models.persona }}
   PERSONA_MODEL: {{ . | quote }}
   {{- end }}
-  {{- with .Values.config.llm.models.forkContext }}
-  FORK_CONTEXT_MODEL: {{ . | quote }}
-  {{- end }}
   {{- with .Values.config.llm.models.insightsMatcher }}
   INSIGHTS_MATCHER_MODEL: {{ . | quote }}
   {{- end }}

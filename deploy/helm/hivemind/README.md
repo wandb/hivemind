@@ -165,7 +165,7 @@ Session screenshots and data exports go to a `StorageProvider`:
 
 ## AI features — LLM provider & embeddings
 
-Insights, PR walkthroughs, personas, session enrichment and fork-context all
+Insights, PR walkthroughs, personas and session enrichment all
 reach an LLM through a provider abstraction. It's **bring-your-own-provider** and
 every feature quietly no-ops until one is configured. Non-secret settings live
 under `config.llm` / `config.embeddings`; API keys under `secrets.llm`. Full

@@ -75,7 +75,7 @@ config:
   logLevel: "INFO"
 
   # --- LLM provider (advanced AI features) ---
-  # Insights, PR walkthroughs, personas, session enrichment and fork-context all
+  # Insights, PR walkthroughs, personas and session enrichment all
   # reach an LLM through agentstream_api.llm. Bring-your-own-provider; every
   # feature quietly no-ops when nothing here is set. API keys are secrets and
   # live under `secrets.llm`. Full guide: docs/llm-providers.md.
@@ -111,7 +111,6 @@ config:
       titleExtraction: ""
       weeklySummary: ""
       persona: ""
-      forkContext: ""
       insightsMatcher: ""
 
   # --- Embeddings (insight clustering + semantic search) ---

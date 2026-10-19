@@ -6,7 +6,6 @@ HiveMind's advanced AI features call an LLM:
 - **Insights pipeline** — per-session extraction (Stage 1) and cluster matching (Stage 2)
 - **PR walkthroughs** — diff chunking and review sequencing
 - **Personas** — `talk-to-<name>` skill generation
-- **Fork context** — long-session compaction
 - **Weekly summary** — activity clustering
 
 Plus **embeddings** for insight clustering and semantic search.
@@ -44,9 +43,14 @@ quietly no-op and the rest of the product works normally.
 
 Per-feature model overrides (each falls back to `LLM_MODEL`, then to its Claude
 default): `ENRICHMENT_MODEL`, `TITLE_EXTRACTION_MODEL`, `WEEKLY_SUMMARY_MODEL`,
-`PERSONA_MODEL`, `FORK_CONTEXT_MODEL`, `SKILL_EXTRACTION_MODEL`,
+`PERSONA_MODEL`, `SKILL_EXTRACTION_MODEL`,
 `INSIGHTS_MATCHER_MODEL`, `ANTHROPIC_MODEL` (insights extraction + PR
 walkthroughs).
+
+Titles and weekly summaries default to `claude-haiku-5-5`; session enrichment,
+its skill extraction pass, and both insights stages default to `claude-sonnet-5-5`.
+Titles and weekly summaries also honor `LLM_SMALL_MODEL` before `LLM_MODEL`.
+Fork context is a dialogue-only transcript and does not require an LLM provider.
 
 ### How the provider is chosen
 
@@ -72,7 +76,7 @@ purely additive.
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
 # Optional: override the default model (per-feature defaults still apply)
-# LLM_MODEL=claude-sonnet-4-6
+# LLM_MODEL=claude-sonnet-5-5
 ```
 
 You can also point the Anthropic SDK at an Anthropic-compatible proxy with
@@ -105,7 +109,7 @@ LLM_MODEL=llama3.3
 > Pick a tool-calling-capable model (e.g. `llama3.3`, `qwen2.5-coder`,
 > `mistral-nemo`). Models without tool support will fail the insights, persona,
 > weekly-summary, and PR-walkthrough features (which force a tool call) while
-> plain-text features (enrichment titles, fork context) still work.
+> plain-text features (enrichment titles) still work.
 
 ### W&B / CoreWeave inference service
 

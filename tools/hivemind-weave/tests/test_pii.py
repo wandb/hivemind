@@ -1,0 +1,858 @@
+from __future__ import annotations
+
+import json
+import socket
+from collections.abc import Callable
+from dataclasses import asdict
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+import hivemind_weave.pii as pii_module
+from hivemind_weave.atif import map_atif
+from hivemind_weave.attribute_safety import MAX_ATTRIBUTE_VALUE_CHARS
+from hivemind_weave.models import ChatMessage, MappedSubAgent, Session
+from hivemind_weave.pii import (
+    configure_weave_pii,
+    redact_agent_name,
+    redact_model_name,
+    redact_source_coordinate,
+    redact_upload_data,
+    sanitize_mapped_conversation,
+)
+from hivemind_weave.utils import sha256_json
+
+
+def test_presidio_configuration_is_offline_and_redacts_pii(monkeypatch: Any) -> None:
+    def reject_network(*_: object, **__: object) -> None:
+        raise AssertionError("PII initialization attempted network access")
+
+    monkeypatch.setattr(socket.socket, "connect", reject_network)
+    configure_weave_pii.cache_clear()
+    configure_weave_pii()
+
+    from weave.utils.pii_redaction import redact_pii_string
+
+    redacted = redact_pii_string(
+        "Alice Johnson lives in New York; contact alice@example.com or 212-555-1212"
+    )
+    assert "Alice Johnson" not in redacted
+    assert "New York" not in redacted
+    assert "alice@example.com" not in redacted
+    assert "212-555-1212" not in redacted
+
+
+def test_full_text_analyzer_raises_spacy_limit_without_splitting_content() -> None:
+    class CapturingAnalyzer:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def analyze(self, *, text: str, language: str, **_: Any) -> list[Any]:
+            assert language == "en"
+            assert pipeline.max_length >= len(text)
+            self.calls.append(text)
+            return []
+
+    pipeline = type("Pipeline", (), {"max_length": 10})()
+    nlp_engine = type("NlpEngine", (), {"nlp": {"en": pipeline}})()
+    captured = CapturingAnalyzer()
+    analyzer = pii_module._FullTextAnalyzer(captured, nlp_engine)
+    source = f"{'x' * 16}Alice Johnson{'y' * 60}"
+
+    analyzer.analyze(text=source, language="en", entities=["PERSON"])
+    analyzer.analyze(text="short", language="en", entities=["PERSON"])
+
+    assert captured.calls == [source, "short"]
+    assert pipeline.max_length == len(source)
+
+
+def test_presidio_redacts_text_above_spacy_limit_without_truncation() -> None:
+    # spaCy's default Language.max_length is 1,000,000. This exact shape raised
+    # E088 before the analyzer adapter divided it into bounded, overlapping work.
+    source = "x" * 1_000_001
+
+    assert redact_upload_data(source) == source
+
+
+def test_code_aware_redaction_preserves_ordinary_identifiers() -> None:
+    code_samples = [
+        "class Washington:\n    pass",
+        "class Washington:\n    pass\n\nx = Washington()",
+        "const Paris = new Map();",
+        "class CustomerLedger:\n    pass",
+        "def customer_ledger(value):\n    return value",
+        "def jordan(value):\n    return value",
+    ]
+    assert [redact_upload_data(value) for value in code_samples] == code_samples
+    assert redact_agent_name("cursor") == "cursor"
+    assert redact_model_name("o3") == "o3"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "class AliceJohnson:\n    pass",
+        "const AliceJohnson = new Map();",
+        "def AliceJohnson(value):\n    return value",
+        "const result = new AliceJohnson();",
+        "AliceJohnson::run()",
+        "def alice_johnson(value):\n    return alice_johnson(value)",
+        "const alice$johnson = 1;",
+        "class Alice_Johnson:\n    pass",
+        "const result = new Alice_Johnson();",
+        "alice_johnson()",
+        "Alice_Johnson::run()",
+    ],
+)
+def test_person_names_cannot_hide_in_declared_code_identifiers(code: str) -> None:
+    redacted = str(redact_upload_data(code))
+    assert "Alice" not in redacted
+    assert "Johnson" not in redacted
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "session-AliceJohnson",
+        "call-JohnSmith",
+        "gpt-AliceJohnson",
+        "gpt-5-john-smith",
+        "claude-3-john-smith",
+        "gemini-2-john-smith",
+        "codex-5-john-smith",
+        "Claude",
+    ],
+)
+def test_protocol_shaped_text_cannot_bypass_pii_redaction(source: str) -> None:
+    redacted = str(redact_upload_data(source))
+    assert redacted != source
+    assert "john" not in redacted.lower()
+    assert "smith" not in redacted.lower()
+    assert "alice" not in redacted.lower()
+
+
+def test_field_specific_model_metadata_keeps_reviewed_machine_names() -> None:
+    for model in ("gpt-5.6-codex", "claude-sonnet-4-5", "gemini-2.5-pro", "o3"):
+        assert redact_model_name(model) == model
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5-john-smith",
+        "claude-3-john-smith",
+        "gemini-2-john-smith",
+        "codex-5-john-smith",
+    ],
+)
+def test_field_specific_model_metadata_scrubs_name_like_suffixes(model: str) -> None:
+    redacted = redact_model_name(model)
+    assert "john" not in redacted.lower()
+    assert "smith" not in redacted.lower()
+
+
+def test_agent_session_coordinate_is_redacted_as_content(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    source = "nonopaque-source-coordinate"
+    mapped = map_atif(
+        Session.from_api(session_payload(agent_session_id=source)),
+        atif_wrapper(),
+    )
+    turn = mapped.turns[0]
+    turn.subagents.append(
+        MappedSubAgent(
+            name="worker",
+            model="gpt-5.6-codex",
+            agent_id=source,
+            description="delegated review",
+            version="1",
+            system_instructions=[],
+            started_at=turn.started_at,
+            ended_at=turn.ended_at,
+            timestamp_inferred=False,
+        )
+    )
+    serialized = repr(asdict(sanitize_mapped_conversation(mapped)))
+
+    assert source not in serialized
+    assert "[REDACTED_SOURCE_COORDINATE]" in serialized
+
+
+def test_source_coordinates_inside_preserved_atif_json_are_redacted(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    source = "nonopaque-source-coordinate"
+    wrapper = atif_wrapper(
+        session_id=source,
+        trajectory_id=source,
+        extra={"parent_session_id": source},
+        agent={
+            "name": "codex",
+            "version": "1.2.3",
+            "model_name": "gpt-5.6-codex",
+            "extra": {"agent_id": source},
+        },
+    )
+    wrapper["metadata"] = {"agent_session_id": source}
+    mapped = map_atif(Session.from_api(session_payload()), wrapper)
+
+    serialized = repr(asdict(sanitize_mapped_conversation(mapped)))
+
+    assert source not in serialized
+    assert "[REDACTED_SOURCE_COORDINATE]" in serialized
+
+
+def test_preserved_atif_json_is_redacted_structurally_and_remains_valid(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    credential_snippet = f'OPENAI_API_KEY="{secret}"'
+    wrapper = atif_wrapper(
+        extra={
+            "credential_snippet": credential_snippet,
+            "person": "Alice Johnson",
+        }
+    )
+    wrapper["trajectory"]["steps"][0]["extra"] = {
+        "credential_snippet": credential_snippet,
+        "person": "Alice Johnson",
+    }
+    mapped = map_atif(Session.from_api(session_payload()), wrapper)
+
+    sanitized = sanitize_mapped_conversation(mapped)
+    attributes = sanitized.turns[0].attributes
+    preserved_keys = {
+        "hivemind.atif_agent_extra",
+        "hivemind.atif_trajectory_metadata",
+        "hivemind.atif_wrapper_metadata",
+    }
+    decoded = {
+        key: json.loads(value)
+        for key, value in attributes.items()
+        if key in preserved_keys and value
+    }
+    serialized = json.dumps(decoded)
+
+    assert secret not in serialized
+    assert "Alice Johnson" not in serialized
+    assert decoded["hivemind.atif_trajectory_metadata"]["extra"]["credential_snippet"]
+    for key, value in attributes.items():
+        if key in pii_module._CANONICAL_JSON_ATTRIBUTE_KEYS and value:
+            assert redact_upload_data({key: value})[key] == value
+
+
+def test_nested_json_credential_scrubbing_preserves_escaped_grammar() -> None:
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    source = json.dumps(
+        {
+            "credential_snippet": f'OPENAI_API_KEY="{secret}"',
+            "ordinary": "keep this",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    key = "hivemind.preserved_step_data"
+    redacted = redact_upload_data({key: source})[key]
+    decoded = json.loads(redacted)
+
+    assert secret not in redacted
+    assert decoded["ordinary"] == "keep this"
+    assert redact_upload_data({key: redacted})[key] == redacted
+
+
+def test_repeated_locations_converge_inside_preserved_step_data(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    source = " -> ".join(["Australia"] * 20)
+    mapped = map_atif(Session.from_api(session_payload()), atif_wrapper())
+    key = "hivemind.preserved_step_data"
+    mapped.turns[0].attributes[key] = json.dumps(
+        [{"raw_step": {"message": source}}],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    sanitized = sanitize_mapped_conversation(mapped)
+    serialized = sanitized.turns[0].attributes[key]
+    decoded = json.loads(serialized)
+
+    assert "Australia" not in decoded[0]["raw_step"]["message"]
+    assert redact_upload_data({key: serialized})[key] == serialized
+
+
+def test_large_nested_canonical_json_converges_losslessly_after_many_changes(
+    monkeypatch: Any,
+) -> None:
+    tokens = [f"sensitiveword{index:02d}" for index in range(12)]
+    ordinary = "x" * (512 * 1024)
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    key = "hivemind.preserved_step_data"
+    source = pii_module.canonical_json(
+        {
+            "steps": [
+                {
+                    "raw_step": {
+                        "message": f"{ordinary}\n{' '.join(tokens)}",
+                        "credential": f'OPENAI_API_KEY="{secret}"',
+                    }
+                }
+            ],
+            "stable_markers": {
+                "[REDACTED_PII_KEY_0001]": "<PERSON>",
+                "[REDACTED_KEY_0002]": "[REDACTED_SOURCE_COORDINATE]",
+            },
+        }
+    )
+
+    def redact_one(value: str) -> str:
+        for token in tokens:
+            if token in value:
+                return value.replace(token, "<PERSON>", 1)
+        return value
+
+    monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
+    monkeypatch.setattr(pii_module, "_PII_ENGINE_REDACTOR", redact_one)
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
+
+    redacted = redact_upload_data({key: source})[key]
+    decoded = json.loads(redacted)
+    message = decoded["steps"][0]["raw_step"]["message"]
+
+    assert message.startswith(ordinary)
+    assert len(message.splitlines()[0]) == len(ordinary)
+    assert all(token not in message for token in tokens)
+    assert message.count("<PERSON>") == len(tokens)
+    assert secret not in redacted
+    assert decoded["stable_markers"] == {
+        "[REDACTED_KEY_0002]": "[REDACTED_SOURCE_COORDINATE]",
+        "[REDACTED_PII_KEY_0001]": "<PERSON>",
+    }
+    assert redacted == pii_module.canonical_json(decoded)
+    assert redact_upload_data({key: redacted})[key] == redacted
+
+
+def test_coordinate_bearing_mapping_keys_fail_closed_without_hashing_names() -> None:
+    source = "nonopaque-source-coordinate"
+    redacted = redact_upload_data(
+        {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "agent_session_id": source,
+            "agent_id": source,
+        }
+    )
+
+    assert redacted == {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "agent_session_id": "[REDACTED_SOURCE_COORDINATE]",
+        "agent_id": "[REDACTED_SOURCE_COORDINATE]",
+    }
+    assert redact_source_coordinate(source) == "[REDACTED_SOURCE_COORDINATE]"
+
+
+def test_uuid_v5_is_redacted_from_an_unvalidated_coordinate_like_mapping_key() -> None:
+    source = "11111111-1111-5111-8111-111111111111"
+
+    redacted = redact_upload_data({"session_id": source, "note": source})
+
+    assert redacted == {
+        "session_id": "[REDACTED_SOURCE_COORDINATE]",
+        "note": "[REDACTED_SOURCE_COORDINATE]",
+    }
+    assert redact_source_coordinate(source) == "[REDACTED_SOURCE_COORDINATE]"
+    assert redact_source_coordinate(source, allow_name_based=True) == source
+
+
+def test_validated_internal_uuid_v5_session_coordinates_survive_mapping(
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    source = "11111111-1111-5111-8111-111111111111"
+    parent = "22222222-2222-5222-8222-222222222222"
+    mapped = map_atif(
+        Session.from_api(session_payload(id=source, parent_session_id=parent, agent_session_id="")),
+        atif_wrapper(wrapper_session_id=source),
+    )
+
+    sanitized = sanitize_mapped_conversation(mapped)
+
+    assert sanitized.conversation_id == f"hivemind:{source}"
+    assert sanitized.turns[0].attributes["hivemind.session_id"] == source
+    assert sanitized.turns[0].attributes["hivemind.parent_session_id"] == parent
+    assert sanitized.agent_id == "[REDACTED_SOURCE_COORDINATE]"
+
+
+def test_redacted_mapping_key_allocation_cannot_collide_on_a_later_pass() -> None:
+    payload = {
+        "[REDACTED_PII_KEY_0001]": "already redacted",
+        "Alice_Johnson": "private field",
+    }
+
+    redacted = redact_upload_data(payload)
+
+    assert redacted["[REDACTED_PII_KEY_0001]"] == "already redacted"
+    assert redacted["[REDACTED_PII_KEY_0002]"] == "private field"
+
+
+def test_code_aware_redaction_scrubs_comments_and_literals() -> None:
+    code = (
+        'class Washington:\n    owner = "Alice Johnson"\n'
+        "    # Alice Johnson works in New York\n    pass"
+    )
+    redacted = redact_upload_data(code)
+    assert "class Washington:" in redacted
+    assert "Alice Johnson" not in redacted
+    assert "New York" not in redacted
+
+    fenced = '```python\nconst Paris = "Alice Johnson in New York";\n```'
+    fenced_redacted = redact_upload_data(fenced)
+    assert "const Paris" in fenced_redacted
+    assert "Alice Johnson" not in fenced_redacted
+    assert "New York" not in fenced_redacted
+
+    mixed_syntax = (
+        "# class Washington belongs to Alice Johnson in New York\n"
+        "const template = `Alice Johnson in New York`;\n"
+        "const pattern = /Alice Johnson in New York/;\n"
+        "-- new Washington() for Alice Johnson in New York\n"
+        "`class Washington for Alice Johnson in New York`"
+    )
+    mixed_redacted = redact_upload_data(mixed_syntax)
+    assert "Alice" not in mixed_redacted
+    assert "Johnson" not in mixed_redacted
+    assert "Washington" not in mixed_redacted
+    assert "New York" not in mixed_redacted
+
+
+def test_scoped_code_identifiers_survive_presidio_ip_recognition() -> None:
+    assert redact_upload_data("Washington::York::run()") == "Washington::York::run()"
+
+
+def test_structured_schema_keys_and_versions_are_not_corrupted() -> None:
+    payload = {
+        "session_id": "atif-session",
+        "schema_version": "ATIF-v1.7",
+        "step_id": 1,
+        "source": "agent",
+        "message": "ok",
+    }
+    assert redact_upload_data(payload) == {
+        **payload,
+        "session_id": "[REDACTED_SOURCE_COORDINATE]",
+    }
+
+
+def test_code_aware_redaction_still_scrubs_credentials_inside_code() -> None:
+    code = 'const apiKey = "sk-abcdefghijklmnopqrstuvwxyz123456";'
+    redacted = redact_upload_data(code)
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in redacted
+
+
+def test_exact_upload_redaction_is_idempotent() -> None:
+    source = "Alice Johnson in New York used api token: abcdefghijklmnopqrstuvwxyz0123456789ABCD"
+    once = redact_upload_data(source)
+    assert redact_upload_data(once) == once
+
+
+def test_repeated_contextual_locations_are_redacted_in_one_stable_result() -> None:
+    source = " -> ".join(["Australia"] * 20)
+
+    redacted = str(redact_upload_data(source))
+
+    assert "Australia" not in redacted
+    assert redacted.count("<LOCATION>") == 20
+    assert redact_upload_data(redacted) == redacted
+
+
+def test_generated_redaction_markers_cannot_change_later_ner_context() -> None:
+    engine_inputs: list[str] = []
+
+    def context_sensitive_engine(value: str) -> str:
+        engine_inputs.append(value)
+        if "<LOCATION>" in value:
+            return value.replace("ordinary.py", "<LOCATION>", 1)
+        return value.replace("seedplace", "<LOCATION>", 1)
+
+    first = pii_module._source_aware_redact(
+        "ordinary.py seedplace",
+        context_sensitive_engine,
+    )
+    second = pii_module._source_aware_redact(first, context_sensitive_engine)
+
+    assert first == "ordinary.py <LOCATION>"
+    assert second == first
+    assert all("<LOCATION>" not in value for value in engine_inputs)
+
+
+def test_embedded_typed_marker_is_shielded_before_code_identifier_probes() -> None:
+    def marker_label_sensitive_engine(value: str) -> str:
+        return "<PERSON>" if value == "US DRIVER LICENSE" else value
+
+    source = "prefix <US_DRIVER_LICENSE> suffix"
+
+    assert pii_module._source_aware_redact(source, marker_label_sensitive_engine) == source
+
+
+def test_redaction_marker_shields_are_collision_safe_and_reversible() -> None:
+    existing_internal_token, _ = pii_module._protect_redaction_placeholders("<LOCATION>")
+    source = f"{existing_internal_token} <LOCATION> <PERSON> <LOCATION>"
+
+    protected, replacements = pii_module._protect_redaction_placeholders(source)
+    restored = protected
+    for placeholder, marker in replacements.items():
+        assert restored.count(placeholder) == 1
+        restored = restored.replace(placeholder, marker, 1)
+
+    assert "<LOCATION>" not in protected
+    assert "<PERSON>" not in protected
+    assert len(replacements) == 3
+    assert restored == source
+
+
+def test_json_looking_chat_text_keeps_its_exact_formatting() -> None:
+    source = '{\n  "z": 1,\n  "a": "ordinary"\n}'
+
+    assert redact_upload_data(source) == source
+
+
+def test_upload_redaction_converges_after_more_than_eight_text_changes(
+    monkeypatch: Any,
+) -> None:
+    tokens = [f"privateword{index:02d}" for index in range(12)]
+    source = " ".join(tokens)
+    calls: list[str] = []
+
+    monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
+    monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
+
+    def redact_one(value: str) -> str:
+        calls.append(value)
+        for token in tokens:
+            if token in value:
+                return value.replace(token, "[REDACTED]", 1)
+        return value
+
+    monkeypatch.setattr(pii_module, "_redact_pii_string_uncached", redact_one)
+
+    redacted = str(redact_upload_data(source))
+
+    assert all(token not in redacted for token in tokens)
+    assert redacted.count("[REDACTED]") == len(tokens)
+    assert len(calls) > 8
+    assert redact_upload_data(redacted) == redacted
+
+
+def test_upload_redaction_rejects_a_nonconverging_cycle(monkeypatch: Any) -> None:
+    monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
+    monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
+    monkeypatch.setattr(
+        pii_module,
+        "_redact_pii_string_uncached",
+        lambda value: "[REDACTED] beta" if value == "secret-alpha" else "secret-alpha",
+    )
+
+    with pytest.raises(ValueError, match="cycle"):
+        redact_upload_data("secret-alpha")
+
+
+def test_upload_redaction_rejects_a_non_redacting_change(monkeypatch: Any) -> None:
+    calls = 0
+    monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
+    monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
+
+    def grow(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"{value}x"
+
+    monkeypatch.setattr(pii_module, "_redact_pii_string_uncached", grow)
+
+    with pytest.raises(ValueError, match="non-redacting"):
+        redact_upload_data("a")
+    assert calls == 1
+
+
+def test_upload_redaction_rejects_progress_beyond_its_work_budget(
+    monkeypatch: Any,
+) -> None:
+    calls = 0
+    monkeypatch.setattr(pii_module, "configure_weave_pii", lambda: None)
+    monkeypatch.setattr(pii_module, "redact_data", lambda value, **_: value)
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
+    monkeypatch.setattr(pii_module, "_MIN_REDACTION_CONVERGENCE_EXTRA_WORK_BYTES", 0)
+    monkeypatch.setattr(pii_module, "_MAX_REDACTION_CONVERGENCE_EXTRA_WORK_BYTES", 0)
+
+    def redact_one(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"[REDACTED]{value[1:]}"
+
+    monkeypatch.setattr(pii_module, "_redact_pii_string_uncached", redact_one)
+
+    with pytest.raises(ValueError, match="bounded work"):
+        redact_upload_data("abcdefghij")
+    assert calls == 1
+
+
+def test_verification_signature_uses_sdk_dict_redaction_not_string_hook(
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
+
+    def local_pass_changes_text(value: Any) -> Any:
+        return f"[local]{value}" if isinstance(value, str) else value
+
+    monkeypatch.setattr(
+        "hivemind_weave.pii.redact_upload_data",
+        local_pass_changes_text,
+    )
+    from weave.utils import pii_redaction
+
+    string_hook_calls: list[str] = []
+
+    def sdk_string_pass(value: str) -> str:
+        string_hook_calls.append(value)
+        return f"[sdk-string]{value}"
+
+    class Analyzer:
+        def analyze(self, **_: Any) -> list[Any]:
+            return []
+
+    class Anonymizer:
+        def anonymize(self, *, text: str, analyzer_results: list[Any]) -> Any:
+            del analyzer_results
+            redacted = f"[sdk-dict]{text}" if text.startswith("[local]") else text
+            return SimpleNamespace(text=redacted)
+
+    monkeypatch.setattr(pii_redaction, "redact_pii_string", sdk_string_pass)
+    monkeypatch.setattr(pii_redaction, "_get_engines", lambda: (Analyzer(), Anonymizer()))
+    turn = sanitize_mapped_conversation(conversation).turns[0]
+    first_user = next(item.content for item in turn.messages if item.role == "user")
+    last_assistant = next(
+        item.content for item in reversed(turn.output_messages) if item.role == "assistant"
+    )
+
+    assert turn.verification_signature == sha256_json(
+        {
+            "started_at_ms": int(turn.started_at.timestamp() * 1000),
+            "first_user": f"[sdk-dict]{local_pass_changes_text(first_user)}",
+            "last_assistant": f"[sdk-dict]{local_pass_changes_text(last_assistant)}",
+        }
+    )
+    assert string_hook_calls == []
+
+
+def test_verification_signature_keeps_sdk_json_looking_content_as_text(
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
+    conversation.turns[0].messages[0] = pii_module.ChatMessage(
+        role="user",
+        content='{"person":"Alice Johnson"}',
+    )
+    conversation.turns[0].output_messages[0] = pii_module.ChatMessage(
+        role="assistant",
+        content='{"city":"New York"}',
+    )
+
+    def local_pass(value: Any) -> Any:
+        if isinstance(value, str):
+            return f"local({value})"
+        return value
+
+    from weave.utils import pii_redaction
+
+    monkeypatch.setattr(pii_module, "redact_upload_data", local_pass)
+    observed_roles: list[str] = []
+
+    def sdk_message_pass(messages: list[Any]) -> list[Any]:
+        observed_roles.extend(message.role for message in messages)
+        return [
+            message.model_copy(update={"content": f"sdk-message({message.content})"})
+            for message in messages
+        ]
+
+    monkeypatch.setattr(pii_redaction, "redact_messages", sdk_message_pass)
+    turn = sanitize_mapped_conversation(conversation).turns[0]
+    first_user = next(item.content for item in turn.messages if item.role == "user")
+    last_assistant = next(
+        item.content for item in reversed(turn.output_messages) if item.role == "assistant"
+    )
+
+    assert turn.verification_signature == sha256_json(
+        {
+            "started_at_ms": int(turn.started_at.timestamp() * 1000),
+            "first_user": f"sdk-message({local_pass(first_user)})",
+            "last_assistant": f"sdk-message({local_pass(last_assistant)})",
+        }
+    )
+    assert observed_roles == ["user", "assistant"]
+
+
+def test_redaction_cache_uses_only_digest_keys_and_redacted_values(monkeypatch: Any) -> None:
+    calls = 0
+
+    def fake_redactor(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return value if value == "[REDACTED]" else "[REDACTED]"
+
+    monkeypatch.setattr(pii_module, "_redact_pii_string_uncached", fake_redactor)
+    source = "private-source-value " * 500
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE", pii_module.OrderedDict())
+    monkeypatch.setattr(pii_module, "_REDACTION_CACHE_BYTES", 0)
+
+    assert pii_module._redact_pii_string(source) == "[REDACTED]"
+    assert pii_module._redact_pii_string(source) == "[REDACTED]"
+    assert calls == 2
+    assert all(source not in str(key) for key in pii_module._REDACTION_CACHE)
+    assert source not in pii_module._REDACTION_CACHE.values()
+
+
+def test_sanitization_keeps_large_attributes_inline_for_fail_closed_preflight(
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
+    source = "x" * (MAX_ATTRIBUTE_VALUE_CHARS + 1)
+    conversation.turns[0].attributes["hivemind.preserved_step_data"] = json.dumps(source)
+    monkeypatch.setattr("hivemind_weave.pii.redact_upload_data", lambda value: value)
+
+    sanitized = sanitize_mapped_conversation(conversation)
+    attributes = sanitized.turns[0].attributes
+
+    assert json.loads(attributes["hivemind.preserved_step_data"]) == source
+
+
+def test_source_payload_hash_tracks_the_complete_pii_redacted_semantics(
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    configure_weave_pii()
+
+    def redactor(marker: str) -> Callable[[Any], Any]:
+        def walk(value: Any) -> Any:
+            if isinstance(value, str):
+                return value.replace("Alice", marker)
+            if isinstance(value, dict):
+                return {key: walk(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [walk(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(walk(item) for item in value)
+            return value
+
+        return walk
+
+    def mapped() -> Any:
+        conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
+        conversation.turns[0].attributes["hivemind.preserved_step_data"] = json.dumps(
+            "Alice " * (MAX_ATTRIBUTE_VALUE_CHARS // 6 + 10)
+        )
+        conversation.turns[0].finalize_hash()
+        return conversation
+
+    monkeypatch.setattr(pii_module, "redact_upload_data", redactor("<PERSON>"))
+    first_mapped = mapped()
+    first = sanitize_mapped_conversation(first_mapped).turns[0]
+    monkeypatch.setattr(
+        pii_module,
+        "redact_upload_data",
+        redactor("<POSSIBLE_PERSON_ENTITY>"),
+    )
+    second = sanitize_mapped_conversation(mapped()).turns[0]
+
+    assert first.payload_sha256 != second.payload_sha256
+    assert first.attributes["hivemind.source_payload_sha256"] == first.payload_sha256
+    assert second.attributes["hivemind.source_payload_sha256"] == second.payload_sha256
+    assert (
+        first.attributes["hivemind.preserved_step_data"]
+        != second.attributes["hivemind.preserved_step_data"]
+    )
+
+
+def test_source_payload_hash_never_depends_on_raw_credentials(
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    configure_weave_pii()
+
+    def sanitize_with(secret: str, ordinary_text: str) -> Any:
+        conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
+        conversation.turns[0].messages[0] = ChatMessage(
+            role="user",
+            content=(f'{ordinary_text}\nAuthorization: Bearer {secret}\nOPENAI_API_KEY="{secret}"'),
+        )
+        conversation.turns[0].finalize_hash()
+        return sanitize_mapped_conversation(conversation).turns[0]
+
+    # Use the deterministic scrubber as the complete redaction pass. Raw
+    # secrets must collapse to the same safe semantic representation while
+    # ordinary source changes remain meaningful.
+    monkeypatch.setattr(pii_module, "redact_upload_data", pii_module.redact_data)
+    first_secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    second_secret = "sk-zyxwvutsrqponmlkjihgfedcba654321"
+    first = sanitize_with(first_secret, "ordinary source")
+    changed_secret = sanitize_with(second_secret, "ordinary source")
+    changed_content = sanitize_with(first_secret, "different source")
+
+    assert first.payload_sha256 == changed_secret.payload_sha256
+    assert first.payload_sha256 != changed_content.payload_sha256
+    assert first_secret not in str(first.payload_for_hash())
+    assert second_secret not in str(changed_secret.payload_for_hash())
+
+
+def test_source_payload_hash_never_becomes_a_raw_pii_equality_oracle(
+    monkeypatch: Any,
+    session_payload: Callable[..., dict[str, Any]],
+    atif_wrapper: Callable[..., dict[str, Any]],
+) -> None:
+    configure_weave_pii()
+
+    def redact_people(value: Any) -> Any:
+        if isinstance(value, str):
+            return value.replace("Alice Johnson", "[PERSON]").replace("Bob Williams", "[PERSON]")
+        if isinstance(value, dict):
+            return {key: redact_people(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redact_people(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(redact_people(item) for item in value)
+        return value
+
+    def sanitize_with(name: str) -> Any:
+        conversation = map_atif(Session.from_api(session_payload()), atif_wrapper())
+        conversation.turns[0].messages[0] = ChatMessage(
+            role="user",
+            content=f"Please help {name} with the same task",
+        )
+        return sanitize_mapped_conversation(conversation).turns[0]
+
+    monkeypatch.setattr(pii_module, "redact_upload_data", redact_people)
+    first = sanitize_with("Alice Johnson")
+    second = sanitize_with("Bob Williams")
+
+    assert first.payload_sha256 == second.payload_sha256
+    assert "Alice Johnson" not in str(first.payload_for_hash())
+    assert "Bob Williams" not in str(second.payload_for_hash())

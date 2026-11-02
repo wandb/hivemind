@@ -4,7 +4,7 @@
 
 W&B HiveMind is a shared dashboard for AI coding sessions. A lightweight daemon runs on each developer's machine, watches for coding agent activity, and sends session transcripts to [hivemind.wandb.tools](https://hivemind.wandb.tools).
 
-Coding agents like Claude Code, Codex, Cursor, Gemini CLI, OpenCode, GitHub Copilot CLI, and Pi all write transcripts to the local filesystem as they work. The HiveMind daemon wakes up every 30 seconds, checks for new activity, and uploads anything it finds. There's nothing to configure per agent. If the agent writes transcripts, HiveMind picks them up.
+Coding agents like Claude Code, Codex, Cursor, Gemini CLI, OpenCode, GitHub Copilot CLI, Pi, and Devin all write transcripts to the local filesystem as they work. The HiveMind daemon wakes up every 30 seconds, checks for new activity, and uploads anything it finds. There's nothing to configure per agent. If the agent writes transcripts, HiveMind picks them up. Sessions that run in the cloud, from Claude Code on the web and Devin, are synced too (see [Cloud sessions](#cloud-sessions)).
 
 This repository hosts release binaries for the HiveMind daemon and is the public issue tracker. Found a bug or have a feature request? [Open an issue](https://github.com/wandb/hivemind/issues). The dashboard and docs live at [hivemind.wandb.tools](https://hivemind.wandb.tools).
 
@@ -102,15 +102,32 @@ Once the daemon is running, open any supported coding agent and start working. W
 
 ### Supported agents
 
-| Agent              | Transcript source                      |
-| ------------------ | -------------------------------------- |
-| Claude Code        | `~/.claude/projects/` JSONL files      |
-| Codex              | `~/.codex/` session logs               |
-| Cursor             | SQLite databases in Cursor's app data  |
-| Gemini CLI         | `~/.gemini/` session history           |
-| OpenCode           | `~/.opencode/` session files           |
-| GitHub Copilot CLI | `~/.copilot/session-state/` event logs |
-| Pi                 | `~/.pi/agent/sessions/` JSONL files    |
+| Agent               | Transcript source                      |
+| ------------------- | -------------------------------------- |
+| Claude Code         | `~/.claude/projects/` JSONL files      |
+| Codex               | `~/.codex/` session logs               |
+| Cursor              | SQLite databases in Cursor's app data  |
+| Gemini CLI          | `~/.gemini/` session history           |
+| OpenCode            | `~/.opencode/` session files           |
+| GitHub Copilot CLI  | `~/.copilot/session-state/` event logs |
+| Pi                  | `~/.pi/agent/sessions/` JSONL files    |
+| Devin CLI / Desktop | `~/.local/share/devin/cli/sessions.db` |
+
+### Cloud sessions
+
+Some agents run in the cloud and never write a local transcript. The daemon syncs those too, using the logins already on your machine:
+
+- **Claude Code on the web** — sessions from [claude.ai/code](https://claude.ai/code) are fetched every 30 minutes. This works automatically when you're logged in to Claude Code locally. Sessions you only remote-control from claude.ai are skipped, since the daemon already uploads them from their local transcripts.
+- **Devin cloud** — sessions from [app.devin.ai](https://app.devin.ai) are replayed through the Devin CLI (`devin acp --cloud`) every 15 minutes, including attachments, screenshots, and session recordings. This needs the Devin CLI installed and logged in:
+
+  ```bash
+  curl -fsSL https://cli.devin.ai/install.sh | bash
+  devin auth login
+  ```
+
+  In a shared Devin org, only sessions you created are uploaded. If you use Devin but the CLI is missing, `hivemind doctor` tells you how to install it.
+
+To turn a source off, set `enabled = false` under `[web_sessions]` (Claude Code on the web) or `[devin_cloud]` in `~/.hivemind/config.toml`.
 
 ### The HiveMind agent
 
@@ -130,7 +147,7 @@ Self-hosting is optional — nothing above requires it. For the full walkthrough
 
 ## How HiveMind compares
 
-HiveMind gives you one view across every coding agent your team uses, instead of a separate dashboard per vendor. Native dashboards from individual agent vendors only show their own usage. HiveMind brings Claude Code, Codex, Cursor, Gemini, Copilot, and more together with session-level detail, spend, and outcomes in one place.
+HiveMind gives you one view across every coding agent your team uses, instead of a separate dashboard per vendor. Native dashboards from individual agent vendors only show their own usage. HiveMind brings Claude Code, Codex, Cursor, Gemini, Copilot, Devin, and more together with session-level detail, spend, and outcomes in one place.
 
 ### HiveMind and Weave
 

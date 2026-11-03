@@ -1,21 +1,21 @@
 {
-  "version": "1.1.2rc1",
-  "minimum_supported": "1.1.2rc1",
-  "released_at": "2026-11-03T00:00:03Z",
+  "version": "1.1.2rc2",
+  "minimum_supported": "1.1.2rc2",
+  "released_at": "2026-11-03T02:50:32Z",
   "rollout_percentage": 100,
   "platforms": {
     "darwin-arm64": {
-      "binary_url": "https://github.com/wandb/hivemind/releases/download/v1.1.2rc1/hivemind-darwin-arm64",
-      "binary_sha256": "ff42248f72ec1b5adc4521fa39ee76dd286f3e39528b1b6f68f505fd7220e49c",
+      "binary_url": "https://github.com/wandb/hivemind/releases/download/v1.1.2rc2/hivemind-darwin-arm64",
+      "binary_sha256": "13664467515d5c572090a645a2feb42df685de4aa21d3563a99a929c9e4c4854",
       "team_id": "5DTHBP38WM"
     },
     "linux-x86_64": {
-      "binary_url": "https://github.com/wandb/hivemind/releases/download/v1.1.2rc1/hivemind-linux-x86_64",
-      "binary_sha256": "2084f844e048ea809e22b4cb811889ffdac9a75aee8d5788fbd22cf312d1f2e2"
+      "binary_url": "https://github.com/wandb/hivemind/releases/download/v1.1.2rc2/hivemind-linux-x86_64",
+      "binary_sha256": "2449142d80e409516cd7c6146fe9eb5932a74c662d35434f4d1e472b89774247"
     },
     "linux-arm64": {
-      "binary_url": "https://github.com/wandb/hivemind/releases/download/v1.1.2rc1/hivemind-linux-arm64",
-      "binary_sha256": "cf7e92b26237bdc91d96a8d6729accad4c52750781a86283d5eaa393cf00c822"
+      "binary_url": "https://github.com/wandb/hivemind/releases/download/v1.1.2rc2/hivemind-linux-arm64",
+      "binary_sha256": "c944683a788658f881c5f92126a7d4f7458a0a237e5021a0d8e1e872f09f5d58"
     }
   }
 }

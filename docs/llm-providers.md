@@ -164,9 +164,12 @@ corresponding Bedrock Haiku id; otherwise they fall back to `LLM_MODEL`.
 LLM_PROVIDER=vertex
 LLM_VERTEX_PROJECT=my-gcp-project
 LLM_VERTEX_LOCATION=global          # optional; `global` is the default
-LLM_MODEL=google/gemini-3.6-flash
+LLM_MODEL=google/gemini-3.5-flash
 LLM_SMALL_MODEL=google/gemini-3.5-flash-lite
 ```
+
+> **Gemini 3.6 Flash shuts down on Nov 19, 2026.** Calls to it return 404 after
+> that. If your `LLM_MODEL` names it, switch to `google/gemini-3.5-flash`.
 
 Gemini ids carry a minor version (`3.6`, `3.5`, `3.1`) and there is no floating
 `gemini-3-pro` / `gemini-3-flash` alias — check what your project actually has
@@ -190,7 +193,7 @@ is a property of the *model*, not of the deployment:
 
 | Model | API | Model id |
 |---|---|---|
-| Gemini | OpenAI-compatible `chat/completions` | `google/gemini-3.6-flash` |
+| Gemini | OpenAI-compatible `chat/completions` | `google/gemini-3.5-flash` |
 | Partner / MaaS (Llama, Grok, …) | OpenAI-compatible `chat/completions` | `meta/llama-…`, `grok-…` |
 | Anthropic Claude | native Messages API (`:rawPredict`) | `claude-sonnet-4-5@20250929` |
 
@@ -234,7 +237,7 @@ spent on a one-word question at `reasoning_effort=minimal`, measured on Vertex:
 
 | Model | Reasoning tokens at `minimal` | |
 |---|---|---|
-| `google/gemini-3.6-flash` | **0** | recommended |
+| `google/gemini-3.6-flash` | **0** | shuts down Nov 19, 2026 |
 | `google/gemini-3.5-flash` | **0** | recommended |
 | `google/gemini-3.5-flash-lite` | **0** | recommended (good `LLM_SMALL_MODEL`) |
 | `google/gemini-3.1-flash-lite` | 61 | ignores `minimal` |
